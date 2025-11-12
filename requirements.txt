@@ -1,0 +1,6 @@
+modal==0.56.0
+supabase==2.0.3
+openai>=1.0.0
+feedparser==6.0.10
+pydub==0.25.1
+python-dotenv==1.0.0
