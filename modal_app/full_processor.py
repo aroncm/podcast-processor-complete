@@ -476,7 +476,7 @@ def extract_quotes(text, podcast, episode, client, chunk_num=0):
     
     The Transcript is provided with Segment IDs in the format: `[ID] Text...`
     
-    Extract ONLY 3-5 exceptional quotes.
+    Extract EXACTLY 5 exceptional quotes.
     For each quote, you MUST identify the exact `start_segment_id` and `end_segment_id` from the text.
     
     Podcast: {podcast}
