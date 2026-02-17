@@ -176,7 +176,9 @@ def promote_quote_to_production(quote_id: str):
         "take_type": 'hot_take', # Default
         "youtube_id": data.get('youtube_id'),
         "timestamp_start": data['timestamp_start'],
-        "timestamp_end": data['timestamp_end']
+        "timestamp_end": data['timestamp_end'],
+        "quality_score": data.get('quality_score'),
+        "extraction_model": data.get('extraction_model')
     }
     
     res = supabase.table('quotes').insert(prod_payload).execute()
