@@ -153,9 +153,15 @@ def process_episode_with_ai(feed_ids: list = None, start_date: str = None, end_d
 # (Real implementation would duplicate logic, for now we restore the stubs/functions 
 # so the Modal dashboard looks correct and they can be expanded)
 
+def slugify(text: str) -> str:
+    """Simple slugify for ID generation"""
+    if not text: return "unknown"
+    import re
+    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
 @app.function(image=image, secrets=[my_secret], timeout=600)
 def promote_quote_to_production(quote_id: str):
-    """Move a quote from test_quotes to production quotes with ID resolution"""
+    """Move a quote from test_quotes to production quotes with robust ID resolution and auto-creation"""
     print(f"🚀 Promoting quote {quote_id} to production...")
     from supabase import create_client
     supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
@@ -165,74 +171,99 @@ def promote_quote_to_production(quote_id: str):
     if not tq.data: return {"error": "Quote not found"}
     data = tq.data
     
-    # 2. Resolve Podcast ID
-    podcast_id = 'adtechgod' # Default
-    p_res = supabase.table('podcasts').select('id').ilike('name', data['podcast_name']).execute()
+    # 2. Resolve Podcast
+    podcast_name = data.get('podcast_name', 'Unknown Podcast')
+    p_res = supabase.table('podcasts').select('id').ilike('name', podcast_name).execute()
     if p_res.data:
         podcast_id = p_res.data[0]['id']
     else:
-        # Fallback: check if the name is already an ID or try fuzzy?
-        print(f"  ⚠️ Podcast '{data['podcast_name']}' not found, defaulting to '{podcast_id}'")
+        # Create new podcast
+        podcast_id = slugify(podcast_name)
+        print(f"  ✨ Creating new podcast: {podcast_name} ({podcast_id})")
+        supabase.table('podcasts').insert({
+            "id": podcast_id,
+            "name": podcast_name
+        }).execute()
 
-    # 3. Resolve Category ID
-    category_id = 'strategy' # Default
-    c_res = supabase.table('categories').select('id').ilike('name', data['category']).execute()
+    # 3. Resolve Category
+    category_name = data.get('category', 'General')
+    c_res = supabase.table('categories').select('id').ilike('name', category_name).execute()
     if c_res.data:
         category_id = c_res.data[0]['id']
     else:
-        print(f"  ⚠️ Category '{data['category']}' not found, defaulting to '{category_id}'")
+        # Create new category
+        category_id = slugify(category_name)
+        print(f"  ✨ Creating new category: {category_name} ({category_id})")
+        supabase.table('categories').insert({
+            "id": category_id,
+            "name": category_name
+        }).execute()
 
-    # 4. Resolve Guest ID
-    guest_id = 'erez-levin' # Default
-    g_res = supabase.table('guests').select('id').ilike('name', data['speaker_name']).execute()
+    # 4. Resolve Guest
+    guest_name = data.get('speaker_name', 'Unknown Speaker')
+    g_res = supabase.table('guests').select('id').ilike('name', guest_name).execute()
     if g_res.data:
         guest_id = g_res.data[0]['id']
     else:
-        print(f"  ⚠️ Guest '{data['speaker_name']}' not found, defaulting to '{guest_id}'")
+        # Create new guest
+        guest_id = slugify(guest_name)
+        print(f"  ✨ Creating new guest: {guest_name} ({guest_id})")
+        supabase.table('guests').insert({
+            "id": guest_id,
+            "name": guest_name
+        }).execute()
 
-    # 5. Resolve Episode ID
-    episode_id = None
-    e_res = supabase.table('episodes').select('id')\
-        .eq('podcast_id', podcast_id)\
-        .ilike('title', f"%{data['episode_name'][:50]}%")\
-        .execute()
+    # 5. Resolve Episode
+    episode_name = data.get('episode_name', 'Unknown Episode')
+    e_res = supabase.table('episodes').select('id').eq('podcast_id', podcast_id).ilike('title', f"%{episode_name[:50]}%").execute()
     if e_res.data:
         episode_id = e_res.data[0]['id']
     else:
-        # If episode doesn't exist in production, we might need to create it?
-        # For now, we'll try to find any episode in that podcast as fallback or fail
-        print(f"  ⚠️ Episode '{data['episode_name']}' not found in production.")
-        fallback_e = supabase.table('episodes').select('id').eq('podcast_id', podcast_id).limit(1).execute()
-        if fallback_e.data:
-            episode_id = fallback_e.data[0]['id']
-            print(f"  💡 Using fallback episode: {episode_id}")
+        # Create new episode
+        episode_id = slugify(episode_name[:50])
+        print(f"  ✨ Creating new episode: {episode_name} ({episode_id})")
+        supabase.table('episodes').insert({
+            "id": episode_id,
+            "title": episode_name,
+            "podcast_id": podcast_id,
+            "date": datetime.now().strftime('%Y-%m-%d')
+        }).execute()
+        
+        # Link guest to episode
+        supabase.table('guest_episodes').upsert({
+            "guest_id": guest_id,
+            "episode_id": episode_id
+        }).execute()
 
-    if not episode_id:
-        return {"error": f"Could not find matching episode in production for podcast {podcast_id}"}
-
-    # 6. Insert into real quotes (mapping fields)
+    # 6. Insert into production quotes
+    # The 'quotes' table schema as found in inspect_schema.py:
+    # id, text, episode_id, guest_id, category_id, clip_link, created_at, updated_at, 
+    # audio_clip_id, quote_start, quote_end, snippet_text, podcast_id, guest_name, 
+    # context, style_category, speaker, support_count, is_featured, featured_order, 
+    # youtube_id, timestamp_start, timestamp_end, youtube_offset, quality_score, extraction_model
+    
     prod_payload = {
-        "id": data['id'], # Preserve ID if possible or let DB generate
+        "id": data['id'],
         "text": data['quote_text'],
         "episode_id": episode_id,
         "guest_id": guest_id,
         "category_id": category_id,
         "clip_link": data['audio_clip_url'],
+        "podcast_id": podcast_id,
+        "guest_name": guest_name,
+        "speaker": guest_name, # Populating both for safety
         "youtube_id": data.get('youtube_id'),
-        "timestamp_start": data['timestamp_start'],
-        "timestamp_end": data['timestamp_end']
-        # Note: quality_score and extraction_model aren't in production yet?
-        # Looking at previous migrations, they were added.
+        "timestamp_start": data.get('timestamp_start'),
+        "timestamp_end": data.get('timestamp_end'),
+        "youtube_offset": data.get('youtube_offset', 0),
+        "quality_score": data.get('quality_score'),
+        "extraction_model": data.get('extraction_model'),
+        "context": data.get('category') # Using category as context if needed
     }
-    
-    # Check if quality fields exist in production schema before sending
-    # (Based on migration 20260217_add_quality_to_production.sql they should)
-    prod_payload["quality_score"] = data.get('quality_score')
-    prod_payload["extraction_model"] = data.get('extraction_model')
     
     try:
         res = supabase.table('quotes').upsert(prod_payload).execute()
-        print(f"✅ Promoted to production! (Quote: {data['id']})")
+        print(f"✅ Successfully promoted to production! (Quote ID: {data['id']})")
         return {"success": True, "data": res.data}
     except Exception as e:
         print(f"❌ Promotion failed: {e}")
