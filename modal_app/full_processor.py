@@ -172,61 +172,69 @@ def promote_quote_to_production(quote_id: str):
     data = tq.data
     
     # 2. Resolve Podcast
-    podcast_name = data.get('podcast_name', 'Unknown Podcast')
-    p_res = supabase.table('podcasts').select('id').ilike('name', podcast_name).execute()
+    podcast_name = data.get('podcast_name', 'Unknown Podcast').strip()
+    p_res = supabase.table('podcasts').select('id').eq('name', podcast_name).execute()
     if p_res.data:
         podcast_id = p_res.data[0]['id']
     else:
-        # Create new podcast
+        # Try slugified match
         podcast_id = slugify(podcast_name)
-        print(f"  ✨ Creating new podcast: {podcast_name} ({podcast_id})")
-        supabase.table('podcasts').insert({
-            "id": podcast_id,
-            "name": podcast_name
-        }).execute()
+        p_res = supabase.table('podcasts').select('id').eq('id', podcast_id).execute()
+        if not p_res.data:
+            print(f"  ✨ Creating new podcast: {podcast_name} ({podcast_id})")
+            supabase.table('podcasts').insert({
+                "id": podcast_id,
+                "name": podcast_name
+            }).execute()
 
     # 3. Resolve Category
-    category_name = data.get('category', 'General')
-    c_res = supabase.table('categories').select('id').ilike('name', category_name).execute()
+    category_name = data.get('category', 'General').strip()
+    c_res = supabase.table('categories').select('id').eq('name', category_name).execute()
     if c_res.data:
         category_id = c_res.data[0]['id']
     else:
-        # Create new category
+        # Try slugified match
         category_id = slugify(category_name)
-        print(f"  ✨ Creating new category: {category_name} ({category_id})")
-        supabase.table('categories').insert({
-            "id": category_id,
-            "name": category_name
-        }).execute()
+        c_res = supabase.table('categories').select('id').eq('id', category_id).execute()
+        if not c_res.data:
+            print(f"  ✨ Creating new category: {category_name} ({category_id})")
+            supabase.table('categories').insert({
+                "id": category_id,
+                "name": category_name
+            }).execute()
 
     # 4. Resolve Guest
-    guest_name = data.get('speaker_name', 'Unknown Speaker')
-    g_res = supabase.table('guests').select('id').ilike('name', guest_name).execute()
+    guest_name = data.get('speaker_name', 'Unknown Speaker').strip()
+    g_res = supabase.table('guests').select('id').eq('name', guest_name).execute()
     if g_res.data:
         guest_id = g_res.data[0]['id']
     else:
-        # Create new guest
+        # Try slugified match
         guest_id = slugify(guest_name)
-        print(f"  ✨ Creating new guest: {guest_name} ({guest_id})")
-        supabase.table('guests').insert({
-            "id": guest_id,
-            "name": guest_name
-        }).execute()
+        g_res = supabase.table('guests').select('id').eq('id', guest_id).execute()
+        if not g_res.data:
+            print(f"  ✨ Creating new guest: {guest_name} ({guest_id})")
+            supabase.table('guests').insert({
+                "id": guest_id,
+                "name": guest_name
+            }).execute()
 
     # 5. Resolve Episode
-    episode_name = data.get('episode_name', 'Unknown Episode')
-    e_res = supabase.table('episodes').select('id').eq('podcast_id', podcast_id).ilike('title', f"%{episode_name[:50]}%").execute()
+    episode_name = data.get('episode_name', 'Unknown Episode').strip()
+    # Use exact podcast_id + title match
+    e_res = supabase.table('episodes').select('id').eq('podcast_id', podcast_id).eq('title', episode_name).execute()
     if e_res.data:
         episode_id = e_res.data[0]['id']
     else:
-        # Create new episode
-        episode_id = slugify(episode_name[:50])
+        # Create new episode with a more robust slug or just use the title
+        # (We prefer a clean slug for the ID)
+        episode_id = slugify(episode_name[:60]) # Longer prefix
         print(f"  ✨ Creating new episode: {episode_name} ({episode_id})")
-        supabase.table('episodes').insert({
+        supabase.table('episodes').upsert({
             "id": episode_id,
             "title": episode_name,
             "podcast_id": podcast_id,
-            "date": datetime.now().strftime('%Y-%m-%d')
+            "date": data.get('date_published', datetime.now().strftime('%Y-%m-%d'))[:10]
         }).execute()
         
         # Link guest to episode
@@ -236,12 +244,6 @@ def promote_quote_to_production(quote_id: str):
         }).execute()
 
     # 6. Insert into production quotes
-    # The 'quotes' table schema as found in inspect_schema.py:
-    # id, text, episode_id, guest_id, category_id, clip_link, created_at, updated_at, 
-    # audio_clip_id, quote_start, quote_end, snippet_text, podcast_id, guest_name, 
-    # context, style_category, speaker, support_count, is_featured, featured_order, 
-    # youtube_id, timestamp_start, timestamp_end, youtube_offset, quality_score, extraction_model
-    
     prod_payload = {
         "id": data['id'],
         "text": data['quote_text'],
@@ -249,16 +251,17 @@ def promote_quote_to_production(quote_id: str):
         "guest_id": guest_id,
         "category_id": category_id,
         "clip_link": data['audio_clip_url'],
-        "podcast_id": podcast_id,
-        "guest_name": guest_name,
-        "speaker": guest_name, # Populating both for safety
+        "podcast_id": podcast_id,      # Critical for visibility in some views
+        "guest_name": guest_name,      # Denormalized for performance
+        "speaker": guest_name,         # Backward compatibility
         "youtube_id": data.get('youtube_id'),
         "timestamp_start": data.get('timestamp_start'),
         "timestamp_end": data.get('timestamp_end'),
         "youtube_offset": data.get('youtube_offset', 0),
         "quality_score": data.get('quality_score'),
         "extraction_model": data.get('extraction_model'),
-        "context": data.get('category') # Using category as context if needed
+        "context": data.get('category'),
+        "support_count": 0             # Start with 0 in production
     }
     
     try:
