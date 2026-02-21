@@ -220,12 +220,19 @@ def promote_quote_to_production(quote_id: str):
         g_res = supabase.table('guests').select('id').eq('id', guest_id).execute()
         if not g_res.data:
             print(f"  ✨ Creating new guest: {guest_name} ({guest_id})")
-            supabase.table('guests').insert({
+            guest_payload = {
                 "id": guest_id,
                 "name": guest_name
-            }).execute()
+            }
+            if data.get('speaker_title'): guest_payload['title'] = data['speaker_title']
+            if data.get('speaker_company'): guest_payload['company'] = data['speaker_company']
+            if data.get('speaker_linkedin'): guest_payload['linkedin_url'] = data['speaker_linkedin']
+            
+            supabase.table('guests').insert(guest_payload).execute()
         else:
             guest_id = g_res.data[0]['id']
+            # Optional: Update existing guest if they are missing metadata
+            # For now, we prioritize the new creation as requested
 
     # 5. Resolve Episode
     episode_name = data.get('episode_name', 'Unknown Episode').strip()
@@ -1001,6 +1008,9 @@ def fastapi_app():
         updates = {}
         if 'quote_text' in data: updates['quote_text'] = data['quote_text']
         if 'speaker_name' in data: updates['speaker_name'] = data['speaker_name']
+        if 'speaker_title' in data: updates['speaker_title'] = data['speaker_title']
+        if 'speaker_company' in data: updates['speaker_company'] = data['speaker_company']
+        if 'speaker_linkedin' in data: updates['speaker_linkedin'] = data['speaker_linkedin']
         
         if updates:
              supabase.table('test_quotes').update(updates).eq('id', quote_id).execute()
