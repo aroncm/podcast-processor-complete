@@ -205,7 +205,13 @@ def promote_quote_to_production(quote_id: str):
 
     # 4. Resolve Guest
     guest_name = data.get('speaker_name', 'Unknown Speaker').strip()
+    
+    # Try exact name match
     g_res = supabase.table('guests').select('id').eq('name', guest_name).execute()
+    if not g_res.data:
+        # Try case-insensitive / trimmed match via ilike
+        g_res = supabase.table('guests').select('id').ilike('name', guest_name).execute()
+        
     if g_res.data:
         guest_id = g_res.data[0]['id']
     else:
@@ -218,6 +224,8 @@ def promote_quote_to_production(quote_id: str):
                 "id": guest_id,
                 "name": guest_name
             }).execute()
+        else:
+            guest_id = g_res.data[0]['id']
 
     # 5. Resolve Episode
     episode_name = data.get('episode_name', 'Unknown Episode').strip()
@@ -266,7 +274,11 @@ def promote_quote_to_production(quote_id: str):
     
     try:
         res = supabase.table('quotes').upsert(prod_payload).execute()
-        print(f"✅ Successfully promoted to production! (Quote ID: {data['id']})")
+        
+        # 7. Update source status to 'promoted' so it leaves the admin queue
+        supabase.table('test_quotes').update({"approval_status": "promoted"}).eq('id', data['id']).execute()
+        
+        print(f"✅ Successfully promoted to production and updated test_quotes! (Quote ID: {data['id']})")
         return {"success": True, "data": res.data}
     except Exception as e:
         print(f"❌ Promotion failed: {e}")
