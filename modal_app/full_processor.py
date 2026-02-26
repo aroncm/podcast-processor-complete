@@ -15,7 +15,11 @@ image = modal.Image.debian_slim() \
         "anthropic",
         "feedparser",
         "pydub",
-        "fastapi"
+        "fastapi",
+        "youtube-transcript-api",
+        "thefuzz",
+        "yt-dlp",
+        "requests"
     ) \
     .apt_install("ffmpeg")
 
@@ -159,6 +163,293 @@ def slugify(text: str) -> str:
     import re
     return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
 
+def normalize_text(text: str) -> str:
+    """Rigorous text normalization for caption matching."""
+    if not text:
+        return ""
+    import re
+    # Lowercase
+    text = text.lower()
+    # Normalize quotes, dashes, etc
+    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    text = text.replace("—", "-").replace("–", "-")
+    # Remove punctuation for matching form
+    text = re.sub(r"[^\w\s']", '', text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YouTube Caption Timestamp Alignment
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Module-level caption cache: {youtube_id: [{text, start, duration}, ...]}
+_caption_cache: dict = {}
+
+def get_yt_captions(youtube_id: str) -> list | None:
+    """Fetch and parse YouTube captions using yt-dlp (json3 format).
+    Results are cached in-memory per video to avoid redundant API calls."""
+    import yt_dlp
+    import requests
+    import json
+    
+    if youtube_id in _caption_cache:
+        return _caption_cache[youtube_id]
+    
+    try:
+        print(f"  🎬 Fetching YouTube captions for {youtube_id} via yt-dlp...")
+        ydl_opts = {
+            'skip_download': True,
+            'writeautosubs': True,
+            'subtitleslangs': ['en.*'],
+            'quiet': True,
+            'no_warnings': True
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_id, download=False)
+            
+            # Find the best English subtitle (auto or manual)
+            sub_url = None
+            
+            # Try manual subtitles first
+            if 'subtitles' in info and 'en' in info['subtitles']:
+                for fmt in info['subtitles']['en']:
+                    if fmt.get('ext') == 'json3':
+                        sub_url = fmt['url']
+                        break
+            
+            # Fallback to automatic captions
+            if not sub_url and 'automatic_captions' in info:
+                # Often 'en', 'en-us', etc.
+                en_keys = [k for k in info['automatic_captions'].keys() if k.startswith('en')]
+                if en_keys:
+                    # Pick first one, look for json3
+                    for fmt in info['automatic_captions'][en_keys[0]]:
+                        if fmt.get('ext') == 'json3':
+                            sub_url = fmt['url']
+                            break
+            
+            if not sub_url:
+                print(f"  ⚠️  No English json3 captions found for {youtube_id}")
+                _caption_cache[youtube_id] = None
+                return None
+            
+            # Fetch the actual json3 data
+            resp = requests.get(sub_url)
+            if resp.status_code != 200:
+                print(f"  ⚠️  Failed to download captions from {sub_url[:50]}...")
+                _caption_cache[youtube_id] = None
+                return None
+            
+            data = resp.json()
+            if 'events' not in data:
+                print(f"  ⚠️  Unrecognized caption format for {youtube_id}")
+                _caption_cache[youtube_id] = None
+                return None
+            
+            # 2. Parse caption events into {start, end, raw_text, norm_text, word_count}
+            processed = []
+            for event in data['events']:
+                if 'segs' not in event: continue
+                
+                start_ms = event.get('tStartMs', 0)
+                duration_ms = event.get('dDurationMs', 0)
+                
+                # Concatenate segments
+                text = "".join([s.get('utf8', '') for s in event['segs']]).strip()
+                if not text: continue
+                
+                processed.append({
+                    'start': start_ms / 1000.0,
+                    'end': (start_ms + duration_ms) / 1000.0,
+                    'raw_text': text,
+                    'norm_text': normalize_text(text),
+                    'word_count': len(text.split())
+                })
+            
+            print(f"  ✅ Parsed {len(processed)} caption events for {youtube_id}")
+            _caption_cache[youtube_id] = processed
+            return processed
+            
+    except Exception as e:
+        print(f"  ⚠️  Caption fetch error for {youtube_id}: {e}")
+        _caption_cache[youtube_id] = None
+        return None
+
+def align_timestamps_to_youtube_captions(
+    quote_text: str,
+    youtube_id: str,
+    whisper_start: int,
+    whisper_end: int
+) -> dict | None:
+    """Deterministic caption-alignment pipeline with strict confidence gating."""
+    from difflib import SequenceMatcher
+    
+    captions = get_yt_captions(youtube_id)
+    if not captions:
+        return None
+
+    # Step 2: Normalize quote text
+    norm_quote = normalize_text(quote_text)
+    quote_words = norm_quote.split()
+    quote_word_count = len(quote_words)
+    if quote_word_count < 5:
+        return None # Too short for reliable alignment
+
+    # Step 3: Find quote location via sliding-window matching
+    best_candidate = None
+    best_composite_score = 0
+    second_best_composite = 0
+    
+    # Candidate size scales with quote length
+    min_win = max(1, int(quote_word_count * 0.55))
+    max_win = int(quote_word_count * 2.2)
+    
+    # To optimize, we search in a +/- 5 minute window around the whisper timestamp
+    SEARCH_RADIUS = 300 # seconds
+    search_start_time = max(0, whisper_start - SEARCH_RADIUS)
+    search_end_time = whisper_end + SEARCH_RADIUS
+    
+    # Find relevant caption indices
+    start_idx = 0
+    end_idx = len(captions)
+    for i, c in enumerate(captions):
+        if c['start'] < search_start_time: start_idx = i
+        if c['start'] > search_end_time: 
+            end_idx = i
+            break
+            
+    # Sliding window over indices
+    for i in range(start_idx, end_idx):
+        for win_size in range(1, 15): # Most quotes span < 15 caption events
+            if i + win_size > len(captions): break
+            
+            window_events = captions[i : i+win_size]
+            window_text = " ".join([e['norm_text'] for e in window_events])
+            window_words = window_text.split()
+            
+            # Length guardrails
+            if len(window_words) < min_win: continue
+            if len(window_words) > max_win: break
+            
+            # Scoring
+            sm_ratio = SequenceMatcher(None, norm_quote, window_text).ratio()
+            
+            # Token metrics
+            needle_set = set(quote_words)
+            candidate_set = set(window_words)
+            common = needle_set & candidate_set
+            
+            f1 = 0
+            recall = 0
+            if common:
+                prec = len(common) / len(candidate_set)
+                rec = len(common) / len(needle_set)
+                f1 = 2 * (prec * rec) / (prec + rec)
+                recall = rec
+            
+            # Composite Score: 0.6 * SM + 0.25 * F1 + 0.15 * Recall
+            composite = (0.6 * sm_ratio) + (0.25 * f1) + (0.15 * recall)
+            
+            if composite > best_composite_score:
+                # Check for overlap with existing best to track ambiguity
+                is_overlapping = False
+                if best_candidate:
+                    if not (i + win_size <= best_candidate['start_idx'] or i >= best_candidate['end_idx']):
+                        is_overlapping = True
+                
+                if not is_overlapping:
+                    second_best_composite = best_composite_score
+                
+                best_composite_score = composite
+                best_candidate = {
+                    'start_idx': i,
+                    'end_idx': i + win_size,
+                    'start_time': window_events[0]['start'],
+                    'end_time': window_events[-1]['end']
+                }
+            elif composite > second_best_composite:
+                # Track non-overlapping rivals for ambiguity check
+                is_overlapping = (not (i + win_size <= best_candidate['start_idx'] or i >= best_candidate['end_idx']))
+                if not is_overlapping:
+                    second_best_composite = composite
+
+    # Step 4: Confidence/ambiguity gates
+    if not best_candidate:
+        return None
+        
+    # Thresholds (Tuned based on user policy)
+    MIN_COMPOSITE = 0.75
+    MIN_MARGIN = 0.04 # Strict margin over second best
+    
+    if quote_word_count > 30:
+        MIN_COMPOSITE = 0.70 # Looser for very long quotes
+        MIN_MARGIN = 0.03
+        
+    is_ambiguous = (best_composite_score - second_best_composite) < MIN_MARGIN
+    
+    if best_composite_score < MIN_COMPOSITE or is_ambiguous:
+        reason = "low_confidence" if best_composite_score < MIN_COMPOSITE else "ambiguous_match"
+        print(f"  ⚠️ YT Alignment rejected ({reason}): score={best_composite_score:.2f}, margin={best_composite_score-second_best_composite:.3f}")
+        return None
+
+    # Step 5: Context window expansion (±30s) + sentence-safe alignment
+    exact_start = best_candidate['start_time']
+    exact_end = best_candidate['end_time']
+    
+    padded_start = max(0, int(exact_start - 30))
+    padded_end = int(exact_end + 30)
+    
+    # Sentence boundary alignment logic
+    # We look for punctuation (.!?) or gaps > 1.5s as sentence boundaries
+    final_start = padded_start
+    final_end = padded_end
+    
+    # Find nearest sentence start at/before padded_start
+    # Search within 15s of the padded start
+    for i in range(len(captions)-1, -1, -1):
+        c = captions[i]
+        if c['start'] <= padded_start:
+            # Check if this or previous event ended a sentence
+            is_sentence_boundary = False
+            if i > 0:
+                prev = captions[i-1]
+                if any(p in prev['raw_text'] for p in ['.', '!', '?']):
+                    is_sentence_boundary = True
+                elif c['start'] - prev['end'] > 1.5:
+                    is_sentence_boundary = True
+            
+            if is_sentence_boundary:
+                final_start = int(c['start'])
+                break
+        if c['start'] < padded_start - 15: break
+
+    # Find nearest sentence end at/after padded_end
+    for i in range(len(captions)):
+        c = captions[i]
+        if c['end'] >= padded_end:
+            if any(p in c['raw_text'] for p in ['.', '!', '?']):
+                final_end = int(c['end'])
+                break
+            # Or if next event starts after a big gap
+            if i + 1 < len(captions):
+                if captions[i+1]['start'] - c['end'] > 1.5:
+                    final_end = int(c['end'])
+                    break
+        if c['end'] > padded_end + 15: break
+            
+    confidence = round(best_composite_score, 3)
+    print(f"  🎯 YT Deterministic Match: {final_start}s–{final_end}s (conf={confidence}, margin={best_composite_score-second_best_composite:.3f})")
+    
+    return {
+        'start': final_start,
+        'end': final_end,
+        'confidence': confidence
+    }
+
+
 @app.function(image=image, secrets=[my_secret], timeout=600)
 def promote_quote_to_production(quote_id: str):
     """Move a quote from test_quotes to production quotes with robust ID resolution and auto-creation"""
@@ -237,26 +528,38 @@ def promote_quote_to_production(quote_id: str):
     # 5. Resolve Episode
     episode_name = data.get('episode_name', 'Unknown Episode').strip()
     # Use exact podcast_id + title match
-    e_res = supabase.table('episodes').select('id').eq('podcast_id', podcast_id).eq('title', episode_name).execute()
-    if e_res.data:
-        episode_id = e_res.data[0]['id']
-    else:
-        # Create new episode with a more robust slug or just use the title
-        # (We prefer a clean slug for the ID)
-        episode_id = slugify(episode_name[:60]) # Longer prefix
-        print(f"  ✨ Creating new episode: {episode_name} ({episode_id})")
-        supabase.table('episodes').upsert({
-            "id": episode_id,
-            "title": episode_name,
-            "podcast_id": podcast_id,
-            "date": data.get('date_published', datetime.now().strftime('%Y-%m-%d'))[:10]
-        }).execute()
-        
-        # Link guest to episode
-        supabase.table('guest_episodes').upsert({
-            "guest_id": guest_id,
-            "episode_id": episode_id
-        }).execute()
+    try:
+        e_res = supabase.table('episodes').select('id').eq('podcast_id', podcast_id).eq('title', episode_name).execute()
+        if e_res.data:
+            episode_id = e_res.data[0]['id']
+        else:
+            # Create new episode with a more robust slug or just use the title
+            # (We prefer a clean slug for the ID)
+            episode_id = slugify(episode_name[:60]) # Longer prefix
+            print(f"  ✨ Creating new episode: {episode_name} ({episode_id})")
+            
+            episode_payload = {
+                "id": episode_id,
+                "title": episode_name,
+                "podcast_id": podcast_id,
+                "date": data.get('date_published', datetime.now().strftime('%Y-%m-%d'))[:10],
+                "slug": episode_id  # Ensure slug is populated for consistency and policies
+            }
+            
+            e_insert = supabase.table('episodes').upsert(episode_payload).execute()
+            if not e_insert.data:
+                print(f"  ⚠️ Warning: Episode creation response empty for {episode_id}")
+            
+            # Link guest to episode
+            supabase.table('guest_episodes').upsert({
+                "guest_id": guest_id,
+                "episode_id": episode_id
+            }).execute()
+    except Exception as e:
+        print(f"  ❌ Episode resolution/creation failed: {e}")
+        # We continue anyway if we have an episode_id, but it might fail later due to FK constraints
+        if not episode_id:
+            return {"success": False, "error": f"Episode resolution failed: {e}"}
 
     # 6. Insert into production quotes
     prod_payload = {
@@ -282,8 +585,8 @@ def promote_quote_to_production(quote_id: str):
     try:
         res = supabase.table('quotes').upsert(prod_payload).execute()
         
-        # 7. Update source status to 'promoted' so it leaves the admin queue
-        supabase.table('test_quotes').update({"approval_status": "promoted"}).eq('id', data['id']).execute()
+        # 7. Update source status to 'promoted' so it leaves the admin queue and flag for RL training
+        supabase.table('test_quotes').update({"approval_status": "promoted", "used_for_training": True}).eq('id', data['id']).execute()
         
         print(f"✅ Successfully promoted to production and updated test_quotes! (Quote ID: {data['id']})")
         return {"success": True, "data": res.data}
@@ -315,11 +618,48 @@ def trigger_scheduled_processor():
     """Legacy trigger for scheduled"""
     return scheduled_processor.remote()
 
+def fetch_golden_quotes(supabase) -> str:
+    """Fetch recent promoted quotes to inject as RL examples."""
+    try:
+        # Fetch up to 5 quotes from 'test_quotes' that were promoted and marked for training
+        res = supabase.table('test_quotes') \
+            .select('quote_text') \
+            .eq('used_for_training', True) \
+            .order('updated_at', desc=True) \
+            .limit(5) \
+            .execute()
+        
+        quotes = [r['quote_text'] for r in res.data] if res.data else []
+        
+        # Fallback if no training quotes found yet
+        if not quotes:
+            res_fb = supabase.table('quotes') \
+                .select('text') \
+                .order('created_at', desc=True) \
+                .limit(5) \
+                .execute()
+            quotes = [r['text'] for r in res_fb.data] if res_fb.data else []
+            
+        if not quotes:
+            return ""
+            
+        golden_str = "\n".join([f'    - "{q}"' for q in quotes])
+        return f"\n    Examples of GREAT Quotes (Recent Approvals):\n{golden_str}\n"
+    except Exception as e:
+        print(f"⚠️ Failed to fetch golden quotes: {e}")
+        return ""
+
 def process_single_episode_logic(episode, feed, client, supabase):
     """Refactored logic for processing a single episode"""
     import subprocess
     import tempfile
     import time
+    
+    # RL Feedback Loop: Fetch recent human-approved quotes
+    golden_quotes_str = fetch_golden_quotes(supabase)
+    if golden_quotes_str:
+        print(f"  🧠 Loaded Golden Quotes for RL feedback loop")
+
     
     try:
         # Extract YouTube ID (Fixed Regex + Search Scope)
@@ -351,9 +691,20 @@ def process_single_episode_logic(episode, feed, client, supabase):
                 
         youtube_id = extract_youtube_id(search_text)
         if youtube_id:
-            print(f"📺 FOUND YouTube ID: {youtube_id}")
+            print(f"📺 FOUND YouTube ID (from RSS text): {youtube_id}")
         else:
-            print("❌ No YouTube ID found in this episode.")
+            print("❌ No YouTube ID found in RSS. Initiating fallback search...")
+            # Try searching with just the episode title first (often more successful for long titles)
+            youtube_id = search_youtube_for_episode(episode.title)
+            
+            if not youtube_id:
+                print("  ⚠️ Search with title only failed. Trying [Podcast Name] + [Episode Title]...")
+                youtube_id = search_youtube_for_episode(f"{feed['name']} {episode.title}")
+                
+            if youtube_id:
+                print(f"📺 FOUND YouTube ID (via search): {youtube_id}")
+            else:
+                print("❌ No matching full-length YouTube video found in search.")
         
         # Get audio URL
         audio_url = episode.enclosures[0].get('href') if episode.enclosures else None
@@ -445,7 +796,8 @@ def process_single_episode_logic(episode, feed, client, supabase):
                 feed['name'], 
                 episode.title, 
                 client,
-                chunk_num=i+1
+                chunk_num=i+1,
+                golden_quotes_str=golden_quotes_str
             )
             
             # Post-Process: Look up real timestamps
@@ -536,6 +888,24 @@ def process_single_episode_logic(episode, feed, client, supabase):
         # Save to database
         saved = []
         for i, quote in enumerate(all_quotes):
+            whisper_start = int(quote.get('clip_start', i * 60))
+            whisper_end = int(quote.get('clip_end', (i + 1) * 60))
+
+            # ── YouTube Caption Timestamp Alignment ──────────────────────────
+            # Try to replace Whisper timestamps with YouTube-native ones.
+            # Falls back silently to Whisper if captions are unavailable or
+            # the match confidence is below threshold.
+            yt_alignment = None
+            if youtube_id:
+                yt_alignment = align_timestamps_to_youtube_captions(
+                    quote['text'], youtube_id, whisper_start, whisper_end
+                )
+            
+            final_start = yt_alignment['start'] if yt_alignment else whisper_start
+            final_end   = yt_alignment['end']   if yt_alignment else whisper_end
+            yt_confidence = yt_alignment['confidence'] if yt_alignment else None
+            # ─────────────────────────────────────────────────────────────────
+
             record = {
                 'podcast_name': feed['name'],
                 'episode_name': episode.title[:100],
@@ -544,8 +914,8 @@ def process_single_episode_logic(episode, feed, client, supabase):
                 'quote_text': quote['text'],
                 'date_published': date_published,
                 'audio_clip_url': audio_url,
-                'timestamp_start': int(quote.get('clip_start', i * 60)),
-                'timestamp_end': int(quote.get('clip_end', (i + 1) * 60)),
+                'timestamp_start': final_start,
+                'timestamp_end': final_end,
                 'approval_status': 'pending',
                 'test_run': True,
                 'youtube_id': youtube_id,
@@ -553,12 +923,20 @@ def process_single_episode_logic(episode, feed, client, supabase):
                 'processing_cost': round(processing_cost, 4),
                 'episode_guid': episode_guid,
                 'quality_score': round(quote.get('quality_score', 0.0), 3),
-                'extraction_model': 'gpt-4o-mini'
+                'extraction_model': 'gpt-4o-mini',
+                'yt_timestamp_confidence': yt_confidence # NULL if failed, signals local bridge
             }
             
-            db_res = supabase.table('test_quotes').insert(record).execute()
-            if db_res.data:
-                saved.append(quote['text'][:80])
+            print(f"🚀 Attempting to save quote to Supabase: {quote['text'][:50]}...")
+            try:
+                db_res = supabase.table('test_quotes').insert(record).execute()
+                if db_res.data:
+                    print(f"✅ Saved successfully: ID {db_res.data[0]['id']}")
+                    saved.append(quote['text'][:80])
+                else:
+                    print(f"⚠️ Insert failed (no data returned): {db_res}")
+            except Exception as e:
+                print(f"❌ Supabase Insert Error: {e}")
         
         os.remove(temp_path)
         
@@ -574,10 +952,20 @@ def process_single_episode_logic(episode, feed, client, supabase):
             os.remove(temp_path)
         return {"episode": episode.title, "error": str(e)}
 
-def extract_quotes(text, podcast, episode, client, chunk_num=0):
+def extract_quotes(text, podcast, episode, client, chunk_num=0, golden_quotes_str=""):
     """Extract only the most insightful and provocative quotes"""
     
     chunk_info = f"(Section {chunk_num})" if chunk_num > 0 else ""
+    
+    if golden_quotes_str:
+        examples_block = golden_quotes_str
+    else:
+        examples_block = """
+    Examples of GREAT Quotes (Extract these):
+    - "Consumers are moving to a multipolar world where they see content from all sides..."
+    - "It is inevitable that AI generated content will surpass human content in volume..."
+    - "Being an ad tech company might not be a bad thing, a maximum might actually be..."
+    """
     
     prompt = f"""
     You are curating quotes for PodTakes.
@@ -602,11 +990,7 @@ def extract_quotes(text, podcast, episode, client, chunk_num=0):
     - Sales pitches ("We are the leading platform...")
     - Personal career history ("I started my career at...")
     - Generic business advice ("It's all about people...")
-    
-    Examples of GREAT Quotes (Extract these):
-    - "Consumers are moving to a multipolar world where they see content from all sides..."
-    - "It is inevitable that AI generated content will surpass human content in volume..."
-    - "Being an ad tech company might not be a bad thing, a maximum might actually be..."
+    {examples_block}
     
     Return JSON:
     {{
@@ -658,6 +1042,43 @@ def call_openai_with_retry(client, prompt):
                 
     print("❌ Max retries reached")
     return []
+
+def search_youtube_for_episode(query: str) -> str | None:
+    """Uses yt-dlp to search YouTube for the episode and pick the best full-length match."""
+    import yt_dlp
+    
+    ydl_opts = {
+        'format': 'best',
+        'noplaylist': True,
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'ytsearch3'
+    }
+    
+    print(f"  🔍 Searching YouTube for: '{query}'")
+    
+    # Explicitly force a search so yt-dlp doesn't mistakenly treat dots/patterns in the title as a valid URL
+    search_query = f"ytsearch3:{query}"
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(search_query, download=False)
+            if 'entries' in info:
+                for entry in info['entries']:
+                    duration = entry.get('duration', 0)
+                    if not duration: duration = 0
+                    
+                    # Exclude shorts (< 5 minutes / 300 seconds)
+                    if duration > 300:
+                        print(f"  ✅ Picked search result: {entry.get('title')[:60]}... ({duration}s)")
+                        return entry.get('id')
+                    else:
+                        print(f"  ⏭️ Ignored short search result: {entry.get('title')[:30]}... ({duration}s)")
+        except Exception as e:
+            print(f"  ❌ YouTube search failed: {e}")
+            
+    return None
 
 def extract_youtube_id(text):
     """Extract YouTube ID with improved regex and logging"""
