@@ -464,7 +464,8 @@ def promote_quote_to_production(quote_id: str):
     
     # 2. Resolve Podcast
     podcast_name = data.get('podcast_name', 'Unknown Podcast').strip()
-    p_res = supabase.table('podcasts').select('id').eq('name', podcast_name).execute()
+    # Case-insensitive resolution
+    p_res = supabase.table('podcasts').select('id').ilike('name', podcast_name).execute()
     if p_res.data:
         podcast_id = p_res.data[0]['id']
     else:
@@ -480,7 +481,8 @@ def promote_quote_to_production(quote_id: str):
 
     # 3. Resolve Category
     category_name = data.get('category', 'General').strip()
-    c_res = supabase.table('categories').select('id').eq('name', category_name).execute()
+    # Case-insensitive resolution
+    c_res = supabase.table('categories').select('id').ilike('name', category_name).execute()
     if c_res.data:
         category_id = c_res.data[0]['id']
     else:
