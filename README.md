@@ -1,28 +1,53 @@
-# Podcast Processor System
+# PodTakes podcast processor
 
-A complete podcast processing system with AI-powered quote extraction and audio clip generation.
+The backend for PodTakes: complete-episode ingestion, timestamped transcription,
+literal take extraction, adtech SME ranking and contextual-analysis proposals,
+and an auditable human publication workflow.
 
-## Features
-- 🎙️ Automatic podcast episode processing
-- 🤖 AI quote extraction using GPT
-- 🎬 Intelligent audio clip creation
-- 📊 Admin dashboard for quote approval
-- ⚡ 10x faster than traditional processing
+## Editorial contract
 
-## Tech Stack
-- **Processing**: Modal (serverless compute)
-- **Database**: Supabase
-- **AI**: OpenAI Whisper & GPT-3.5/4
-- **Frontend**: Next.js (Bolt)
-- **Storage**: Supabase Storage
+- Candidate extraction reads the complete transcript in overlapping chunks and
+  may abstain. It must not rewrite a speaker's words.
+- Direct evidence is tied to transcript segment IDs. Domain inference is labeled
+  separately from transcript-backed claims.
+- A high score does not publish anything. The take and its contextual analysis
+  require separate SME approvals.
+- Rejections capture a reason and the reviewer's expertise lens. Decisions are
+  append-only and usable for held-out evaluation.
+- Promotion is an atomic service-only database operation and refuses incomplete
+  source, speaker, category, or context data.
 
-## Setup
-1. Copy `.env.example` to `.env` and fill in your credentials
-2. Deploy Modal functions: `modal deploy modal_app/full_processor.py`
-3. Run database migrations in Supabase
-4. Deploy Bolt admin UI
+## Runtime
 
-## Usage
-- Process episodes: `modal run modal_app/full_processor.py::process_episode_with_ai`
-- Create clips: `modal run modal_app/full_processor.py::create_audio_clip --quote-id ID`
-- Monitor: `python monitoring/monitor.py`
+- Modal app: `podcast-processor-full`
+- Modal workspace: `aron-personal`
+- Public health: `GET /health`
+- Protected API: Supabase administrator JWT in `Authorization: Bearer ...`
+- Schedule: daily at `00:00 UTC`, subject to the database automation switch
+- Pipeline: `podtakes-sme-v1`
+
+The runtime image and Python dependencies are pinned in
+`modal_app/full_processor.py` and `requirements.txt`. Credentials live in the
+Modal secret `podtakes-secrets`; they are not included in the image or browser.
+
+## Local verification and deployment
+
+```bash
+venv/bin/python -m py_compile modal_app/full_processor.py
+venv/bin/python -m unittest tests.test_pipeline_quality -v
+venv/bin/modal profile current
+venv/bin/modal run modal_app/full_processor.py --action health
+venv/bin/modal deploy modal_app/full_processor.py
+```
+
+Run a bounded, durable operator smoke test only when an episode-processing cost
+is acceptable:
+
+```bash
+venv/bin/modal run modal_app/full_processor.py \
+  --action process --max-episodes 1 --days-back 30
+```
+
+The CLI processing action creates a `processing_jobs` record before it invokes
+the worker. See [OPERATIONS.md](OPERATIONS.md) for release order, monitoring,
+quality gates, and incident controls.
