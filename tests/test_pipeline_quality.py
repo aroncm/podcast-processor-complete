@@ -5,8 +5,10 @@ from types import SimpleNamespace
 from modal_app.full_processor import (
     build_extraction_chunks,
     call_openai_structured,
+    conversation_mapping_is_reviewable,
     context_evidence_is_source_bounded,
     deduplicate_candidates,
+    fetch_conversation_taxonomy,
     normalize_text,
 )
 
@@ -54,6 +56,53 @@ class PipelineQualityTests(unittest.TestCase):
         invalid = [{'evidence_type': 'direct_transcript', 'segment_ids': [7, 11]}]
         self.assertTrue(context_evidence_is_source_bounded(valid, 7, 9))
         self.assertFalse(context_evidence_is_source_bounded(invalid, 7, 9))
+
+    def test_conversation_mapping_requires_supported_named_connections(self):
+        mapping = {
+            'theme_name': 'Performance TV',
+            'theme_summary': 'How television is being connected to business outcomes.',
+            'question_text': 'What should performance accountability look like on TV?',
+            'question_summary': 'The measurement and buying assumptions in dispute.',
+            'connection_context': 'The take distinguishes TV measurement from search-style accountability while keeping addressability and incrementality in the same industry conversation.',
+            'related_people': [{
+                'name': 'Nikhil Lai',
+                'relationship': 'Speaker',
+                'description': 'Frames the measurement tension.',
+                'evidence_type': 'speaker_identity',
+                'evidence': 'Attributed speaker in the processed episode.',
+                'segment_ids': [],
+            }],
+            'related_companies': [],
+        }
+        self.assertTrue(conversation_mapping_is_reviewable(mapping, 7, 9))
+        mapping['related_people'][0]['evidence_type'] = 'direct_transcript'
+        mapping['related_people'][0]['segment_ids'] = [6]
+        self.assertFalse(conversation_mapping_is_reviewable(mapping, 7, 9))
+
+    def test_conversation_taxonomy_preserves_reviewed_vocabulary(self):
+        rows = {
+            'conversation_themes': [{'id': 'theme-1', 'name': 'Performance TV', 'summary': 'TV and performance media.'}],
+            'conversation_questions': [{'theme_id': 'theme-1', 'question_text': 'How should TV be measured?', 'summary': 'Measurement expectations.'}],
+            'conversation_entities': [{'entity_type': 'company', 'name': 'Forrester', 'description': 'Research organization.'}],
+        }
+
+        class Query:
+            def __init__(self, data):
+                self.data = data
+
+            def select(self, *_args): return self
+            def eq(self, *_args): return self
+            def order(self, *_args, **_kwargs): return self
+            def limit(self, *_args): return self
+            def execute(self): return SimpleNamespace(data=self.data)
+
+        class Database:
+            def table(self, name): return Query(rows[name])
+
+        taxonomy = json.loads(fetch_conversation_taxonomy(Database()))
+        self.assertEqual(taxonomy['themes'][0]['name'], 'Performance TV')
+        self.assertEqual(taxonomy['questions'][0]['theme'], 'Performance TV')
+        self.assertEqual(taxonomy['entities'][0]['name'], 'Forrester')
 
     def test_structured_call_uses_strict_schema_and_no_storage(self):
         calls = []

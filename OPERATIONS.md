@@ -37,7 +37,7 @@ An operator must refresh the session or sign in again after the claim changes.
 
 `processing_jobs` is the durable source of truth. Normal state progression is:
 
-`queued -> claimed -> downloading -> transcribing -> extracting -> ranking -> staging -> succeeded`
+`queued -> claimed -> downloading -> transcribing -> extracting -> ranking -> mapping -> staging -> succeeded`
 
 Every in-progress job updates `heartbeat_at`, `progress`, and the current episode.
 A failed job records `error_code`, bounded `error_message`, result details, and
@@ -58,17 +58,23 @@ limit 20;
 
 Before approving a take, the SME should confirm:
 
-- the quote is literal and its segment/timestamp bounds contain the claim;
-- the claim is specific enough to change an industry assumption or decision;
-- the context names the mechanism, stakeholders, and real tradeoff;
+- the quote is literal and its segment/timestamp bounds contain the complete take;
+- the take is specific enough to change an industry assumption or decision;
+- the context connects the take to a real industry mechanism, stakeholder tension,
+  prior idea, or adjacent debate without announcing its importance;
 - transcript evidence and domain inference are labeled correctly;
-- the counterpoint is substantive rather than a generic caveat;
 - the category and speaker identity are defensible;
 - the analysis does not add an unsupported fact or imply false certainty.
+- the proposed theme is durable enough to connect multiple episodes rather than
+  acting as a category or episode summary;
+- the question is open, legible, and genuinely answered by the take;
+- every person and company connection has a recorded source or explicit
+  editorial basis; inferred employment or partnership is never accepted.
 
-Take approval and context approval are separate. Promotion remains disabled until
-both are complete. A reject decision requires a reason. Edits and undo actions
-append new `curation_decisions`; they do not rewrite history.
+Take, context, and conversation-mapping approvals are separate. Promotion remains
+disabled until all three are complete, then the production quote and conversation
+graph are written atomically. A reject decision requires a reason. Edits and undo
+actions append new `curation_decisions`; they do not rewrite history.
 
 ## Model evaluation gate
 

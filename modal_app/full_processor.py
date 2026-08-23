@@ -29,10 +29,11 @@ image = modal.Image.debian_slim() \
 #   modal secret create podtakes-secrets --from-dotenv .env
 my_secret = modal.Secret.from_name("podtakes-secrets")
 
-PIPELINE_VERSION = "podtakes-sme-v1"
+PIPELINE_VERSION = "podtakes-sme-v2"
 EXTRACTION_PROMPT_VERSION = "take-candidates-v2"
-RANKING_PROMPT_VERSION = "adtech-sme-ranking-v2"
-CONTEXT_PROMPT_VERSION = "adtech-sme-context-v1"
+RANKING_PROMPT_VERSION = "adtech-sme-ranking-v3"
+CONTEXT_PROMPT_VERSION = "adtech-sme-context-v2"
+MAPPING_PROMPT_VERSION = "adtech-conversation-mapping-v1"
 
 
 def utcnow_iso() -> str:
@@ -601,7 +602,7 @@ def promote_quote_to_production(quote_id: str, reviewer_id: str = None):
     supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
     try:
         result = supabase.rpc(
-            "promote_curated_quote",
+            "promote_curated_quote_with_conversation",
             {"p_quote_id": quote_id, "p_reviewer_id": reviewer_id},
         ).execute()
         production_quote_id = result.data
@@ -718,6 +719,69 @@ def fetch_curation_examples(supabase) -> str:
         return "\n".join(sections)
     except Exception as e:
         print(f"⚠️ Failed to fetch balanced curation examples: {e}")
+        return ""
+
+
+def fetch_conversation_taxonomy(supabase) -> str:
+    """Give mapping a reviewed vocabulary so equivalent ideas converge over time."""
+    try:
+        themes_result = (
+            supabase.table("conversation_themes")
+            .select("id,name,summary")
+            .eq("publication_status", "published")
+            .order("updated_at", desc=True)
+            .limit(80)
+            .execute()
+        )
+        questions_result = (
+            supabase.table("conversation_questions")
+            .select("theme_id,question_text,summary")
+            .eq("publication_status", "published")
+            .limit(240)
+            .execute()
+        )
+        entities_result = (
+            supabase.table("conversation_entities")
+            .select("entity_type,name,description")
+            .eq("publication_status", "published")
+            .order("name")
+            .limit(400)
+            .execute()
+        )
+
+        themes = themes_result.data or []
+        questions = questions_result.data or []
+        entities = entities_result.data or []
+        if not themes and not questions and not entities:
+            return ""
+
+        theme_names = {row["id"]: row.get("name") for row in themes}
+        reviewed_graph = {
+            "themes": [
+                {"name": row.get("name"), "summary": row.get("summary")}
+                for row in themes
+            ],
+            "questions": [
+                {
+                    "theme": theme_names.get(row.get("theme_id")),
+                    "question": row.get("question_text"),
+                    "summary": row.get("summary"),
+                }
+                for row in questions
+            ],
+            "entities": [
+                {
+                    "type": row.get("entity_type"),
+                    "name": row.get("name"),
+                    "description": row.get("description"),
+                }
+                for row in entities
+            ],
+        }
+        return json.dumps(reviewed_graph, ensure_ascii=False)
+    except Exception as exc:
+        # The v2 migration may not yet be applied during a controlled rollout.
+        print(f"⚠️ Conversation vocabulary unavailable: {exc}")
         return ""
 
 
@@ -884,6 +948,43 @@ def context_evidence_is_source_bounded(evidence_items, start_segment, end_segmen
     return True
 
 
+def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
+    """Reject malformed connection proposals without rejecting the underlying take."""
+    required_text = (
+        "theme_name", "theme_summary", "question_text",
+        "question_summary", "connection_context",
+    )
+    if any(not str(selection.get(field, "")).strip() for field in required_text):
+        return False
+
+    people = selection.get("related_people") or []
+    companies = selection.get("related_companies") or []
+    if not isinstance(people, list) or not isinstance(companies, list):
+        return False
+
+    allowed_evidence_types = {
+        "direct_transcript", "episode_metadata", "speaker_identity",
+        "editorial_connection",
+    }
+    for entity in people + companies:
+        if not isinstance(entity, dict):
+            return False
+        if any(not str(entity.get(field, "")).strip() for field in ("name", "relationship", "evidence")):
+            return False
+        if entity.get("evidence_type") not in allowed_evidence_types:
+            return False
+        segment_ids = entity.get("segment_ids") or []
+        if entity.get("evidence_type") == "direct_transcript" and (
+            not segment_ids
+            or any(
+                int(segment_id) < int(start_segment) or int(segment_id) > int(end_segment)
+                for segment_id in segment_ids
+            )
+        ):
+            return False
+    return True
+
+
 def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
     """Refactored logic for processing a single episode"""
     import subprocess
@@ -894,6 +995,9 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
     curation_examples = fetch_curation_examples(supabase)
     if curation_examples:
         print("  🧠 Loaded balanced SME preference examples")
+    conversation_taxonomy = fetch_conversation_taxonomy(supabase)
+    if conversation_taxonomy:
+        print("  🕸️ Loaded the SME-approved conversation vocabulary")
 
     
     try:
@@ -1111,7 +1215,18 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             episode.title,
             client,
             curation_examples=curation_examples,
+            conversation_taxonomy=conversation_taxonomy,
         )[:8]
+
+        update_processing_job(
+            supabase,
+            job_id,
+            "mapping",
+            progress={
+                "grounded_candidates": len(all_candidates),
+                "mapped_candidates": len(all_quotes),
+            },
+        )
         
         print(f"💎 Extracted {len(all_quotes)} high-quality takes")
         
@@ -1129,6 +1244,12 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         saved = []
         per_quote_cost = processing_cost / max(len(all_quotes), 1)
         candidate_set_id = str(uuid.uuid4())
+        update_processing_job(
+            supabase,
+            job_id,
+            "staging",
+            progress={"candidates_ready_for_sme_review": len(all_quotes)},
+        )
         for i, quote in enumerate(all_quotes):
             whisper_start = int(quote.get('clip_start', i * 60))
             whisper_end = int(quote.get('clip_end', (i + 1) * 60))
@@ -1192,6 +1313,18 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'context_prompt_version': CONTEXT_PROMPT_VERSION,
                 # Context is never public until an SME approves it explicitly.
                 'context_review_status': 'unreviewed',
+                'proposed_theme_name': quote.get('theme_name'),
+                'proposed_theme_summary': quote.get('theme_summary'),
+                'proposed_question_text': quote.get('question_text'),
+                'proposed_question_summary': quote.get('question_summary'),
+                'proposed_people': quote.get('related_people', []),
+                'proposed_companies': quote.get('related_companies', []),
+                'connection_context': quote.get('connection_context'),
+                'mapping_confidence': quote.get('mapping_confidence'),
+                'mapping_model': os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                'mapping_prompt_version': MAPPING_PROMPT_VERSION,
+                # Themes, questions, and entities have their own SME gate.
+                'mapping_review_status': 'unreviewed',
             }
             
             print(f"🚀 Attempting to save quote to Supabase: {quote['text'][:50]}...")
@@ -1383,6 +1516,7 @@ def rank_and_contextualize_quotes(
     episode,
     client,
     curation_examples="",
+    conversation_taxonomy="",
 ):
     """Apply an adtech-specific editorial rubric and draft evidence-linked context."""
     if not candidates:
@@ -1403,16 +1537,13 @@ def rank_and_contextualize_quotes(
                         "ranking_reason": {"type": "string"},
                         "editorial_context": {"type": "string"},
                         "context_confidence": {"type": "number"},
-                        "why_it_matters": {"type": "string"},
-                        "stakeholders": {"type": "array", "items": {"type": "string"}},
-                        "counterpoint": {"type": "string"},
                         "genericness_check": {"type": "string", "enum": ["pass", "fail"]},
                         "context_evidence": {
                             "type": "array",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "claim": {"type": "string"},
+                                    "statement": {"type": "string"},
                                     "support": {"type": "string"},
                                     "evidence_type": {
                                         "type": "string",
@@ -1424,22 +1555,62 @@ def rank_and_contextualize_quotes(
                                     },
                                     "segment_ids": {"type": "array", "items": {"type": "integer"}},
                                 },
-                                "required": ["claim", "support", "evidence_type", "segment_ids"],
+                                "required": ["statement", "support", "evidence_type", "segment_ids"],
                                 "additionalProperties": False,
                             },
+                        },
+                        "theme_name": {"type": "string"},
+                        "theme_summary": {"type": "string"},
+                        "question_text": {"type": "string"},
+                        "question_summary": {"type": "string"},
+                        "connection_context": {"type": "string"},
+                        "mapping_confidence": {"type": "number"},
+                        "related_people": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/entity_connection"},
+                        },
+                        "related_companies": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/entity_connection"},
                         },
                     },
                     "required": [
                         "candidate_index", "quality_score", "ranking_reason",
-                        "editorial_context", "context_confidence", "why_it_matters",
-                        "stakeholders", "counterpoint", "genericness_check",
-                        "context_evidence"
+                        "editorial_context", "context_confidence",
+                        "genericness_check", "context_evidence", "theme_name",
+                        "theme_summary", "question_text", "question_summary",
+                        "connection_context", "mapping_confidence",
+                        "related_people", "related_companies"
                     ],
                     "additionalProperties": False,
                 },
             }
         },
         "required": ["selections"],
+        "$defs": {
+            "entity_connection": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "relationship": {"type": "string"},
+                    "description": {"type": "string"},
+                    "evidence_type": {
+                        "type": "string",
+                        "enum": [
+                            "direct_transcript", "episode_metadata",
+                            "speaker_identity", "editorial_connection"
+                        ],
+                    },
+                    "evidence": {"type": "string"},
+                    "segment_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": [
+                    "name", "relationship", "description", "evidence_type",
+                    "evidence", "segment_ids"
+                ],
+                "additionalProperties": False,
+            }
+        },
         "additionalProperties": False,
     }
 
@@ -1477,21 +1648,34 @@ Editorial standard:
    identity/addressability, measurement and incrementality, privacy, supply-path
    economics, publisher monetization, agency/brand incentives, CTV, retail media,
    walled gardens, or AI's effect on media and advertising economics.
-3. `editorial_context` must explain why this exact take matters in 60-110 words.
-   Name the mechanism, affected stakeholder, and practical tension. Do not merely
-   paraphrase the quote.
+3. `editorial_context` must situate this exact take in the industry conversation
+   in 60-110 words. Connect it to a real mechanism, stakeholder tension, prior
+   idea, or adjacent debate. Do not paraphrase the quote, announce its importance,
+   render a verdict, or use a claim/consequence template.
 4. Distinguish transcript facts from domain inference in `context_evidence`.
    Never invent a company fact, market statistic, event, or speaker intent.
 5. `genericness_check` must be `fail` if the analysis could be attached to an
    unrelated business quote with only noun substitutions.
 6. Avoid generic AI prose such as "in today's rapidly evolving landscape",
    "underscores the importance", "game changer", or "businesses must adapt".
-7. Acknowledge the strongest reasonable counterpoint rather than presenting
-   provocation as settled fact.
-8. Scores are from 0 to 1. Reserve 0.90+ for unusually specific, consequential,
+7. Propose one durable `theme_name` broad enough to connect multiple episodes,
+   and one open `question_text` that this take helps answer. A theme is not a
+   category label or episode summary. `connection_context` should explain how
+   the speaker joins that conversation in 35-80 words without hype.
+8. Add people and companies only when their relationship is supported by the
+   speaker identity, episode metadata, the quoted transcript, or a clearly
+   labeled editorial connection. Never infer employment, partnership, or an
+   organizational relationship from general industry knowledge.
+9. When the approved graph below already contains the same theme, question, or
+   entity, reuse its exact name. Propose a new label only when the distinction is
+   meaningful enough that an SME should preserve it as a separate node.
+10. Scores are from 0 to 1. Reserve 0.90+ for unusually specific, consequential,
    source-grounded insight.
 
 {curation_examples}
+
+EXISTING SME-APPROVED CONVERSATION GRAPH:
+{conversation_taxonomy or "No approved graph vocabulary exists yet."}
 
 CANDIDATES:
 {json.dumps(compact_candidates, ensure_ascii=False)}
@@ -1499,9 +1683,12 @@ CANDIDATES:
     system_prompt = """
 You are PodTakes' senior industry editor. Your standard is an expert adtech
 publication, not an AI summary product. Your job is to identify decision-relevant
-insight and draft rigorous context for SME review. Do not optimize for quantity,
-engagement bait, or superficial controversy. Treat every factual statement as a
-claim that needs either direct transcript support or an explicit inference label.
+insight, place it inside ongoing industry discourse, and propose connections for
+SME review. Do not optimize for quantity, engagement bait, or superficial
+controversy. Write like an operator who knows the history, incentives, people,
+and companies involved. Every factual statement still needs direct transcript
+support or an explicit inference label, but the editorial posture is connective,
+not prosecutorial.
 """
     data = call_openai_structured(
         client,
@@ -1543,6 +1730,12 @@ claim that needs either direct transcript support or an explicit inference label
         ):
             continue
 
+        mapping_is_reviewable = conversation_mapping_is_reviewable(
+            selection,
+            candidate_start,
+            candidate_end,
+        )
+
         candidate = dict(candidates[index])
         candidate.update({
             "quality_score": quality,
@@ -1550,9 +1743,17 @@ claim that needs either direct transcript support or an explicit inference label
             "editorial_context": editorial_context,
             "context_confidence": confidence,
             "context_evidence": evidence_items,
-            "why_it_matters": selection.get("why_it_matters"),
-            "stakeholders": selection.get("stakeholders", []),
-            "counterpoint": selection.get("counterpoint"),
+            "theme_name": selection.get("theme_name") if mapping_is_reviewable else None,
+            "theme_summary": selection.get("theme_summary") if mapping_is_reviewable else None,
+            "question_text": selection.get("question_text") if mapping_is_reviewable else None,
+            "question_summary": selection.get("question_summary") if mapping_is_reviewable else None,
+            "connection_context": selection.get("connection_context") if mapping_is_reviewable else None,
+            "mapping_confidence": (
+                max(0.0, min(1.0, float(selection.get("mapping_confidence", 0))))
+                if mapping_is_reviewable else 0.0
+            ),
+            "related_people": selection.get("related_people", []) if mapping_is_reviewable else [],
+            "related_companies": selection.get("related_companies", []) if mapping_is_reviewable else [],
             "extraction_model": model,
         })
         selected.append(candidate)
@@ -1996,7 +2197,7 @@ def scheduled_processor():
         )
         if existing_job.data and existing_job.data[0].get("state") in {
             "queued", "claimed", "downloading", "transcribing", "extracting",
-            "ranking", "staging", "succeeded"
+            "ranking", "mapping", "staging", "succeeded"
         }:
             result = existing_job.data[0].get("result") or {
                 "success": True,
@@ -2103,6 +2304,13 @@ def fastapi_app():
         action: str = "approve"
         quote_text: str | None = None
         editorial_context: str | None = None
+        proposed_theme_name: str | None = None
+        proposed_theme_summary: str | None = None
+        proposed_question_text: str | None = None
+        proposed_question_summary: str | None = None
+        proposed_people: list[dict] | None = None
+        proposed_companies: list[dict] | None = None
+        connection_context: str | None = None
         speaker_name: str | None = None
         category: str | None = None
         speaker_title: str | None = None
@@ -2286,11 +2494,14 @@ def fastapi_app():
     async def review_quote_endpoint(req: ReviewRequest, admin=Depends(require_admin)):
         allowed_actions = {
             "approve", "reject", "edit", "approve_context",
-            "reject_context", "undo",
+            "reject_context", "approve_mapping", "reject_mapping", "undo",
         }
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported review action")
-        if req.action in {"approve", "reject", "approve_context", "reject_context"} and not req.reviewer_expertise:
+        if req.action in {
+            "approve", "reject", "approve_context", "reject_context",
+            "approve_mapping", "reject_mapping",
+        } and not req.reviewer_expertise:
             raise HTTPException(status_code=422, detail="Reviewer expertise is required for an editorial decision")
 
         supabase = service_client()
@@ -2319,7 +2530,12 @@ def fastapi_app():
                 "speaker_title", "speaker_company", "speaker_linkedin",
                 "youtube_id", "podcast_name", "episode_name",
                 "timestamp_start", "timestamp_end", "youtube_offset",
-                "rejection_reason", "editorial_notes",
+                "rejection_reason", "editorial_notes", "proposed_theme_name",
+                "proposed_theme_summary", "proposed_question_text",
+                "proposed_question_summary", "proposed_people",
+                "proposed_companies", "connection_context",
+                "mapping_review_status", "mapping_reviewed_by",
+                "mapping_reviewed_at",
             }
             updates = {key: value for key, value in restore.items() if key in allowed_restore}
             if not updates:
@@ -2328,6 +2544,13 @@ def fastapi_app():
             editable_values = {
                 "quote_text": req.quote_text,
                 "editorial_context": req.editorial_context,
+                "proposed_theme_name": req.proposed_theme_name,
+                "proposed_theme_summary": req.proposed_theme_summary,
+                "proposed_question_text": req.proposed_question_text,
+                "proposed_question_summary": req.proposed_question_summary,
+                "proposed_people": req.proposed_people,
+                "proposed_companies": req.proposed_companies,
+                "connection_context": req.connection_context,
                 "speaker_name": req.speaker_name,
                 "category": req.category,
                 "speaker_title": req.speaker_title,
@@ -2370,6 +2593,48 @@ def fastapi_app():
                 if not req.reason_code and not req.reason_detail:
                     raise HTTPException(status_code=422, detail="A context rejection reason is required")
                 updates["context_review_status"] = "rejected"
+            elif req.action == "approve_mapping":
+                mapping_values = {
+                    "theme": updates.get("proposed_theme_name", before.get("proposed_theme_name")),
+                    "theme_summary": updates.get("proposed_theme_summary", before.get("proposed_theme_summary")),
+                    "question": updates.get("proposed_question_text", before.get("proposed_question_text")),
+                    "question_summary": updates.get("proposed_question_summary", before.get("proposed_question_summary")),
+                    "connection_context": updates.get("connection_context", before.get("connection_context")),
+                }
+                if any(not str(value or "").strip() for value in mapping_values.values()):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Theme, theme summary, question, and connection context are required",
+                    )
+                if len(str(mapping_values["connection_context"]).split()) < 20:
+                    raise HTTPException(status_code=422, detail="Connection context is too thin for SME approval")
+                reviewable_mapping = {
+                    "theme_name": mapping_values["theme"],
+                    "theme_summary": mapping_values["theme_summary"],
+                    "question_text": mapping_values["question"],
+                    "question_summary": mapping_values["question_summary"],
+                    "connection_context": mapping_values["connection_context"],
+                    "related_people": updates.get("proposed_people", before.get("proposed_people")) or [],
+                    "related_companies": updates.get("proposed_companies", before.get("proposed_companies")) or [],
+                }
+                if not conversation_mapping_is_reviewable(
+                    reviewable_mapping,
+                    before.get("source_start_segment") if before.get("source_start_segment") is not None else -1,
+                    before.get("source_end_segment") if before.get("source_end_segment") is not None else -1,
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Connections require complete labels and reviewable evidence inside the recorded source boundary",
+                    )
+                updates.update({
+                    "mapping_review_status": "approved",
+                    "mapping_reviewed_by": admin["id"],
+                    "mapping_reviewed_at": utcnow_iso(),
+                })
+            elif req.action == "reject_mapping":
+                if not req.reason_code and not req.reason_detail:
+                    raise HTTPException(status_code=422, detail="A mapping rejection reason is required")
+                updates["mapping_review_status"] = "rejected"
 
         updates["updated_at"] = utcnow_iso()
         updated = supabase.table("test_quotes").update(updates).eq("id", req.quote_id).execute()
@@ -2383,7 +2648,12 @@ def fastapi_app():
                     "speaker_title", "speaker_company", "speaker_linkedin",
                     "youtube_id", "podcast_name", "episode_name",
                     "timestamp_start", "timestamp_end", "youtube_offset",
-                    "rejection_reason", "editorial_notes",
+                    "rejection_reason", "editorial_notes", "proposed_theme_name",
+                    "proposed_theme_summary", "proposed_question_text",
+                    "proposed_question_summary", "proposed_people",
+                    "proposed_companies", "connection_context",
+                    "mapping_review_status", "mapping_reviewed_by",
+                    "mapping_reviewed_at",
                 )
             },
             "after": updates,
@@ -2403,7 +2673,11 @@ def fastapi_app():
             "candidate_rank": before.get("candidate_rank"),
             "candidate_set_id": before.get("candidate_set_id"),
             "model_version": before.get("extraction_model"),
-            "prompt_version": before.get("context_prompt_version"),
+            "prompt_version": (
+                before.get("mapping_prompt_version")
+                if "mapping" in req.action
+                else before.get("context_prompt_version")
+            ),
             "metadata": audit_metadata,
         }).execute()
         return {

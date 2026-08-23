@@ -1,8 +1,8 @@
 # PodTakes podcast processor
 
 The backend for PodTakes: complete-episode ingestion, timestamped transcription,
-literal take extraction, adtech SME ranking and contextual-analysis proposals,
-and an auditable human publication workflow.
+literal take extraction, adtech SME ranking, contextual-analysis proposals,
+conversation-graph proposals, and an auditable human publication workflow.
 
 ## Editorial contract
 
@@ -10,12 +10,12 @@ and an auditable human publication workflow.
   may abstain. It must not rewrite a speaker's words.
 - Direct evidence is tied to transcript segment IDs. Domain inference is labeled
   separately from transcript-backed claims.
-- A high score does not publish anything. The take and its contextual analysis
-  require separate SME approvals.
+- A high score does not publish anything. The take, its industry context, and its
+  theme/question/entity mapping require three separate SME approvals.
 - Rejections capture a reason and the reviewer's expertise lens. Decisions are
   append-only and usable for held-out evaluation.
 - Promotion is an atomic service-only database operation and refuses incomplete
-  source, speaker, category, or context data.
+  source, speaker, category, context, or conversation-mapping data.
 
 ## Runtime
 
@@ -24,7 +24,7 @@ and an auditable human publication workflow.
 - Public health: `GET /health`
 - Protected API: Supabase administrator JWT in `Authorization: Bearer ...`
 - Schedule: daily at `00:00 UTC`, subject to the database automation switch
-- Pipeline: `podtakes-sme-v1`
+- Pipeline: `podtakes-sme-v2`
 
 The runtime image and Python dependencies are pinned in
 `modal_app/full_processor.py` and `requirements.txt`. Credentials live in the
