@@ -4,11 +4,14 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     build_extraction_chunks,
+    build_caption_evidence,
+    align_quote_to_segments,
     call_openai_structured,
     conversation_mapping_is_reviewable,
     context_evidence_is_source_bounded,
     deduplicate_candidates,
     fetch_conversation_taxonomy,
+    historical_mapping_is_reviewable,
     normalize_text,
 )
 
@@ -78,6 +81,68 @@ class PipelineQualityTests(unittest.TestCase):
         mapping['related_people'][0]['evidence_type'] = 'direct_transcript'
         mapping['related_people'][0]['segment_ids'] = [6]
         self.assertFalse(conversation_mapping_is_reviewable(mapping, 7, 9))
+
+    def test_caption_evidence_is_numbered_and_bounded(self):
+        captions = [
+            {'start': index * 10, 'end': index * 10 + 5, 'raw_text': f'caption {index}'}
+            for index in range(20)
+        ]
+        evidence = build_caption_evidence(
+            captions,
+            start_time=50,
+            end_time=70,
+            padding_seconds=10,
+            max_events=10,
+        )
+        self.assertEqual(evidence['start_segment'], 4)
+        self.assertEqual(evidence['end_segment'], 8)
+        self.assertIn('[4] caption 4', evidence['excerpt'])
+        self.assertIn('[8] caption 8', evidence['excerpt'])
+
+    def test_transcript_alignment_requires_a_unique_high_confidence_match(self):
+        segments = [
+            {'start': 0, 'end': 4, 'raw_text': 'A generic opening about the market.'},
+            {'start': 10, 'end': 14, 'raw_text': 'Television measurement needs a different feedback loop'},
+            {'start': 14, 'end': 18, 'raw_text': 'than search attribution because exposure and response are separated.'},
+            {'start': 30, 'end': 34, 'raw_text': 'A closing thought about teams.'},
+        ]
+        aligned = align_quote_to_segments(
+            'Television measurement needs a different feedback loop than search attribution because exposure and response are separated.',
+            segments,
+            expected_start=9,
+            expected_end=20,
+        )
+        self.assertIsNotNone(aligned)
+        self.assertEqual(aligned['start'], 10)
+        self.assertEqual(aligned['end'], 18)
+        self.assertGreaterEqual(aligned['confidence'], 0.75)
+
+    def test_historical_mapping_quality_gate_requires_confidence_and_depth(self):
+        mapping = {
+            'theme_name': 'Performance TV',
+            'theme_summary': 'How television is being connected to accountable media outcomes.',
+            'question_text': 'What should performance accountability look like on television?',
+            'question_summary': 'The measurement, optimization, and market incentives in dispute.',
+            'connection_context': (
+                'The take separates television accountability from search-style attribution and '
+                'places incrementality, addressability, and buyer expectations in the same '
+                'operating debate. It gives practitioners a concrete way to discuss which '
+                'feedback loops belong in performance television and which would distort it.'
+            ),
+            'mapping_confidence': 0.84,
+            'related_people': [{
+                'name': 'Example Speaker',
+                'relationship': 'Speaker',
+                'description': 'Introduces the measurement distinction.',
+                'evidence_type': 'speaker_identity',
+                'evidence': 'Named speaker in episode metadata.',
+                'segment_ids': [],
+            }],
+            'related_companies': [],
+        }
+        self.assertTrue(historical_mapping_is_reviewable(mapping, 4, 8))
+        mapping['mapping_confidence'] = 0.6
+        self.assertFalse(historical_mapping_is_reviewable(mapping, 4, 8))
 
     def test_conversation_taxonomy_preserves_reviewed_vocabulary(self):
         rows = {

@@ -34,6 +34,7 @@ EXTRACTION_PROMPT_VERSION = "take-candidates-v2"
 RANKING_PROMPT_VERSION = "adtech-sme-ranking-v3"
 CONTEXT_PROMPT_VERSION = "adtech-sme-context-v2"
 MAPPING_PROMPT_VERSION = "adtech-conversation-mapping-v1"
+HISTORICAL_MAPPING_PROMPT_VERSION = "adtech-historical-conversation-mapping-v1"
 
 
 def utcnow_iso() -> str:
@@ -332,14 +333,40 @@ def normalize_text(text: str) -> str:
 _caption_cache: dict = {}
 
 def get_yt_captions(youtube_id: str) -> list | None:
-    """Fetch and parse YouTube captions using yt-dlp (json3 format).
+    """Fetch captions through the transcript API, then yt-dlp as a fallback.
     Results are cached in-memory per video to avoid redundant API calls."""
     import yt_dlp
     import requests
     import json
+    import html
+    from youtube_transcript_api import YouTubeTranscriptApi
     
     if youtube_id in _caption_cache:
         return _caption_cache[youtube_id]
+
+    try:
+        print(f"  🎬 Fetching YouTube captions for {youtube_id} via transcript API...")
+        transcript = YouTubeTranscriptApi().fetch(youtube_id, languages=['en'])
+        processed = []
+        for snippet in transcript:
+            text = html.unescape(str(getattr(snippet, 'text', '') or '')).strip()
+            if not text:
+                continue
+            start = float(getattr(snippet, 'start', 0) or 0)
+            duration = float(getattr(snippet, 'duration', 0) or 0)
+            processed.append({
+                'start': start,
+                'end': start + duration,
+                'raw_text': text,
+                'norm_text': normalize_text(text),
+                'word_count': len(text.split()),
+            })
+        if processed:
+            print(f"  ✅ Parsed {len(processed)} transcript API events for {youtube_id}")
+            _caption_cache[youtube_id] = processed
+            return processed
+    except Exception as exc:
+        print(f"  ⚠️  Transcript API unavailable for {youtube_id}: {exc}")
     
     try:
         print(f"  🎬 Fetching YouTube captions for {youtube_id} via yt-dlp...")
@@ -421,6 +448,21 @@ def get_yt_captions(youtube_id: str) -> list | None:
         print(f"  ⚠️  Caption fetch error for {youtube_id}: {e}")
         _caption_cache[youtube_id] = None
         return None
+
+
+@app.function(image=image, secrets=[my_secret], timeout=180)
+def caption_source_check(youtube_id: str):
+    """Read-only operator check for caption availability from Modal."""
+    captions = get_yt_captions(youtube_id)
+    if not captions:
+        return {"ok": False, "youtube_id": youtube_id, "events": 0}
+    return {
+        "ok": True,
+        "youtube_id": youtube_id,
+        "events": len(captions),
+        "first_start": captions[0]["start"],
+        "last_end": captions[-1]["end"],
+    }
 
 def align_timestamps_to_youtube_captions(
     quote_text: str,
@@ -983,6 +1025,363 @@ def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
         ):
             return False
     return True
+
+
+def build_caption_evidence(captions, start_time, end_time, padding_seconds=45, max_events=120):
+    """Build a bounded, numbered caption window for historical mapping review."""
+    if not captions or end_time <= start_time:
+        return None
+    window_start = max(0.0, float(start_time) - float(padding_seconds))
+    window_end = float(end_time) + float(padding_seconds)
+    selected = []
+    for source_index, caption in enumerate(captions):
+        caption_start = float(caption.get("start", 0))
+        caption_end = float(caption.get("end", caption_start))
+        if caption_end < window_start or caption_start > window_end:
+            continue
+        text = str(caption.get("raw_text") or "").strip()
+        if not text:
+            continue
+        selected.append({
+            "id": source_index,
+            "start": caption_start,
+            "end": caption_end,
+            "text": text,
+        })
+        if len(selected) >= max_events:
+            break
+    if not selected:
+        return None
+    return {
+        "segments": selected,
+        "start_segment": selected[0]["id"],
+        "end_segment": selected[-1]["id"],
+        "excerpt": "\n".join(f"[{row['id']}] {row['text']}" for row in selected),
+    }
+
+
+def align_quote_to_segments(quote_text, segments, expected_start, expected_end):
+    """Strictly align a published quote to timestamped transcript segments."""
+    from difflib import SequenceMatcher
+
+    normalized_quote = normalize_text(quote_text)
+    quote_words = normalized_quote.split()
+    if len(quote_words) < 5 or not segments:
+        return None
+    search_start = max(0.0, float(expected_start) - 300)
+    search_end = float(expected_end) + 300
+    relevant = [
+        (index, segment)
+        for index, segment in enumerate(segments)
+        if float(segment.get("end", 0)) >= search_start
+        and float(segment.get("start", 0)) <= search_end
+    ]
+    minimum_words = max(1, int(len(quote_words) * 0.55))
+    maximum_words = int(len(quote_words) * 2.2)
+    best = None
+    runner_up = 0.0
+    quote_word_set = set(quote_words)
+    for position, (source_index, _segment) in enumerate(relevant):
+        for window_size in range(1, 16):
+            window = relevant[position:position + window_size]
+            if len(window) != window_size:
+                break
+            window_words = " ".join(
+                normalize_text(row.get("raw_text") or row.get("text") or "")
+                for _, row in window
+            ).split()
+            if len(window_words) < minimum_words:
+                continue
+            if len(window_words) > maximum_words:
+                break
+            window_text = " ".join(window_words)
+            sequence_score = SequenceMatcher(None, normalized_quote, window_text).ratio()
+            common = quote_word_set & set(window_words)
+            f1 = 0.0
+            recall = 0.0
+            if common:
+                precision = len(common) / len(set(window_words))
+                recall = len(common) / len(quote_word_set)
+                f1 = 2 * precision * recall / (precision + recall)
+            score = (0.6 * sequence_score) + (0.25 * f1) + (0.15 * recall)
+            candidate = {
+                "score": score,
+                "start_index": source_index,
+                "end_index": window[-1][0],
+                "start": float(window[0][1].get("start", 0)),
+                "end": float(window[-1][1].get("end", 0)),
+            }
+            if best is None or score > best["score"]:
+                if best is not None and (
+                    candidate["start_index"] > best["end_index"]
+                    or candidate["end_index"] < best["start_index"]
+                ):
+                    runner_up = max(runner_up, best["score"])
+                best = candidate
+            elif best is not None and (
+                candidate["start_index"] > best["end_index"]
+                or candidate["end_index"] < best["start_index"]
+            ):
+                runner_up = max(runner_up, score)
+    if not best:
+        return None
+    minimum_score = 0.70 if len(quote_words) > 30 else 0.75
+    minimum_margin = 0.03 if len(quote_words) > 30 else 0.04
+    if best["score"] < minimum_score or best["score"] - runner_up < minimum_margin:
+        return None
+    return {
+        "start": best["start"],
+        "end": best["end"],
+        "confidence": round(best["score"], 3),
+    }
+
+
+def resolve_rss_audio_source(podcast_name, episode_name, feed_rows):
+    """Resolve a legacy episode to its current RSS enclosure without mutating data."""
+    import feedparser
+    from difflib import SequenceMatcher
+
+    normalized_podcast = normalize_text(podcast_name or "")
+    feed_row = max(
+        feed_rows,
+        key=lambda row: SequenceMatcher(
+            None, normalized_podcast, normalize_text(row.get("name") or "")
+        ).ratio(),
+        default=None,
+    )
+    if not feed_row or not feed_row.get("rss_url"):
+        return None
+    if SequenceMatcher(
+        None, normalized_podcast, normalize_text(feed_row.get("name") or "")
+    ).ratio() < 0.80:
+        return None
+    parsed = feedparser.parse(feed_row["rss_url"])
+    normalized_episode = normalize_text(episode_name or "")
+    best_entry = None
+    best_score = 0.0
+    for entry in parsed.entries:
+        score = SequenceMatcher(
+            None,
+            normalized_episode,
+            normalize_text(getattr(entry, "title", "")),
+        ).ratio()
+        if score > best_score:
+            best_score = score
+            best_entry = entry
+    if not best_entry or best_score < 0.76:
+        return None
+    audio_url = None
+    for enclosure in getattr(best_entry, "enclosures", []) or []:
+        href = enclosure.get("href") or enclosure.get("url")
+        content_type = str(enclosure.get("type") or "")
+        if href and (content_type.startswith("audio/") or not audio_url):
+            audio_url = href
+            if content_type.startswith("audio/"):
+                break
+    if not audio_url:
+        for link in getattr(best_entry, "links", []) or []:
+            if str(link.get("type") or "").startswith("audio/") and link.get("href"):
+                audio_url = link["href"]
+                break
+    if not audio_url:
+        return None
+    return {
+        "audio_url": audio_url,
+        "feed_url": feed_row["rss_url"],
+        "episode_match_confidence": round(best_score, 3),
+        "episode_title": getattr(best_entry, "title", None),
+    }
+
+
+def transcribe_remote_audio_window(audio_url, expected_start, expected_end, client):
+    """Transcribe only the bounded RSS window needed to support one legacy take."""
+    import subprocess
+    import tempfile
+
+    clip_start = max(0.0, float(expected_start) - 120.0)
+    requested_duration = max(240.0, float(expected_end) - float(expected_start) + 240.0)
+    clip_duration = min(requested_duration, 600.0)
+    temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    temp_path = temp_audio.name
+    temp_audio.close()
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-ss", str(clip_start), "-i", audio_url,
+                "-t", str(clip_duration), "-ac", "1", "-ar", "16000",
+                "-b:a", "64k", "-y", temp_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=360,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"RSS audio window extraction failed: {completed.stderr[-800:]}")
+        with open(temp_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model=os.environ.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1"),
+                file=audio_file,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+        processed = []
+        for index, segment in enumerate(getattr(transcript, "segments", None) or []):
+            if isinstance(segment, dict):
+                text = segment.get("text", "")
+                start = float(segment.get("start", 0))
+                end = float(segment.get("end", start))
+            else:
+                text = getattr(segment, "text", "")
+                start = float(getattr(segment, "start", 0))
+                end = float(getattr(segment, "end", start))
+            text = str(text or "").strip()
+            if not text:
+                continue
+            processed.append({
+                "id": index,
+                "start": start + clip_start,
+                "end": end + clip_start,
+                "raw_text": text,
+                "norm_text": normalize_text(text),
+                "word_count": len(text.split()),
+            })
+        return processed
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def historical_mapping_is_reviewable(mapping, start_segment, end_segment):
+    """Apply the normal evidence gate plus historical-workflow quality floors."""
+    if mapping.get("abstain"):
+        return False
+    if not conversation_mapping_is_reviewable(mapping, start_segment, end_segment):
+        return False
+    if len(str(mapping.get("connection_context") or "").split()) < 25:
+        return False
+    try:
+        confidence = float(mapping.get("mapping_confidence", 0))
+    except (TypeError, ValueError):
+        return False
+    return confidence >= float(os.environ.get("MIN_HISTORICAL_MAPPING_CONFIDENCE", "0.72"))
+
+
+def propose_historical_conversation_mapping(
+    quote,
+    source_evidence,
+    client,
+    conversation_taxonomy="",
+):
+    """Propose only conversation placement; never rewrite a published take."""
+    model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+    reasoning_effort = os.environ.get("OPENAI_EDITORIAL_REASONING", "high")
+    entity_schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "relationship": {"type": "string"},
+            "description": {"type": "string"},
+            "evidence_type": {
+                "type": "string",
+                "enum": [
+                    "direct_transcript", "episode_metadata",
+                    "speaker_identity", "editorial_connection",
+                ],
+            },
+            "evidence": {"type": "string"},
+            "segment_ids": {"type": "array", "items": {"type": "integer"}},
+        },
+        "required": [
+            "name", "relationship", "description", "evidence_type",
+            "evidence", "segment_ids",
+        ],
+        "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "abstain": {"type": "boolean"},
+            "abstention_reason": {"type": "string"},
+            "theme_name": {"type": "string"},
+            "theme_summary": {"type": "string"},
+            "question_text": {"type": "string"},
+            "question_summary": {"type": "string"},
+            "relationship_label": {"type": "string"},
+            "connection_context": {"type": "string"},
+            "mapping_confidence": {"type": "number"},
+            "related_people": {"type": "array", "items": entity_schema},
+            "related_companies": {"type": "array", "items": entity_schema},
+        },
+        "required": [
+            "abstain", "abstention_reason", "theme_name", "theme_summary",
+            "question_text", "question_summary", "relationship_label",
+            "connection_context", "mapping_confidence", "related_people",
+            "related_companies",
+        ],
+        "additionalProperties": False,
+    }
+    user_prompt = f"""
+Published take (immutable): {quote.get('text')}
+Speaker: {quote.get('speaker_name') or 'Unknown'}
+Speaker title: {quote.get('speaker_title') or 'Unknown'}
+Speaker company: {quote.get('speaker_company') or 'Unknown'}
+Podcast: {quote.get('podcast_name') or 'Unknown'}
+Episode: {quote.get('episode_name') or 'Unknown'}
+
+Map this existing take into the ongoing industry discourse. This is not a fact
+check, a summary, or an opportunity to embellish the quote.
+
+Editorial standard:
+1. Start with a durable industry theme broad enough to connect multiple people,
+   companies, episodes, and questions. A theme is not the take's category.
+2. Place the take under one open question inside that theme. The question should
+   expose a live operating, market-structure, measurement, incentive, or policy
+   tension that multiple industry participants could answer differently.
+3. `connection_context` is 45-90 words. Explain how this take advances or
+   complicates that conversation using concrete adtech mechanisms and
+   stakeholder incentives. Do not praise the take, paraphrase it, verify a
+   claim, or use claim/consequence language.
+4. Write from inside the industry. Use relevant precision about auctions,
+   identity/addressability, incrementality, privacy, supply paths, publisher
+   economics, agency/brand incentives, CTV, retail media, walled gardens, or AI,
+   but only where the source actually supports the connection.
+5. Add named people and companies when supported by speaker identity, episode
+   metadata, the numbered source segments, or a clearly labeled editorial
+   connection. Do not infer employment, partnerships, or interviews.
+6. `direct_transcript` evidence must cite segment IDs inside the supplied source
+   boundary. Other evidence types use an empty segment list.
+7. Reuse an exact approved theme, question, or entity name below when the idea is
+   substantively the same. Do not force a quote into Performance TV simply
+   because it is the only current theme.
+8. Abstain when the source is too thin, the quote is too generic, or a defensible
+   placement would require facts outside the supplied evidence.
+9. Avoid generic AI prose: no "underscores the importance", "rapidly evolving
+   landscape", "game changer", "key takeaway", or "businesses must adapt".
+
+EXISTING SME-APPROVED CONVERSATION GRAPH:
+{conversation_taxonomy or "No approved graph vocabulary exists yet."}
+
+SOURCE-BOUNDED CAPTIONS:
+{source_evidence['excerpt']}
+"""
+    system_prompt = """
+You are PodThreads' senior adtech editor. You connect podcast moments into
+durable industry conversations with the judgment of an experienced operator.
+Your output is a private proposal for SME review, never a published conclusion.
+Prefer abstention to generic analysis or unsupported connections.
+"""
+    return call_openai_structured(
+        client,
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        schema_name="podthreads_historical_mapping",
+        schema=schema,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=4500,
+    )
 
 
 def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
@@ -1763,6 +2162,285 @@ not prosecutorial.
     return selected
 
 
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+def backfill_historical_conversation_mappings(
+    limit: int = 12,
+    quote_ids: list = None,
+    job_id: str = None,
+):
+    """Stage source-bounded mappings for published takes; never approve or publish."""
+    from openai import OpenAI
+    from supabase import create_client
+
+    bounded_limit = max(1, min(int(limit or 12), 50))
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        claimed_at=utcnow_iso(),
+        started_at=utcnow_iso(),
+        attempt_count=1,
+        progress={"phase": "loading_published_takes", "limit": bounded_limit},
+    )
+
+    counts = {
+        "considered": 0,
+        "staged_unreviewed": 0,
+        "abstained": 0,
+        "source_unavailable": 0,
+        "skipped_existing": 0,
+        "retried_source_unavailable": 0,
+    }
+    try:
+        existing_result = (
+            supabase.table("conversation_mapping_reviews")
+            .select("quote_id,workflow_status")
+            .limit(5000)
+            .execute()
+        )
+        existing = {
+            str(row.get("quote_id")): row
+            for row in (existing_result.data or [])
+        }
+
+        quote_query = (
+            supabase.table("quotes")
+            .select(
+                "id,text,timestamp_start,timestamp_end,youtube_id,"
+                "episode_id,guest_id,created_at"
+            )
+            .not_.is_("youtube_id", "null")
+            .not_.is_("timestamp_start", "null")
+            .not_.is_("timestamp_end", "null")
+        )
+        if quote_ids:
+            quote_query = quote_query.in_("id", [str(value) for value in quote_ids])
+        rows_result = quote_query.order("created_at", desc=True).limit(500).execute()
+        candidates = []
+        for row in rows_result.data or []:
+            prior = existing.get(str(row.get("id")))
+            prior_status = (prior or {}).get("workflow_status")
+            if prior_status and prior_status != "source_unavailable":
+                counts["skipped_existing"] += 1
+                continue
+            if prior_status == "source_unavailable":
+                counts["retried_source_unavailable"] += 1
+            candidates.append(row)
+            if len(candidates) >= bounded_limit:
+                break
+
+        episode_ids = sorted({row.get("episode_id") for row in candidates if row.get("episode_id")})
+        guest_ids = sorted({row.get("guest_id") for row in candidates if row.get("guest_id")})
+        episodes = {}
+        if episode_ids:
+            result = (
+                supabase.table("episodes")
+                .select("id,title,podcast_id")
+                .in_("id", episode_ids)
+                .execute()
+            )
+            episodes = {str(row["id"]): row for row in (result.data or [])}
+        podcast_ids = sorted({row.get("podcast_id") for row in episodes.values() if row.get("podcast_id")})
+        podcasts = {}
+        if podcast_ids:
+            result = supabase.table("podcasts").select("id,name").in_("id", podcast_ids).execute()
+            podcasts = {str(row["id"]): row for row in (result.data or [])}
+        guests = {}
+        if guest_ids:
+            result = (
+                supabase.table("guests")
+                .select("id,name,title,company")
+                .in_("id", guest_ids)
+                .execute()
+            )
+            guests = {str(row["id"]): row for row in (result.data or [])}
+
+        feed_rows = (
+            supabase.table("test_podcast_feeds")
+            .select("name,rss_url,active")
+            .eq("active", True)
+            .execute()
+        ).data or []
+        taxonomy = fetch_conversation_taxonomy(supabase)
+        model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+        for index, raw_quote in enumerate(candidates):
+            counts["considered"] += 1
+            quote_id = str(raw_quote["id"])
+            episode = episodes.get(str(raw_quote.get("episode_id")), {})
+            podcast = podcasts.get(str(episode.get("podcast_id")), {})
+            guest = guests.get(str(raw_quote.get("guest_id")), {})
+            quote = {
+                **raw_quote,
+                "speaker_name": guest.get("name"),
+                "speaker_title": guest.get("title"),
+                "speaker_company": guest.get("company"),
+                "episode_name": episode.get("title"),
+                "podcast_name": podcast.get("name"),
+            }
+            update_processing_job(
+                supabase,
+                job_id,
+                "mapping",
+                progress={
+                    "phase": "mapping_historical_takes",
+                    "current": index + 1,
+                    "total": len(candidates),
+                    "quote_id": quote_id,
+                    **counts,
+                },
+            )
+
+            captions = get_yt_captions(str(quote.get("youtube_id")))
+            source_url = (
+                f"https://www.youtube.com/watch?v={quote.get('youtube_id')}"
+                f"&t={max(0, int(float(quote.get('timestamp_start') or 0)))}s"
+            )
+            source_kind = "youtube_captions"
+            aligned = None
+            source_failure = None
+            if captions:
+                aligned = align_timestamps_to_youtube_captions(
+                    str(quote.get("text") or ""),
+                    str(quote.get("youtube_id")),
+                    int(float(quote.get("timestamp_start") or 0)),
+                    int(float(quote.get("timestamp_end") or 0)),
+                )
+            else:
+                try:
+                    rss_source = resolve_rss_audio_source(
+                        quote.get("podcast_name"),
+                        quote.get("episode_name"),
+                        feed_rows,
+                    )
+                    if rss_source:
+                        source_kind = "rss_audio_transcript"
+                        source_url = rss_source["audio_url"]
+                        captions = transcribe_remote_audio_window(
+                            source_url,
+                            float(quote.get("timestamp_start") or 0),
+                            float(quote.get("timestamp_end") or 0),
+                            client,
+                        )
+                        aligned = align_quote_to_segments(
+                            str(quote.get("text") or ""),
+                            captions,
+                            float(quote.get("timestamp_start") or 0),
+                            float(quote.get("timestamp_end") or 0),
+                        )
+                    else:
+                        source_failure = "No matching RSS audio enclosure"
+                except Exception as exc:
+                    source_failure = f"RSS audio fallback failed: {exc}"
+                    print(f"  ⚠️  {source_failure}")
+            if not captions:
+                supabase.table("conversation_mapping_reviews").upsert({
+                    "quote_id": quote_id,
+                    "processing_job_id": job_id,
+                    "source_kind": source_kind,
+                    "source_url": source_url,
+                    "workflow_status": "source_unavailable",
+                    "abstention_reason": source_failure or "No retrievable caption or RSS audio source",
+                    "mapping_model": model,
+                    "mapping_prompt_version": HISTORICAL_MAPPING_PROMPT_VERSION,
+                    "updated_at": utcnow_iso(),
+                }, on_conflict="quote_id").execute()
+                counts["source_unavailable"] += 1
+                continue
+
+            evidence_start = aligned.get("start") if aligned else float(quote.get("timestamp_start") or 0)
+            evidence_end = aligned.get("end") if aligned else float(quote.get("timestamp_end") or 0)
+            source_evidence = build_caption_evidence(captions, evidence_start, evidence_end)
+            if not aligned or not source_evidence:
+                fallback = source_evidence or {"segments": [], "excerpt": None}
+                supabase.table("conversation_mapping_reviews").upsert({
+                    "quote_id": quote_id,
+                    "processing_job_id": job_id,
+                    "source_kind": source_kind,
+                    "source_url": source_url,
+                    "source_transcript_excerpt": fallback.get("excerpt"),
+                    "source_segments": fallback.get("segments", []),
+                    "workflow_status": "abstained",
+                    "abstention_reason": "Published quote could not be aligned to captions with sufficient confidence",
+                    "mapping_model": model,
+                    "mapping_prompt_version": HISTORICAL_MAPPING_PROMPT_VERSION,
+                    "updated_at": utcnow_iso(),
+                }, on_conflict="quote_id").execute()
+                counts["abstained"] += 1
+                continue
+
+            mapping = propose_historical_conversation_mapping(
+                quote,
+                source_evidence,
+                client,
+                conversation_taxonomy=taxonomy,
+            )
+            reviewable = historical_mapping_is_reviewable(
+                mapping,
+                source_evidence["start_segment"],
+                source_evidence["end_segment"],
+            )
+            record = {
+                "quote_id": quote_id,
+                "processing_job_id": job_id,
+                "source_kind": source_kind,
+                "source_url": source_url,
+                "source_transcript_excerpt": source_evidence["excerpt"],
+                "source_start_segment": source_evidence["start_segment"],
+                "source_end_segment": source_evidence["end_segment"],
+                "source_segments": source_evidence["segments"],
+                "source_alignment_confidence": aligned.get("confidence"),
+                "proposed_theme_name": mapping.get("theme_name") or None,
+                "proposed_theme_summary": mapping.get("theme_summary") or None,
+                "proposed_question_text": mapping.get("question_text") or None,
+                "proposed_question_summary": mapping.get("question_summary") or None,
+                "proposed_people": mapping.get("related_people") or [],
+                "proposed_companies": mapping.get("related_companies") or [],
+                "proposed_relationship_label": mapping.get("relationship_label") or None,
+                "connection_context": mapping.get("connection_context") or None,
+                "mapping_confidence": max(0.0, min(1.0, float(mapping.get("mapping_confidence", 0)))),
+                "mapping_model": model,
+                "mapping_prompt_version": HISTORICAL_MAPPING_PROMPT_VERSION,
+                "workflow_status": "unreviewed" if reviewable else "abstained",
+                "abstention_reason": None if reviewable else (
+                    mapping.get("abstention_reason")
+                    or "Proposal did not clear the source-bounded mapping quality gate"
+                ),
+                "updated_at": utcnow_iso(),
+            }
+            supabase.table("conversation_mapping_reviews").upsert(
+                record,
+                on_conflict="quote_id",
+            ).execute()
+            if reviewable:
+                counts["staged_unreviewed"] += 1
+            else:
+                counts["abstained"] += 1
+
+        result = {"success": True, "limit": bounded_limit, **counts}
+        update_processing_job(
+            supabase,
+            job_id,
+            "succeeded",
+            progress={"phase": "complete", **counts},
+            result=result,
+            completed_at=utcnow_iso(),
+        )
+        return result
+    except Exception as exc:
+        update_processing_job(
+            supabase,
+            job_id,
+            "failed",
+            result={"success": False, **counts},
+            error_code="historical_mapping_failed",
+            error_message=str(exc),
+            completed_at=utcnow_iso(),
+        )
+        raise
+
+
 @app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
 def run_editorial_evaluation(sample_limit: int = 40, job_id: str = None):
     """Evaluate the active editorial gate against balanced, source-backed SME decisions."""
@@ -2269,14 +2947,14 @@ def fastapi_app():
     from pydantic import BaseModel, Field
     from supabase import create_client
 
-    web_app = FastAPI(title="PodTakes Admin API", docs_url=None, redoc_url=None)
+    web_app = FastAPI(title="PodThreads Admin API", docs_url=None, redoc_url=None)
     bearer_scheme = HTTPBearer(auto_error=False)
 
     allowed_origins = [
         value.strip()
         for value in os.environ.get(
             "ALLOWED_ORIGINS",
-            "https://podtakes.com,https://www.podtakes.com,http://localhost:5173,http://127.0.0.1:5173",
+            "https://podthreads.com,https://www.podthreads.com,https://getpodtakes.com,https://www.getpodtakes.com,https://podtakes.com,https://www.podtakes.com,http://localhost:5173,http://127.0.0.1:5173",
         ).split(",")
         if value.strip()
     ]
@@ -2284,6 +2962,7 @@ def fastapi_app():
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
+        allow_origin_regex=r"^https://(?:[a-z0-9-]+--)?[a-z0-9-]+\.netlify\.app$",
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
@@ -2339,6 +3018,29 @@ def fastapi_app():
 
     class EvaluationRequest(BaseModel):
         sample_limit: int = Field(default=40, ge=12, le=100)
+
+    class HistoricalBackfillRequest(BaseModel):
+        limit: int = Field(default=12, ge=1, le=50)
+        quote_ids: list[str] | None = None
+
+    class HistoricalMappingReviewRequest(BaseModel):
+        mapping_review_id: str
+        action: str
+        proposed_theme_name: str | None = None
+        proposed_theme_summary: str | None = None
+        proposed_question_text: str | None = None
+        proposed_question_summary: str | None = None
+        proposed_people: list[dict] | None = None
+        proposed_companies: list[dict] | None = None
+        proposed_relationship_label: str | None = None
+        connection_context: str | None = None
+        reason_code: str | None = None
+        reason_detail: str | None = None
+        reviewer_expertise: list[str] = Field(default_factory=list)
+        target_decision_id: str | None = None
+
+    class HistoricalMappingPublishRequest(BaseModel):
+        mapping_review_id: str
 
     def service_client():
         return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
@@ -2479,6 +3181,197 @@ def fastapi_app():
             status_code=202,
             content={"success": True, "job_id": job_id, "state": "queued"},
         )
+
+    @web_app.post("/historical-mappings/backfill")
+    async def historical_mapping_backfill_endpoint(
+        req: HistoricalBackfillRequest,
+        admin=Depends(require_admin),
+    ):
+        """Queue a bounded private backfill; the worker cannot approve or publish."""
+        supabase = service_client()
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"historical-mapping:{uuid.uuid4()}",
+            "job_type": "historical_mapping",
+            "source": "admin",
+            "requested_by": admin["id"],
+            "parameters": {"limit": req.limit, "quote_ids": req.quote_ids},
+        }).execute()
+        job_id = inserted.data[0]["id"]
+        function_call = await backfill_historical_conversation_mappings.spawn.aio(
+            limit=req.limit,
+            quote_ids=req.quote_ids,
+            job_id=job_id,
+        )
+        supabase.table("processing_jobs").update({
+            "modal_call_id": function_call.object_id,
+            "updated_at": utcnow_iso(),
+        }).eq("id", job_id).execute()
+        return JSONResponse(
+            status_code=202,
+            content={
+                "success": True,
+                "job_id": job_id,
+                "state": "queued",
+                "status_url": f"/jobs/{job_id}",
+            },
+        )
+
+    @web_app.post("/historical-mappings/review")
+    async def historical_mapping_review_endpoint(
+        req: HistoricalMappingReviewRequest,
+        admin=Depends(require_admin),
+    ):
+        allowed_actions = {"edit", "approve", "reject", "needs_revision", "undo"}
+        if req.action not in allowed_actions:
+            raise HTTPException(status_code=422, detail="Unsupported historical mapping action")
+        if req.action in {"approve", "reject", "needs_revision"} and not req.reviewer_expertise:
+            raise HTTPException(status_code=422, detail="Reviewer expertise is required")
+        if req.action in {"reject", "needs_revision"} and not (
+            req.reason_code or (req.reason_detail or "").strip()
+        ):
+            raise HTTPException(status_code=422, detail="A reason is required")
+
+        supabase = service_client()
+        current = (
+            supabase.table("conversation_mapping_reviews")
+            .select("*")
+            .eq("id", req.mapping_review_id)
+            .single()
+            .execute()
+        )
+        if not current.data:
+            raise HTTPException(status_code=404, detail="Historical mapping review not found")
+        before = current.data
+        if before.get("workflow_status") == "published":
+            raise HTTPException(status_code=409, detail="Published mappings are immutable")
+
+        if req.action == "undo":
+            if not req.target_decision_id:
+                raise HTTPException(status_code=422, detail="target_decision_id is required")
+            decision = (
+                supabase.table("conversation_mapping_review_decisions")
+                .select("before_state")
+                .eq("id", req.target_decision_id)
+                .eq("mapping_review_id", req.mapping_review_id)
+                .single()
+                .execute()
+            )
+            allowed_restore = {
+                "proposed_theme_name", "proposed_theme_summary",
+                "proposed_question_text", "proposed_question_summary",
+                "proposed_people", "proposed_companies",
+                "proposed_relationship_label", "connection_context",
+                "workflow_status", "abstention_reason", "reviewed_by", "reviewed_at",
+            }
+            updates = {
+                key: value
+                for key, value in ((decision.data or {}).get("before_state") or {}).items()
+                if key in allowed_restore
+            }
+            if not updates:
+                raise HTTPException(status_code=422, detail="Decision has no restorable state")
+        else:
+            editable = {
+                "proposed_theme_name": req.proposed_theme_name,
+                "proposed_theme_summary": req.proposed_theme_summary,
+                "proposed_question_text": req.proposed_question_text,
+                "proposed_question_summary": req.proposed_question_summary,
+                "proposed_people": req.proposed_people,
+                "proposed_companies": req.proposed_companies,
+                "proposed_relationship_label": req.proposed_relationship_label,
+                "connection_context": req.connection_context,
+            }
+            updates = {
+                key: value.strip() if isinstance(value, str) else value
+                for key, value in editable.items()
+                if value is not None
+            }
+            if req.action == "edit" and before.get("workflow_status") == "approved":
+                updates.update({
+                    "workflow_status": "needs_revision",
+                    "reviewed_by": None,
+                    "reviewed_at": None,
+                })
+            elif req.action == "approve":
+                proposed = {
+                    "theme_name": updates.get("proposed_theme_name", before.get("proposed_theme_name")),
+                    "theme_summary": updates.get("proposed_theme_summary", before.get("proposed_theme_summary")),
+                    "question_text": updates.get("proposed_question_text", before.get("proposed_question_text")),
+                    "question_summary": updates.get("proposed_question_summary", before.get("proposed_question_summary")),
+                    "connection_context": updates.get("connection_context", before.get("connection_context")),
+                    "related_people": updates.get("proposed_people", before.get("proposed_people")) or [],
+                    "related_companies": updates.get("proposed_companies", before.get("proposed_companies")) or [],
+                    "mapping_confidence": before.get("mapping_confidence"),
+                }
+                if not historical_mapping_is_reviewable(
+                    proposed,
+                    before.get("source_start_segment") if before.get("source_start_segment") is not None else -1,
+                    before.get("source_end_segment") if before.get("source_end_segment") is not None else -1,
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Mapping does not clear the source, completeness, or confidence gate",
+                    )
+                updates.update({
+                    "workflow_status": "approved",
+                    "abstention_reason": None,
+                    "reviewed_by": admin["id"],
+                    "reviewed_at": utcnow_iso(),
+                })
+            elif req.action == "reject":
+                updates.update({
+                    "workflow_status": "rejected",
+                    "reviewed_by": admin["id"],
+                    "reviewed_at": utcnow_iso(),
+                })
+            elif req.action == "needs_revision":
+                updates.update({
+                    "workflow_status": "needs_revision",
+                    "reviewed_by": admin["id"],
+                    "reviewed_at": utcnow_iso(),
+                })
+
+        updates["updated_at"] = utcnow_iso()
+        updated = (
+            supabase.table("conversation_mapping_reviews")
+            .update(updates)
+            .eq("id", req.mapping_review_id)
+            .execute()
+        )
+        after = updated.data[0] if updated.data else {**before, **updates}
+        decision = supabase.table("conversation_mapping_review_decisions").insert({
+            "mapping_review_id": req.mapping_review_id,
+            "reviewer_id": admin["id"],
+            "decision": req.action,
+            "reason_code": req.reason_code,
+            "reason_detail": req.reason_detail,
+            "reviewer_expertise": req.reviewer_expertise,
+            "before_state": before,
+            "after_state": after,
+            "metadata": {"quote_id": before.get("quote_id")},
+        }).execute()
+        return {
+            "success": True,
+            "mapping": after,
+            "decision_id": decision.data[0]["id"] if decision.data else None,
+        }
+
+    @web_app.post("/historical-mappings/publish")
+    async def historical_mapping_publish_endpoint(
+        req: HistoricalMappingPublishRequest,
+        admin=Depends(require_admin),
+    ):
+        try:
+            result = service_client().rpc(
+                "publish_historical_conversation_mapping",
+                {
+                    "p_mapping_review_id": req.mapping_review_id,
+                    "p_publisher_id": admin["id"],
+                },
+            ).execute()
+            return {"success": True, "quote_id": result.data}
+        except Exception as exc:
+            return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
 
     @web_app.post("/create-clip")
     async def create_clip_endpoint(req: ClipRequest, admin=Depends(require_admin)):
@@ -2797,8 +3690,38 @@ def fastapi_app():
     return web_app
 
 
+@app.function(image=image, secrets=[my_secret], timeout=3700)
+def trigger_historical_backfill(backfill_limit: int = 12):
+    """Create an auditable operator job for a bounded historical mapping run."""
+    from supabase import create_client
+
+    bounded_limit = max(1, min(backfill_limit, 50))
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-historical-mapping:{uuid.uuid4()}",
+        "job_type": "historical_mapping",
+        "source": "admin",
+        "parameters": {
+            "limit": bounded_limit,
+            "operator_surface": "modal_cli",
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    result = backfill_historical_conversation_mappings.remote(
+        limit=bounded_limit,
+        job_id=job_id,
+    )
+    return {"job_id": job_id, **result}
+
+
 @app.local_entrypoint()
-def main(action: str = "health", max_episodes: int = 1, days_back: int = 7):
+def main(
+    action: str = "health",
+    max_episodes: int = 1,
+    days_back: int = 7,
+    backfill_limit: int = 12,
+    youtube_id: str = "V1M1mDyuJKM",
+):
     """Operator-only CLI entrypoint for audited smoke checks and bounded runs."""
     import json
 
@@ -2811,7 +3734,13 @@ def main(action: str = "health", max_episodes: int = 1, days_back: int = 7):
         )
     elif action == "scheduled-check":
         result = scheduled_processor.remote()
+    elif action == "historical-backfill":
+        result = trigger_historical_backfill.remote(backfill_limit=backfill_limit)
+    elif action == "caption-check":
+        result = caption_source_check.remote(youtube_id=youtube_id)
     else:
-        raise ValueError("action must be health, process, or scheduled-check")
+        raise ValueError(
+            "action must be health, process, scheduled-check, historical-backfill, or caption-check"
+        )
 
     print(json.dumps(result, indent=2, default=str))
