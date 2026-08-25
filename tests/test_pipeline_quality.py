@@ -20,6 +20,7 @@ from modal_app.full_processor import (
     editorial_gate_invalidations,
     fetch_conversation_taxonomy,
     historical_mapping_is_reviewable,
+    legacy_integer_timestamp,
     missing_take_verification_fields,
     normalize_text,
     openai_error_is_retryable,
@@ -31,6 +32,12 @@ from modal_app.full_processor import (
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_review_payload_normalizes_legacy_integer_timestamps(self):
+        self.assertEqual(legacy_integer_timestamp(2154.0), 2154)
+        self.assertEqual(legacy_integer_timestamp("2120.0"), 2120)
+        self.assertEqual(legacy_integer_timestamp(0.0), 0)
+        self.assertIsNone(legacy_integer_timestamp(None))
+
     def test_staged_analysis_batches_skip_known_source_failures_but_allow_retry(self):
         record = {
             "analysis_review_flags": {"ai_draft_status": "source_unavailable"},

@@ -49,6 +49,19 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def legacy_integer_timestamp(value):
+    """Normalize review payloads for the original integer playback columns.
+
+    The source-alignment columns retain sub-second precision. These legacy
+    fields remain integers for existing clients, but Pydantic materializes the
+    shared review inputs as floats (for example, ``2154.0``), which PostgREST
+    will not coerce into an integer column.
+    """
+    if value is None:
+        return None
+    return int(round(float(value)))
+
+
 def quote_word_count(text: str) -> int:
     return len(str(text or "").strip().split())
 
@@ -7362,9 +7375,9 @@ def fastapi_app():
                 "youtube_id": req.youtube_id,
                 "podcast_name": req.podcast_name,
                 "episode_name": req.episode_name,
-                "timestamp_start": req.timestamp_start,
-                "timestamp_end": req.timestamp_end,
-                "youtube_offset": req.youtube_offset,
+                "timestamp_start": legacy_integer_timestamp(req.timestamp_start),
+                "timestamp_end": legacy_integer_timestamp(req.timestamp_end),
+                "youtube_offset": legacy_integer_timestamp(req.youtube_offset),
             }
             updates.update({
                 key: value.strip() if isinstance(value, str) else value
