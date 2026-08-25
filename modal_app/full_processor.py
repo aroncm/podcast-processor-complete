@@ -4184,7 +4184,13 @@ def fastapi_app():
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
-        allow_origin_regex=r"^https://(?:[a-z0-9-]+--)?[a-z0-9-]+\.netlify\.app$",
+        allow_origin_regex=(
+            r"^https://(?:"
+            r"(?:[a-z0-9-]+--)?[a-z0-9-]+\.netlify\.app"
+            r"|[a-z0-9-]+\.bolt\.host"
+            r"|(?:[a-z0-9-]+\.)*webcontainer(?:-api)?\.io"
+            r")$"
+        ),
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
@@ -4337,6 +4343,7 @@ def fastapi_app():
             "ok": True,
             "pipeline_version": PIPELINE_VERSION,
             "auth": "supabase-admin-jwt",
+            "preview_cors": "netlify-bolt-webcontainer",
         }
 
     @web_app.post("/process-episode")
