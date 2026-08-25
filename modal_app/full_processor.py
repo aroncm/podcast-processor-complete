@@ -4,6 +4,7 @@ import modal
 import os
 import json
 import hashlib
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -1458,6 +1459,50 @@ def editorial_gate_invalidations(before, updates):
             "mapping_reviewed_at": None,
         })
     return invalidations
+
+
+def staged_analysis_write_plan(record, mode="fill_missing"):
+    """Choose draft layers without overwriting human work or approved analysis."""
+    if mode not in {"fill_missing", "regenerate_unreviewed"}:
+        raise ValueError("Unsupported staged analysis mode")
+    record = record or {}
+    context_locked = record.get("context_review_status") == "approved"
+    mapping_locked = record.get("mapping_review_status") == "approved"
+    has_context_work = bool(
+        str(record.get("editorial_context") or "").strip()
+        or str(record.get("context_model") or "").strip()
+    )
+    has_mapping_work = bool(
+        str(record.get("proposed_theme_name") or "").strip()
+        or str(record.get("proposed_question_text") or "").strip()
+        or str(record.get("connection_context") or "").strip()
+        or str(record.get("mapping_model") or "").strip()
+    )
+    regenerate = mode == "regenerate_unreviewed"
+    return {
+        "context": not context_locked and (regenerate or not has_context_work),
+        "mapping": not mapping_locked and (regenerate or not has_mapping_work),
+        "context_locked": context_locked,
+        "mapping_locked": mapping_locked,
+        "protected_existing_work": (
+            (context_locked or (has_context_work and not regenerate))
+            and (mapping_locked or (has_mapping_work and not regenerate))
+        ),
+    }
+
+
+def staged_analysis_should_skip_source_retry(
+    record,
+    mode="fill_missing",
+    explicitly_targeted=False,
+):
+    """Avoid repeating known source failures in batches; allow deliberate retries."""
+    flags = (record or {}).get("analysis_review_flags") or {}
+    return bool(
+        mode == "fill_missing"
+        and not explicitly_targeted
+        and flags.get("ai_draft_status") == "source_unavailable"
+    )
 
 
 def build_caption_evidence(captions, start_time, end_time, padding_seconds=45, max_events=120):
@@ -3532,6 +3577,293 @@ def backfill_historical_conversation_mappings(
         raise
 
 
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+def backfill_staged_take_analysis(
+    limit: int = 20,
+    quote_ids: list = None,
+    approval_status: str = "approved",
+    mode: str = "fill_missing",
+    job_id: str = None,
+):
+    """Draft source-bounded context for staged takes without approving any layer."""
+    from openai import OpenAI
+    from supabase import create_client
+
+    if mode not in {"fill_missing", "regenerate_unreviewed"}:
+        raise ValueError("Unsupported staged analysis mode")
+    if mode == "regenerate_unreviewed" and not quote_ids:
+        raise ValueError("Regeneration must target explicit take IDs")
+    allowed_statuses = {"pending", "approved"}
+    statuses = (
+        [approval_status]
+        if approval_status in allowed_statuses
+        else sorted(allowed_statuses)
+    )
+    bounded_limit = max(1, min(int(limit or 20), 50))
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        claimed_at=utcnow_iso(),
+        started_at=utcnow_iso(),
+        attempt_count=1,
+        progress={"phase": "loading_staged_takes", "limit": bounded_limit},
+    )
+    counts = {
+        "considered": 0,
+        "analyzed": 0,
+        "context_drafted": 0,
+        "mapping_drafted": 0,
+        "mapping_abstained": 0,
+        "source_unavailable": 0,
+        "previous_source_unavailable_skipped": 0,
+        "protected_existing_work": 0,
+        "failed": 0,
+    }
+    errors = []
+    try:
+        query = (
+            supabase.table("test_quotes")
+            .select("*")
+            .in_("approval_status", statuses)
+            .order("quality_score", desc=True)
+            .order("created_at", desc=True)
+            .limit(500)
+        )
+        if quote_ids:
+            query = query.in_("id", [str(value) for value in quote_ids])
+        rows = query.execute().data or []
+        candidates = []
+        for row in rows:
+            if staged_analysis_should_skip_source_retry(
+                row,
+                mode=mode,
+                explicitly_targeted=bool(quote_ids),
+            ):
+                counts["previous_source_unavailable_skipped"] += 1
+                continue
+            plan = staged_analysis_write_plan(row, mode=mode)
+            if not plan["context"] and not plan["mapping"]:
+                counts["protected_existing_work"] += 1
+                continue
+            candidates.append((row, plan))
+            if len(candidates) >= bounded_limit:
+                break
+
+        feed_rows = (
+            supabase.table("test_podcast_feeds")
+            .select("name,rss_url,active")
+            .eq("active", True)
+            .execute()
+        ).data or []
+        taxonomy = fetch_conversation_taxonomy(supabase)
+
+        for index, (row, plan) in enumerate(candidates):
+            quote_id = str(row.get("id"))
+            counts["considered"] += 1
+            update_processing_job(
+                supabase,
+                job_id,
+                "mapping",
+                progress={
+                    "phase": "drafting_staged_analysis",
+                    "current": index + 1,
+                    "total": len(candidates),
+                    "quote_id": quote_id,
+                    **counts,
+                },
+            )
+            try:
+                start = float(row.get("timestamp_start") or 0)
+                end = float(row.get("timestamp_end") or 0)
+                if end <= start:
+                    raise RuntimeError("Take has no valid source timing")
+
+                captions = None
+                source_kind = None
+                source_url = None
+                youtube_value = str(row.get("youtube_id") or "").strip()
+                youtube_id = (
+                    youtube_value
+                    if re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_value)
+                    else extract_youtube_id(youtube_value)
+                )
+                expected_start = start
+                expected_end = end
+                if youtube_id:
+                    source_kind = "youtube_captions"
+                    source_url = f"https://www.youtube.com/watch?v={youtube_id}"
+                    captions = get_yt_captions(youtube_id)
+                    youtube_offset = float(row.get("youtube_offset") or 0)
+                    expected_start += youtube_offset
+                    expected_end += youtube_offset
+
+                if not captions:
+                    audio_url = str(row.get("episode_audio_url") or "").strip()
+                    if not audio_url:
+                        resolved = resolve_rss_audio_source(
+                            row.get("podcast_name"),
+                            row.get("episode_name"),
+                            feed_rows,
+                        )
+                        audio_url = str((resolved or {}).get("audio_url") or "")
+                    if audio_url:
+                        source_kind = "rss_audio_transcript"
+                        source_url = audio_url
+                        expected_start = start
+                        expected_end = end
+                        captions = transcribe_remote_audio_window(
+                            audio_url,
+                            expected_start,
+                            expected_end,
+                            client,
+                        )
+
+                aligned = align_quote_to_segments(
+                    str(row.get("quote_text") or ""),
+                    captions or [],
+                    expected_start,
+                    expected_end,
+                )
+                evidence = (
+                    build_caption_evidence(
+                        captions,
+                        aligned["start"],
+                        aligned["end"],
+                        padding_seconds=45,
+                    )
+                    if aligned else None
+                )
+                if not captions or not aligned or not evidence:
+                    counts["source_unavailable"] += 1
+                    if not captions:
+                        source_reason = "No retrievable caption or episode-audio transcript was available for this take."
+                    elif not aligned:
+                        source_reason = "The stored take could not be uniquely aligned to the retrievable source transcript."
+                    else:
+                        source_reason = "The aligned source window did not contain enough bounded evidence for an AI draft."
+                    flags = dict(row.get("analysis_review_flags") or {})
+                    flags.update({
+                        "ai_draft_status": "source_unavailable",
+                        "ai_draft_job_id": job_id,
+                        "ai_draft_attempted_at": utcnow_iso(),
+                        "ai_draft_source_kind": source_kind,
+                        "ai_draft_source_url": source_url,
+                        "ai_draft_reason": source_reason,
+                    })
+                    supabase.table("test_quotes").update({
+                        "analysis_review_flags": flags,
+                        "updated_at": utcnow_iso(),
+                    }).eq("id", quote_id).execute()
+                    continue
+
+                candidate = {
+                    "text": str(row.get("quote_text") or "").strip(),
+                    "speaker": str(row.get("speaker_name") or "Unknown").strip(),
+                    "start_seg": evidence["start_segment"],
+                    "end_seg": evidence["end_segment"],
+                    "source_transcript_excerpt": evidence["excerpt"],
+                    "ranking_reason": row.get("ranking_reason"),
+                }
+                analysis = contextualize_and_map_quotes(
+                    [candidate],
+                    row.get("podcast_name"),
+                    row.get("episode_name"),
+                    client,
+                    conversation_taxonomy=taxonomy,
+                )[0]
+                updates = {"updated_at": utcnow_iso()}
+                flags = dict(row.get("analysis_review_flags") or {})
+                flags.update(analysis.get("analysis_review_flags") or {})
+                flags.update({
+                    "ai_draft_status": "drafted",
+                    "ai_draft_job_id": job_id,
+                    "ai_draft_attempted_at": utcnow_iso(),
+                    "ai_draft_source_kind": source_kind,
+                    "ai_draft_source_url": source_url,
+                    "ai_draft_alignment_confidence": aligned.get("confidence"),
+                    "ai_draft_mode": mode,
+                })
+                updates["analysis_review_flags"] = flags
+
+                if plan["context"]:
+                    updates.update({
+                        "source_transcript_excerpt": evidence["excerpt"],
+                        "source_start_segment": evidence["start_segment"],
+                        "source_end_segment": evidence["end_segment"],
+                        "editorial_context": analysis.get("editorial_context"),
+                        "context_evidence": analysis.get("context_evidence") or [],
+                        "context_confidence": analysis.get("context_confidence"),
+                        "context_model": analysis.get("context_model"),
+                        "context_prompt_version": analysis.get("context_prompt_version") or CONTEXT_PROMPT_VERSION,
+                        "context_review_status": "unreviewed",
+                        "context_reviewed_by": None,
+                        "context_reviewed_at": None,
+                    })
+                    if analysis.get("editorial_context"):
+                        counts["context_drafted"] += 1
+
+                if plan["mapping"]:
+                    updates.update({
+                        "proposed_theme_name": analysis.get("theme_name"),
+                        "proposed_theme_summary": analysis.get("theme_summary"),
+                        "proposed_question_text": analysis.get("question_text"),
+                        "proposed_question_summary": analysis.get("question_summary"),
+                        "proposed_people": analysis.get("related_people") or [],
+                        "proposed_companies": analysis.get("related_companies") or [],
+                        "connection_context": analysis.get("connection_context"),
+                        "mapping_confidence": analysis.get("mapping_confidence"),
+                        "theme_match_action": analysis.get("theme_match_action") or "abstain",
+                        "mapping_model": analysis.get("mapping_model"),
+                        "mapping_prompt_version": analysis.get("mapping_prompt_version") or MAPPING_PROMPT_VERSION,
+                        "mapping_review_status": "unreviewed",
+                        "mapping_reviewed_by": None,
+                        "mapping_reviewed_at": None,
+                    })
+                    if analysis.get("theme_name") and analysis.get("question_text"):
+                        counts["mapping_drafted"] += 1
+                    else:
+                        counts["mapping_abstained"] += 1
+
+                supabase.table("test_quotes").update(updates).eq("id", quote_id).execute()
+                counts["analyzed"] += 1
+            except Exception as item_exc:
+                counts["failed"] += 1
+                errors.append({"quote_id": quote_id, "error": str(item_exc)[:500]})
+                print(f"⚠️ Staged analysis failed quote={quote_id}: {item_exc}")
+
+        result = {
+            "success": True,
+            "limit": bounded_limit,
+            "approval_status": approval_status,
+            "mode": mode,
+            **counts,
+            "errors": errors[:20],
+        }
+        update_processing_job(
+            supabase,
+            job_id,
+            "succeeded",
+            progress={"phase": "complete", **counts},
+            result=result,
+            completed_at=utcnow_iso(),
+        )
+        return result
+    except Exception as exc:
+        update_processing_job(
+            supabase,
+            job_id,
+            "failed",
+            result={"success": False, **counts, "errors": errors[:20]},
+            error_code="staged_analysis_backfill_failed",
+            error_message=str(exc)[:4000],
+            completed_at=utcnow_iso(),
+        )
+        raise
+
+
 @app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
 def run_editorial_evaluation(sample_limit: int = 40, job_id: str = None):
     """Evaluate the active editorial gate against balanced, source-backed SME decisions."""
@@ -4289,6 +4621,12 @@ def fastapi_app():
         limit: int = Field(default=12, ge=1, le=50)
         quote_ids: list[str] | None = None
 
+    class StagedAnalysisBackfillRequest(BaseModel):
+        limit: int = Field(default=20, ge=1, le=50)
+        quote_ids: list[str] | None = None
+        approval_status: str = "approved"
+        mode: str = "fill_missing"
+
     class HistoricalMappingReviewRequest(BaseModel):
         mapping_review_id: str
         action: str
@@ -4964,6 +5302,79 @@ def fastapi_app():
         )
         return {"success": True, "gold_set": updated.data[0]}
 
+    @web_app.post("/staged-analysis/backfill")
+    async def staged_analysis_backfill_endpoint(
+        req: StagedAnalysisBackfillRequest,
+        admin=Depends(require_admin),
+    ):
+        """Queue private AI drafts; the worker cannot approve or publish them."""
+        if req.approval_status not in {"pending", "approved", "both"}:
+            raise HTTPException(status_code=422, detail="Unsupported approval status")
+        if req.mode not in {"fill_missing", "regenerate_unreviewed"}:
+            raise HTTPException(status_code=422, detail="Unsupported staged analysis mode")
+        if req.mode == "regenerate_unreviewed" and not req.quote_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="Regeneration must target explicit take IDs",
+            )
+        supabase = service_client()
+        active_states = [
+            "queued", "claimed", "downloading", "transcribing",
+            "extracting", "ranking", "mapping", "staging",
+        ]
+        active = (
+            supabase.table("processing_jobs")
+            .select("id,state")
+            .eq("job_type", "staged_analysis_backfill")
+            .in_("state", active_states)
+            .order("queued_at", desc=True)
+            .limit(1)
+            .execute()
+        ).data or []
+        if active:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "error": "A staged-analysis job is already active",
+                    "job_id": active[0]["id"],
+                    "state": active[0]["state"],
+                },
+            )
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"staged-analysis:{uuid.uuid4()}",
+            "job_type": "staged_analysis_backfill",
+            "source": "admin",
+            "requested_by": admin["id"],
+            "parameters": {
+                "limit": req.limit,
+                "quote_ids": req.quote_ids,
+                "approval_status": req.approval_status,
+                "mode": req.mode,
+            },
+        }).execute()
+        job_id = inserted.data[0]["id"]
+        function_call = await backfill_staged_take_analysis.spawn.aio(
+            limit=req.limit,
+            quote_ids=req.quote_ids,
+            approval_status=req.approval_status,
+            mode=req.mode,
+            job_id=job_id,
+        )
+        supabase.table("processing_jobs").update({
+            "modal_call_id": function_call.object_id,
+            "updated_at": utcnow_iso(),
+        }).eq("id", job_id).execute()
+        return JSONResponse(
+            status_code=202,
+            content={
+                "success": True,
+                "job_id": job_id,
+                "state": "queued",
+                "status_url": f"/jobs/{job_id}",
+            },
+        )
+
     @web_app.post("/historical-mappings/backfill")
     async def historical_mapping_backfill_endpoint(
         req: HistoricalBackfillRequest,
@@ -5573,6 +5984,44 @@ def trigger_historical_backfill(backfill_limit: int = 12):
     job_id = job.data[0]["id"]
     result = backfill_historical_conversation_mappings.remote(
         limit=bounded_limit,
+        job_id=job_id,
+    )
+    return {"job_id": job_id, **result}
+
+
+@app.function(image=image, secrets=[my_secret], timeout=3700)
+def trigger_staged_analysis_backfill(
+    backfill_limit: int = 20,
+    approval_status: str = "approved",
+    mode: str = "fill_missing",
+):
+    """Create an auditable operator job for a bounded staged-analysis pilot."""
+    from supabase import create_client
+
+    bounded_limit = max(1, min(backfill_limit, 50))
+    if approval_status not in {"pending", "approved", "both"}:
+        raise ValueError("Unsupported approval status")
+    if mode not in {"fill_missing", "regenerate_unreviewed"}:
+        raise ValueError("Unsupported staged analysis mode")
+    if mode != "fill_missing":
+        raise ValueError("The bulk CLI trigger supports fill_missing only")
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-staged-analysis:{uuid.uuid4()}",
+        "job_type": "staged_analysis_backfill",
+        "source": "admin",
+        "parameters": {
+            "limit": bounded_limit,
+            "approval_status": approval_status,
+            "mode": mode,
+            "operator_surface": "modal_cli",
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    result = backfill_staged_take_analysis.remote(
+        limit=bounded_limit,
+        approval_status=approval_status,
+        mode=mode,
         job_id=job_id,
     )
     return {"job_id": job_id, **result}

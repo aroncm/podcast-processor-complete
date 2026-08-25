@@ -19,11 +19,52 @@ from modal_app.full_processor import (
     missing_take_verification_fields,
     normalize_text,
     quote_word_count,
+    staged_analysis_should_skip_source_retry,
+    staged_analysis_write_plan,
     theme_match_is_controlled,
 )
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_staged_analysis_batches_skip_known_source_failures_but_allow_retry(self):
+        record = {
+            "analysis_review_flags": {"ai_draft_status": "source_unavailable"},
+        }
+        self.assertTrue(staged_analysis_should_skip_source_retry(record))
+        self.assertFalse(
+            staged_analysis_should_skip_source_retry(record, explicitly_targeted=True)
+        )
+        self.assertFalse(
+            staged_analysis_should_skip_source_retry(
+                record,
+                mode="regenerate_unreviewed",
+            )
+        )
+
+    def test_staged_analysis_backfill_never_overwrites_human_or_approved_work(self):
+        manual = {
+            "editorial_context": "An SME already drafted this context.",
+            "context_review_status": "unreviewed",
+            "proposed_theme_name": "Performance TV",
+            "mapping_review_status": "unreviewed",
+        }
+        fill_missing = staged_analysis_write_plan(manual, mode="fill_missing")
+        self.assertFalse(fill_missing["context"])
+        self.assertFalse(fill_missing["mapping"])
+
+        regenerate = staged_analysis_write_plan(manual, mode="regenerate_unreviewed")
+        self.assertTrue(regenerate["context"])
+        self.assertTrue(regenerate["mapping"])
+
+        locked = {
+            **manual,
+            "context_review_status": "approved",
+            "mapping_review_status": "approved",
+        }
+        locked_plan = staged_analysis_write_plan(locked, mode="regenerate_unreviewed")
+        self.assertFalse(locked_plan["context"])
+        self.assertFalse(locked_plan["mapping"])
+
     def test_take_approval_requires_complete_human_verified_identity(self):
         record = {
             "quote_text": "A complete source-grounded take.",
