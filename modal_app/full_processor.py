@@ -1803,6 +1803,7 @@ def resolve_rss_audio_source(podcast_name, episode_name, feed_rows):
         "feed_url": feed_row["rss_url"],
         "episode_match_confidence": round(best_score, 3),
         "episode_title": getattr(best_entry, "title", None),
+        "episode_metadata": episode_metadata_text(best_entry),
     }
 
 
@@ -3083,10 +3084,12 @@ SELECTED TAKES:
             "mapping_prompt_version": MAPPING_PROMPT_VERSION,
             "speaker_title": analysis.get("speaker_title") if metadata_source != "unknown" else None,
             "speaker_company": analysis.get("speaker_company") if metadata_source != "unknown" else None,
+            "speaker_metadata_source": metadata_source,
             "analysis_review_flags": {
                 "context_reviewable": context_is_reviewable,
                 "mapping_reviewable": mapping_is_reviewable,
                 "controlled_theme_action": controlled_action,
+                "speaker_metadata_source": metadata_source,
             },
         })
         enriched.append(candidate)
@@ -3887,6 +3890,12 @@ def backfill_staged_take_analysis(
                 if end <= start:
                     raise RuntimeError("Take has no valid source timing")
 
+                rss_resolution = resolve_rss_audio_source(
+                    row.get("podcast_name"),
+                    row.get("episode_name"),
+                    feed_rows,
+                )
+                rss_metadata = str((rss_resolution or {}).get("episode_metadata") or "")
                 captions = None
                 source_kind = None
                 source_url = None
@@ -3909,12 +3918,7 @@ def backfill_staged_take_analysis(
                 if not captions:
                     audio_url = str(row.get("episode_audio_url") or "").strip()
                     if not audio_url:
-                        resolved = resolve_rss_audio_source(
-                            row.get("podcast_name"),
-                            row.get("episode_name"),
-                            feed_rows,
-                        )
-                        audio_url = str((resolved or {}).get("audio_url") or "")
+                        audio_url = str((rss_resolution or {}).get("audio_url") or "")
                     if audio_url:
                         source_kind = "rss_audio_transcript"
                         source_url = audio_url
@@ -3979,6 +3983,7 @@ def backfill_staged_take_analysis(
                     row.get("episode_name"),
                     client,
                     conversation_taxonomy=taxonomy,
+                    episode_metadata=rss_metadata,
                 )[0]
                 updates = {"updated_at": utcnow_iso()}
                 flags = dict(row.get("analysis_review_flags") or {})
@@ -3993,6 +3998,18 @@ def backfill_staged_take_analysis(
                     "ai_draft_mode": mode,
                 })
                 updates["analysis_review_flags"] = flags
+
+                metadata_source = analysis.get("speaker_metadata_source")
+                if metadata_source in {"direct_transcript", "episode_metadata"}:
+                    if not str(row.get("speaker_title") or "").strip() and analysis.get("speaker_title"):
+                        updates["speaker_title"] = analysis.get("speaker_title")
+                    if not str(row.get("speaker_company") or "").strip() and analysis.get("speaker_company"):
+                        updates["speaker_company"] = analysis.get("speaker_company")
+                    flags.update({
+                        "speaker_metadata_ai_draft": True,
+                        "speaker_metadata_source": metadata_source,
+                        "speaker_metadata_requires_sme_verification": True,
+                    })
 
                 if plan["context"]:
                     updates.update({
