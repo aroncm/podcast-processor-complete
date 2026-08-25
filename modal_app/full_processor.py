@@ -30,7 +30,7 @@ image = modal.Image.debian_slim() \
 #   modal secret create podtakes-secrets --from-dotenv .env
 my_secret = modal.Secret.from_name("podtakes-secrets")
 
-PIPELINE_VERSION = "podthreads-hybrid-v5-speaker-aware"
+PIPELINE_VERSION = "podthreads-hybrid-v5-directory-aware"
 TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v1"
 EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
@@ -1465,11 +1465,14 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
 
     chunk_dir = tempfile.mkdtemp(prefix="podtakes-transcript-")
     chunk_pattern = os.path.join(chunk_dir, "chunk-%03d.mp3")
+    transcript_model = os.environ.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+    fallback_model = os.environ.get("OPENAI_TRANSCRIPTION_FALLBACK_MODEL", "whisper-1")
+    chunk_seconds = 600 if transcript_model == "gpt-4o-transcribe-diarize" else 1200
     try:
         split_result = subprocess.run(
             [
                 "ffmpeg", "-v", "error", "-i", temp_path,
-                "-f", "segment", "-segment_time", "1200",
+                "-f", "segment", "-segment_time", str(chunk_seconds),
                 "-reset_timestamps", "1", "-c", "copy", "-y", chunk_pattern,
             ],
             capture_output=True,
@@ -1485,11 +1488,6 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
         absolute_offset = 0.0
         transcript_parts = []
         absolute_segments = []
-        transcript_model = os.environ.get(
-            "OPENAI_TRANSCRIPTION_MODEL",
-            "gpt-4o-transcribe-diarize",
-        )
-        fallback_model = os.environ.get("OPENAI_TRANSCRIPTION_FALLBACK_MODEL", "whisper-1")
         used_models = []
 
         for chunk_index, chunk_path in enumerate(chunk_paths):
@@ -1511,6 +1509,7 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
                             file=audio_file,
                             response_format="diarized_json",
                             chunking_strategy="auto",
+                            timeout=float(os.environ.get("OPENAI_DIARIZATION_TIMEOUT_SECONDS", "300")),
                         )
                     else:
                         transcript = client.audio.transcriptions.create(
