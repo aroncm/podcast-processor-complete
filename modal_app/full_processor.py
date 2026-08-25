@@ -30,8 +30,8 @@ image = modal.Image.debian_slim() \
 #   modal secret create podtakes-secrets --from-dotenv .env
 my_secret = modal.Secret.from_name("podtakes-secrets")
 
-PIPELINE_VERSION = "podthreads-hybrid-v5-directory-aware"
-TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v1"
+PIPELINE_VERSION = "podthreads-hybrid-v6-checkpointed-directory-aware"
+TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v2-bounded"
 EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
@@ -165,13 +165,35 @@ def _process_episode_with_ai_impl(
     )
     client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
     register_pipeline_model_versions(supabase)
+    attempt_count = 1
+    claim_state = "claimed"
+    claimed_at = utcnow_iso()
+    started_at = claimed_at
+    if job_id:
+        try:
+            existing_job = (
+                supabase.table("processing_jobs")
+                .select("state,attempt_count,claimed_at,started_at")
+                .eq("id", job_id)
+                .limit(1)
+                .execute()
+            )
+            if existing_job.data:
+                job_row = existing_job.data[0]
+                attempt_count = int(job_row.get("attempt_count") or 0) + 1
+                claimed_at = job_row.get("claimed_at") or claimed_at
+                started_at = job_row.get("started_at") or started_at
+                if job_row.get("state") not in {None, "queued", "pending"}:
+                    claim_state = job_row["state"]
+        except Exception as exc:
+            print(f"AUDIT_WARNING attempt counter lookup failed: {exc}")
     update_processing_job(
         supabase,
         job_id,
-        "claimed",
-        claimed_at=utcnow_iso(),
-        started_at=utcnow_iso(),
-        attempt_count=1,
+        claim_state,
+        claimed_at=claimed_at,
+        started_at=started_at,
+        attempt_count=attempt_count,
     )
     
     # Automated/manual-all runs should respect the active-feed control. An
@@ -1351,7 +1373,7 @@ def bind_candidate_to_directories(candidate: dict, directory: dict, episode_peop
     )
     if category:
         bound["category_id"] = category.get("id")
-        bound["category"] = category.get("name")
+        bound["category"] = str(category.get("name") or "").strip()
         resolution.update({
             "category_status": "matched",
             "category_source": "canonical_exact",
@@ -1421,15 +1443,16 @@ def propose_transcript_corrections(
     episode,
     client,
     terminology_glossary="",
+    progress_callback=None,
 ):
     """Propose narrow terminology fixes; no prose rewriting is permitted."""
     if not segments:
         return []
     model = os.environ.get(
         "OPENAI_TERMINOLOGY_MODEL",
-        os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+        os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra"),
     )
-    reasoning_effort = os.environ.get("OPENAI_TERMINOLOGY_REASONING", "medium")
+    reasoning_effort = os.environ.get("OPENAI_TERMINOLOGY_REASONING", "low")
     correction_schema = {
         "type": "object",
         "properties": {
@@ -1460,10 +1483,18 @@ def propose_transcript_corrections(
         "additionalProperties": False,
     }
     proposals = []
-    for chunk_index, chunk_text in enumerate(
-        build_extraction_chunks(segments, max_chars=15000, overlap_segments=0),
-        start=1,
-    ):
+    correction_chunks = build_extraction_chunks(
+        segments,
+        max_chars=int(os.environ.get("TERMINOLOGY_CHUNK_CHARS", "10000")),
+        overlap_segments=0,
+    )
+    print(
+        f"  📝 Terminology configuration: {model}, reasoning={reasoning_effort}, "
+        f"chunks={len(correction_chunks)}"
+    )
+    for chunk_index, chunk_text in enumerate(correction_chunks, start=1):
+        if progress_callback:
+            progress_callback(chunk_index, len(correction_chunks))
         data = call_openai_structured(
             client,
             model=model,
@@ -1491,7 +1522,9 @@ TRANSCRIPT WITH GLOBAL SEGMENT IDS:
             schema_name="podthreads_transcript_corrections",
             schema=correction_schema,
             reasoning_effort=reasoning_effort,
-            max_output_tokens=4000,
+            max_output_tokens=1500,
+            max_retries=2,
+            request_timeout_seconds=180,
         )
         proposals.extend(data.get("corrections", []))
     return proposals
@@ -1632,6 +1665,10 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
 
 def build_extraction_chunks(segments, max_chars=18000, overlap_segments=3):
     """Create complete, overlapping chunks while preserving global segment IDs."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    if overlap_segments < 0:
+        raise ValueError("overlap_segments cannot be negative")
     chunks = []
     current_lines = []
     current_size = 0
@@ -1640,7 +1677,11 @@ def build_extraction_chunks(segments, max_chars=18000, overlap_segments=3):
         line = f"[{segment['id']}]{speaker} {segment['text']}"
         if current_lines and current_size + len(line) + 1 > max_chars:
             chunks.append("\n".join(current_lines))
-            current_lines = current_lines[-overlap_segments:]
+            current_lines = (
+                current_lines[-overlap_segments:]
+                if overlap_segments
+                else []
+            )
             current_size = sum(len(value) + 1 for value in current_lines)
         current_lines.append(line)
         current_size += len(line) + 1
@@ -2300,58 +2341,149 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             return {"episode": episode.title, "error": "No audio URL"}
         
         print(f"🎙️ Processing: {episode.title}")
-        
-        # Download FULL episode
-        temp_audio = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
-        temp_path = temp_audio.name
-        temp_audio.close()
-        
-        print("⬇️ Downloading full episode audio...")
-        cmd = [
-            'ffmpeg', '-v', 'error', '-reconnect', '1',
-            '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-            '-i', audio_url,
-            '-acodec', 'mp3',
-            '-ar', '16000',
-            '-ac', '1',
-            '-y', temp_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Full episode download failed: {result.stderr[-1000:]}")
-        
-        # Use the media duration, not compressed file size, for duration/cost.
-        probe = subprocess.run(
-            [
-                'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1', temp_path
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        duration_minutes = float(probe.stdout.strip()) / 60
-        processing_cost = duration_minutes * 0.006 
-        
-        print(f"📊 Episode duration: ~{duration_minutes:.1f} minutes")
-        print(f"💰 Estimated cost: ${duration_minutes * 0.006:.2f}")
-        
         episode_guid = getattr(episode, 'id', None) or hashlib.sha256(
             f"{feed['name']}|{episode.title}|{audio_url}".encode("utf-8")
         ).hexdigest()
+        temp_path = None
+        checkpoint = None
+        try:
+            checkpoint_result = (
+                supabase.table("episode_processing_artifacts")
+                .select(
+                    "transcript_text,transcript_segments,transcript_model,"
+                    "transcript_duration_seconds,transcription_cost_usd,"
+                    "transcript_diarization_requested,transcript_diarization_complete"
+                )
+                .eq("episode_guid", episode_guid)
+                .eq("pipeline_version", PIPELINE_VERSION)
+                .limit(1)
+                .execute()
+            )
+            if checkpoint_result.data and checkpoint_result.data[0].get("transcript_segments"):
+                checkpoint = checkpoint_result.data[0]
+        except Exception as exc:
+            print(f"AUDIT_WARNING transcript checkpoint lookup failed: {exc}")
 
-        # Transcribe every bounded audio chunk and preserve absolute timestamps.
-        print("🎤 Transcribing complete episode in bounded chunks...")
-        transcription = transcribe_audio_in_chunks(
-            temp_path,
-            client,
-            supabase,
-            job_id=job_id,
-        )
-        raw_transcript_text = transcription["text"]
-        raw_segments = transcription["segments"]
-        print(f"✅ Transcription complete: {len(raw_transcript_text)} characters, {len(raw_segments)} segments")
+        if checkpoint:
+            raw_segments = checkpoint.get("transcript_segments") or []
+            raw_transcript_text = checkpoint.get("transcript_text") or "\n".join(
+                segment.get("text", "") for segment in raw_segments
+            ).strip()
+            duration_minutes = float(checkpoint.get("transcript_duration_seconds") or 0) / 60
+            processing_cost = float(checkpoint.get("transcription_cost_usd") or 0)
+            transcription = {
+                "text": raw_transcript_text,
+                "segments": raw_segments,
+                "model": checkpoint.get("transcript_model") or "unknown",
+                "diarization_requested": bool(
+                    checkpoint.get("transcript_diarization_requested")
+                ),
+                "diarization_complete": bool(
+                    checkpoint.get("transcript_diarization_complete")
+                ),
+            }
+            print(
+                f"♻️ Reusing transcript checkpoint: {len(raw_transcript_text)} characters, "
+                f"{len(raw_segments)} segments"
+            )
+            update_processing_job(
+                supabase,
+                job_id,
+                "transcribing",
+                progress={"phase": "transcript_checkpoint_reused"},
+            )
+        else:
+            # Download and transcribe only when a durable transcript checkpoint
+            # does not already exist for this episode and pipeline version.
+            temp_audio = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+            temp_path = temp_audio.name
+            temp_audio.close()
+
+            print("⬇️ Downloading full episode audio...")
+            cmd = [
+                'ffmpeg', '-v', 'error', '-reconnect', '1',
+                '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+                '-i', audio_url,
+                '-acodec', 'mp3',
+                '-ar', '16000',
+                '-ac', '1',
+                '-y', temp_path
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"Full episode download failed: {result.stderr[-1000:]}")
+
+            probe = subprocess.run(
+                [
+                    'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1', temp_path
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            duration_minutes = float(probe.stdout.strip()) / 60
+            processing_cost = duration_minutes * 0.006
+
+            print(f"📊 Episode duration: ~{duration_minutes:.1f} minutes")
+            print(f"💰 Estimated cost: ${processing_cost:.2f}")
+            print("🎤 Transcribing complete episode in bounded chunks...")
+            transcription = transcribe_audio_in_chunks(
+                temp_path,
+                client,
+                supabase,
+                job_id=job_id,
+            )
+            raw_transcript_text = transcription["text"]
+            raw_segments = transcription["segments"]
+            print(
+                f"✅ Transcription complete: {len(raw_transcript_text)} characters, "
+                f"{len(raw_segments)} segments"
+            )
+
+            raw_artifact_payload = {
+                "processing_job_id": job_id,
+                "episode_guid": episode_guid,
+                "podcast_name": feed["name"],
+                "episode_name": episode.title,
+                "source_audio_url": audio_url,
+                "transcript_text": raw_transcript_text,
+                "transcript_segments": raw_segments,
+                "corrected_transcript_text": None,
+                "corrected_transcript_segments": None,
+                "transcript_corrections": [],
+                "rejected_transcript_corrections": [],
+                "transcript_model": transcription["model"],
+                "transcript_diarization_requested": transcription.get(
+                    "diarization_requested", False
+                ),
+                "transcript_diarization_complete": transcription.get(
+                    "diarization_complete", False
+                ),
+                "terminology_model": os.environ.get(
+                    "OPENAI_TERMINOLOGY_MODEL",
+                    os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra"),
+                ),
+                "terminology_prompt_version": TRANSCRIPT_CORRECTION_PROMPT_VERSION,
+                "transcript_duration_seconds": round(duration_minutes * 60, 3),
+                "transcription_cost_usd": round(processing_cost, 4),
+                "extraction_prompt_version": EXTRACTION_PROMPT_VERSION,
+                "ranking_prompt_version": RANKING_PROMPT_VERSION,
+                "pipeline_version": PIPELINE_VERSION,
+                "artifact_status": "partial",
+                "updated_at": utcnow_iso(),
+            }
+            supabase.table("episode_processing_artifacts").upsert(
+                raw_artifact_payload,
+                on_conflict="episode_guid,pipeline_version",
+            ).execute()
+            update_processing_job(
+                supabase,
+                job_id,
+                "transcribing",
+                progress={"phase": "transcript_checkpoint_saved"},
+            )
 
         # Correct only unmistakable AdTech terms and named entities. The raw
         # transcript remains immutable and is stored alongside every correction.
@@ -2367,6 +2499,16 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             episode.title,
             client,
             terminology_glossary=terminology_glossary,
+            progress_callback=lambda chunk_index, chunk_total: update_processing_job(
+                supabase,
+                job_id,
+                "transcribing",
+                progress={
+                    "phase": "terminology_correction",
+                    "terminology_chunk": chunk_index,
+                    "terminology_chunks": chunk_total,
+                },
+            ),
         )
         segments, applied_corrections, rejected_corrections = apply_transcript_corrections(
             raw_segments,
@@ -2415,7 +2557,7 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             "transcript_diarization_complete": transcription.get("diarization_complete", False),
             "terminology_model": os.environ.get(
                 "OPENAI_TERMINOLOGY_MODEL",
-                os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+                os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra"),
             ),
             "terminology_prompt_version": TRANSCRIPT_CORRECTION_PROMPT_VERSION,
             "transcript_duration_seconds": round(duration_minutes * 60, 3),
@@ -2689,7 +2831,7 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'transcript_corrections': quote.get('transcript_corrections', []),
                 'terminology_model': os.environ.get(
                     'OPENAI_TERMINOLOGY_MODEL',
-                    os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                    os.environ.get('OPENAI_CANDIDATE_MODEL', 'gpt-5.6-terra'),
                 ),
                 'terminology_prompt_version': TRANSCRIPT_CORRECTION_PROMPT_VERSION,
                 'source_start_segment': quote.get('start_seg'),
@@ -2737,7 +2879,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 else:
                     print(f"❌ Supabase Insert Error: {e}")
         
-        os.remove(temp_path)
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
         
         return {
             "episode": episode.title,
@@ -2747,7 +2890,7 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         }
     except Exception as e:
         print(f"❌ Error processing {episode.title}: {str(e)}")
-        if 'temp_path' in locals() and os.path.exists(temp_path):
+        if 'temp_path' in locals() and temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
         return {"episode": episode.title, "error": str(e)}
 
@@ -2774,15 +2917,24 @@ def call_openai_structured(
     schema,
     reasoning_effort,
     max_output_tokens=6000,
+    max_retries=4,
+    request_timeout_seconds=None,
 ):
     """Call the Responses API with a strict, versioned output contract."""
     import time
 
-    max_retries = 4
     base_delay = 4
     for attempt in range(max_retries):
         try:
-            response = client.responses.create(
+            request_options = {"max_retries": 0}
+            if request_timeout_seconds is not None:
+                request_options["timeout"] = request_timeout_seconds
+            request_client = (
+                client.with_options(**request_options)
+                if hasattr(client, "with_options")
+                else client
+            )
+            response = request_client.responses.create(
                 model=model,
                 instructions=system_prompt,
                 input=user_prompt,

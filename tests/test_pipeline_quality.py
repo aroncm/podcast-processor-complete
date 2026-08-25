@@ -239,6 +239,29 @@ class PipelineQualityTests(unittest.TestCase):
         first_tail = chunks[0].splitlines()[-2:]
         self.assertEqual(first_tail, chunks[1].splitlines()[:2])
 
+    def test_extraction_chunks_with_zero_overlap_do_not_retain_prior_chunk(self):
+        segments = [
+            {
+                'id': index,
+                'text': f'segment {index} ' + ('x' * 30),
+                'start': index * 2,
+                'end': index * 2 + 1,
+            }
+            for index in range(12)
+        ]
+        chunks = build_extraction_chunks(
+            segments,
+            max_chars=120,
+            overlap_segments=0,
+        )
+        rendered_ids = [
+            int(line.split(']', 1)[0][1:])
+            for chunk in chunks
+            for line in chunk.splitlines()
+        ]
+        self.assertEqual(rendered_ids, list(range(12)))
+        self.assertLess(len(chunks), len(segments))
+
     def test_deduplication_keeps_stronger_near_duplicate(self):
         weak = {
             'text': 'The open web needs a more efficient supply path.',
