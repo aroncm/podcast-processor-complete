@@ -781,6 +781,47 @@ def health_check():
         "feed_table_readable": feeds.data is not None,
     }
 
+
+@app.function(image=image, secrets=[my_secret], timeout=120)
+def openai_quota_check():
+    """Make one minimal, non-stored model call before a costly processing run."""
+    from openai import OpenAI
+
+    model = os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra")
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    try:
+        response = client.responses.create(
+            model=model,
+            input="Reply with exactly OK.",
+            max_output_tokens=32,
+            store=False,
+            metadata={
+                "pipeline_version": PIPELINE_VERSION,
+                "operator_check": "openai_quota",
+            },
+        )
+        return {
+            "ok": getattr(response, "status", None) == "completed",
+            "model": getattr(response, "model", model),
+            "status": getattr(response, "status", None),
+            "request_id": getattr(response, "_request_id", None),
+        }
+    except Exception as exc:
+        body = getattr(exc, "body", None)
+        body_error = body.get("error", body) if isinstance(body, dict) else {}
+        error_code = getattr(exc, "code", None)
+        if not error_code and isinstance(body_error, dict):
+            error_code = body_error.get("code")
+        return {
+            "ok": False,
+            "model": model,
+            "error_type": exc.__class__.__name__,
+            "error_code": error_code,
+            "http_status": getattr(exc, "status_code", None),
+            "request_id": getattr(exc, "request_id", None),
+            "retryable": openai_error_is_retryable(exc),
+        }
+
 @app.function(image=image, secrets=[my_secret], timeout=1800)
 def trigger_manual_processor(max_episodes: int = 1, days_back: int = 7):
     """Create an auditable job before an operator-initiated CLI run."""
@@ -6664,6 +6705,8 @@ def main(
 
     if action == "health":
         result = health_check.remote()
+    elif action == "openai-check":
+        result = openai_quota_check.remote()
     elif action == "process":
         result = trigger_manual_processor.remote(
             max_episodes=max(1, min(max_episodes, 3)),
@@ -6677,7 +6720,8 @@ def main(
         result = caption_source_check.remote(youtube_id=youtube_id)
     else:
         raise ValueError(
-            "action must be health, process, scheduled-check, historical-backfill, or caption-check"
+            "action must be health, openai-check, process, scheduled-check, "
+            "historical-backfill, or caption-check"
         )
 
     print(json.dumps(result, indent=2, default=str))
