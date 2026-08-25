@@ -3811,6 +3811,19 @@ def backfill_staged_take_analysis(
     bounded_limit = max(1, min(int(limit or 20), 50))
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    job_parameters = {}
+    if job_id and not quote_ids:
+        job_row = (
+            supabase.table("processing_jobs")
+            .select("parameters")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+        job_parameters = dict((job_row.data or {}).get("parameters") or {})
+        snapshotted_ids = job_parameters.get("target_quote_ids") or []
+        if snapshotted_ids:
+            quote_ids = [str(value) for value in snapshotted_ids]
     update_processing_job(
         supabase,
         job_id,
@@ -3860,6 +3873,18 @@ def backfill_staged_take_analysis(
             candidates.append((row, plan))
             if len(candidates) >= bounded_limit:
                 break
+
+        target_quote_ids = [str(row.get("id")) for row, _plan in candidates]
+        if job_id and not job_parameters.get("target_quote_ids"):
+            job_parameters.update({
+                "target_quote_ids": target_quote_ids,
+                "target_snapshot_count": len(target_quote_ids),
+                "target_snapshotted_at": utcnow_iso(),
+            })
+            supabase.table("processing_jobs").update({
+                "parameters": job_parameters,
+                "updated_at": utcnow_iso(),
+            }).eq("id", job_id).execute()
 
         feed_rows = (
             supabase.table("test_podcast_feeds")
