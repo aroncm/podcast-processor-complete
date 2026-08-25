@@ -2710,6 +2710,19 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             os.remove(temp_path)
         return {"episode": episode.title, "error": str(e)}
 
+def openai_error_is_retryable(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if any(marker in message for marker in (
+        "insufficient_quota", "credit_balance_exhausted", "no credits remaining",
+        "invalid_api_key", "authentication_error",
+    )):
+        return False
+    return any(
+        marker in message
+        for marker in ("rate_limit", "429", "timeout", "temporarily", "500", "502", "503")
+    )
+
+
 def call_openai_structured(
     client,
     *,
@@ -2757,10 +2770,7 @@ def call_openai_structured(
                 raise RuntimeError("OpenAI returned no structured output")
             return json.loads(output_text)
         except Exception as exc:
-            retryable = any(
-                marker in str(exc).lower()
-                for marker in ("rate_limit", "429", "timeout", "temporarily", "500", "502", "503")
-            )
+            retryable = openai_error_is_retryable(exc)
             if retryable and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 print(f"⚠️ OpenAI transient error; retrying in {delay}s: {exc}")

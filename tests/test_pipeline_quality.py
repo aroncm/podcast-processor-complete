@@ -19,6 +19,7 @@ from modal_app.full_processor import (
     historical_mapping_is_reviewable,
     missing_take_verification_fields,
     normalize_text,
+    openai_error_is_retryable,
     quote_word_count,
     staged_analysis_should_skip_source_retry,
     staged_analysis_write_plan,
@@ -404,6 +405,12 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(result, {'items': []})
         self.assertTrue(calls[0]['text']['format']['strict'])
         self.assertFalse(calls[0]['store'])
+
+    def test_openai_quota_errors_fail_without_retrying(self):
+        quota = RuntimeError("429 insufficient_quota credit_balance_exhausted")
+        transient = RuntimeError("429 rate_limit temporarily unavailable")
+        self.assertFalse(openai_error_is_retryable(quota))
+        self.assertTrue(openai_error_is_retryable(transient))
 
 
 if __name__ == '__main__':
