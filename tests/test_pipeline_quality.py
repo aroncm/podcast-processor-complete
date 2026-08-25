@@ -3,7 +3,10 @@ import unittest
 from types import SimpleNamespace
 
 from modal_app.full_processor import (
+    _caption_cache,
+    _parse_timedtext_captions,
     apply_transcript_corrections,
+    align_timestamps_to_youtube_captions_detailed,
     build_extraction_chunks,
     build_caption_evidence,
     align_quote_to_segments,
@@ -81,6 +84,25 @@ class PipelineQualityTests(unittest.TestCase):
             missing_take_verification_fields(record),
             ["speaker title", "speaker company"],
         )
+
+    def test_take_approval_requires_verified_youtube_clock(self):
+        record = {
+            "quote_text": "A complete source-grounded take.",
+            "speaker_name": "Jane Operator",
+            "guest_id": "operator-1",
+            "speaker_title": "CEO",
+            "speaker_company": "Signal Co",
+            "category": "Measurement",
+            "category_id": "measurement",
+            "youtube_id": "video-1",
+            "youtube_alignment_status": "failed",
+        }
+        self.assertEqual(
+            missing_take_verification_fields(record),
+            ["exact YouTube segment"],
+        )
+        record["youtube_alignment_status"] = "verified"
+        self.assertEqual(missing_take_verification_fields(record), [])
 
     def test_directory_binding_uses_only_exact_or_episode_scoped_identity(self):
         directory = {
@@ -348,6 +370,101 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(aligned['start'], 10)
         self.assertEqual(aligned['end'], 18)
         self.assertGreaterEqual(aligned['confidence'], 0.75)
+
+    def test_youtube_alignment_uses_full_track_when_rss_edit_drift_is_large(self):
+        youtube_id = "fixture-large-edit-drift"
+        _caption_cache[youtube_id] = [
+            {
+                "start": 100.0,
+                "end": 104.0,
+                "raw_text": "Retail media needs a durable measurement layer",
+                "norm_text": "retail media needs a durable measurement layer",
+                "caption_source": "fixture",
+            },
+            {
+                "start": 104.0,
+                "end": 109.0,
+                "raw_text": "before buyers can compare outcomes across closed ecosystems.",
+                "norm_text": "before buyers can compare outcomes across closed ecosystems",
+                "caption_source": "fixture",
+            },
+            {
+                "start": 800.0,
+                "end": 804.0,
+                "raw_text": "A generic discussion about buyers and outcomes.",
+                "norm_text": "a generic discussion about buyers and outcomes",
+                "caption_source": "fixture",
+            },
+        ]
+        try:
+            aligned = align_timestamps_to_youtube_captions_detailed(
+                "Retail media needs a durable measurement layer before buyers can compare outcomes across closed ecosystems.",
+                youtube_id,
+                whisper_start=900,
+                whisper_end=910,
+            )
+        finally:
+            _caption_cache.pop(youtube_id, None)
+        self.assertEqual(aligned["status"], "verified")
+        self.assertEqual(aligned["details"]["search_scope"], "full_caption_track")
+        self.assertAlmostEqual(aligned["start"], 98.5)
+        self.assertAlmostEqual(aligned["end"], 110.5)
+
+    def test_long_asr_quote_matches_as_word_sequence_without_autojunk(self):
+        quote = (
+            "So blended ROAS metric, this is where brands lean often on their agencies "
+            "or some of the late stage DTC brands are doing this with heads of growth. "
+            "You would have a baseline of what the ROAS was before you plus up a certain "
+            "channel. The idea is that the efficiency of retargeting on social is going "
+            "to be benefited by incremental reach on CTV, which is then going to have a "
+            "downstream impact on the cost per clicks of search. And so the blended ROAS "
+            "four to one, five to one, seven to one looks like ROAS, but it is trying to "
+            "harmonize and normalize performance across all the disparate channels."
+        )
+        segments = [
+            {"start": 607.4, "end": 617.04, "raw_text": "The blended ROAS metric actually this is where brands lean often on their agencies"},
+            {"start": 617.04, "end": 627.72, "raw_text": "or some late stage D2C brands are doing this with heads of growth but you would have a baseline"},
+            {"start": 627.72, "end": 640.48, "raw_text": "of what the ROAS was before you plus up a certain channel and the efficiency of retargeting on social is benefited by incremental reach on CTV"},
+            {"start": 640.48, "end": 653.08, "raw_text": "which has a downstream impact on cost per clicks of search and so blended ROAS four to one five to one seven to one looks like ROAS"},
+            {"start": 653.08, "end": 656.52, "raw_text": "but tries to harmonize and normalize performance across all those disparate channels"},
+            {"start": 800.0, "end": 810.0, "raw_text": "A separate generic discussion about campaign performance and metrics"},
+        ]
+        aligned = align_quote_to_segments(
+            quote,
+            segments,
+            expected_start=665,
+            expected_end=711,
+            global_fallback=True,
+            max_window_events=32,
+        )
+        self.assertIsNotNone(aligned)
+        self.assertEqual(aligned["start"], 607.4)
+        self.assertEqual(aligned["end"], 656.52)
+        self.assertGreaterEqual(aligned["confidence"], 0.70)
+
+    def test_timedtext_xml_parser_preserves_caption_clock(self):
+        captions = _parse_timedtext_captions(
+            b'<transcript><text start="35.25" dur="2.5">Exact &amp; sourced</text></transcript>',
+            "fixture_xml",
+        )
+        self.assertEqual(len(captions), 1)
+        self.assertEqual(captions[0]["raw_text"], "Exact & sourced")
+        self.assertEqual(captions[0]["start"], 35.25)
+        self.assertEqual(captions[0]["end"], 37.75)
+        self.assertEqual(captions[0]["caption_source"], "fixture_xml")
+
+    def test_ttml_parser_preserves_hour_minute_second_clock(self):
+        captions = _parse_timedtext_captions(
+            b'''<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml"><body><div>
+            <p begin="00:35:23.520" end="00:35:27.880">A precisely timed source moment</p>
+            </div></body></tt>''',
+            "fixture_ttml",
+        )
+        self.assertEqual(len(captions), 1)
+        self.assertEqual(captions[0]["raw_text"], "A precisely timed source moment")
+        self.assertAlmostEqual(captions[0]["start"], 2123.52)
+        self.assertAlmostEqual(captions[0]["end"], 2127.88)
+        self.assertEqual(captions[0]["caption_source"], "fixture_ttml")
 
     def test_historical_mapping_quality_gate_requires_confidence_and_depth(self):
         mapping = {

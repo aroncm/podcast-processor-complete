@@ -31,6 +31,7 @@ image = modal.Image.debian_slim() \
 my_secret = modal.Secret.from_name("podtakes-secrets")
 
 PIPELINE_VERSION = "podthreads-hybrid-v6-checkpointed-directory-aware"
+YOUTUBE_ALIGNMENT_VERSION = "youtube-caption-align-v3-provenance-gated"
 TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v2-bounded"
 EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
@@ -335,24 +336,54 @@ def _process_episode_with_ai_impl(
         
     failed_results = [item for item in all_results if isinstance(item, dict) and item.get("error")]
     successful_results = [item for item in all_results if isinstance(item, dict) and not item.get("error")]
+    youtube_alignment_failures = sum(
+        int((item.get("youtube_alignment") or {}).get("failed") or 0)
+        for item in successful_results
+    )
+    youtube_alignments_verified = sum(
+        int((item.get("youtube_alignment") or {}).get("verified") or 0)
+        for item in successful_results
+    )
     result = {
-        "success": len(failed_results) == 0,
-        "partial_success": bool(failed_results and successful_results),
+        "success": len(failed_results) == 0 and youtube_alignment_failures == 0,
+        "partial_success": bool(
+            (failed_results and successful_results) or youtube_alignment_failures
+        ),
         "processed_count": len(successful_results),
         "failed_count": len(failed_results),
+        "youtube_alignment_verified": youtube_alignments_verified,
+        "youtube_alignment_failed": youtube_alignment_failures,
         "details": all_results,
     }
-    final_state = "failed" if failed_results and not successful_results else "succeeded"
+    final_state = (
+        "failed" if failed_results and not successful_results
+        else "succeeded_with_warnings" if failed_results or youtube_alignment_failures
+        else "succeeded"
+    )
     update_processing_job(
         supabase,
         job_id,
         final_state,
         result=result,
-        progress={"attempted_episodes": attempted_episodes},
-        error_code="episode_processing_failed" if final_state == "failed" else None,
+        progress={
+            "attempted_episodes": attempted_episodes,
+            "youtube_alignment_verified": youtube_alignments_verified,
+            "youtube_alignment_failed": youtube_alignment_failures,
+        },
+        error_code=(
+            "episode_processing_failed" if final_state == "failed"
+            else "youtube_alignment_incomplete"
+            if final_state == "succeeded_with_warnings" and youtube_alignment_failures
+            else "episode_processing_partial"
+            if final_state == "succeeded_with_warnings"
+            else None
+        ),
         error_message=(
             "; ".join(str(item.get("error")) for item in failed_results)[:4000]
-            if final_state == "failed" else None
+            if final_state == "failed"
+            else f"{youtube_alignment_failures} takes require exact YouTube source verification"
+            if youtube_alignment_failures
+            else None
         ),
         completed_at=utcnow_iso(),
     )
@@ -426,122 +457,440 @@ def normalize_text(text: str) -> str:
 # Module-level caption cache: {youtube_id: [{text, start, duration}, ...]}
 _caption_cache: dict = {}
 
-def get_yt_captions(youtube_id: str) -> list | None:
-    """Fetch captions through the transcript API, then yt-dlp as a fallback.
-    Results are cached in-memory per video to avoid redundant API calls."""
-    import yt_dlp
-    import requests
-    import json
+def _caption_event(text, start, end, source):
     import html
-    from youtube_transcript_api import YouTubeTranscriptApi
-    
+
+    cleaned = html.unescape(str(text or "")).replace("\n", " ").strip()
+    if not cleaned:
+        return None
+    start_value = max(0.0, float(start or 0))
+    end_value = max(start_value + 0.01, float(end or start_value + 0.01))
+    return {
+        "start": start_value,
+        "end": end_value,
+        "raw_text": cleaned,
+        "norm_text": normalize_text(cleaned),
+        "word_count": len(cleaned.split()),
+        "caption_source": source,
+    }
+
+
+def _parse_json3_captions(payload, source):
+    processed = []
+    for event in (payload or {}).get("events", []):
+        if not event.get("segs"):
+            continue
+        start_ms = float(event.get("tStartMs", 0) or 0)
+        duration_ms = float(event.get("dDurationMs", 0) or 0)
+        text = "".join(segment.get("utf8", "") for segment in event["segs"])
+        parsed = _caption_event(
+            text,
+            start_ms / 1000.0,
+            (start_ms + max(duration_ms, 10)) / 1000.0,
+            source,
+        )
+        if parsed:
+            processed.append(parsed)
+    return processed
+
+
+def _parse_timedtext_captions(content, source):
+    """Parse classic timedtext, srv3, and TTML caption payloads."""
+    import xml.etree.ElementTree as element_tree
+
+    def parse_time_expression(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.endswith("ms"):
+            return float(raw[:-2]) / 1000.0
+        if raw.endswith("s"):
+            return float(raw[:-1])
+        if ":" in raw:
+            parts = [float(part) for part in raw.split(":")]
+            if len(parts) == 3:
+                return (parts[0] * 3600) + (parts[1] * 60) + parts[2]
+            if len(parts) == 2:
+                return (parts[0] * 60) + parts[1]
+        return float(raw)
+
+    root = element_tree.fromstring(content)
+    processed = []
+    for node in root.iter():
+        tag = str(node.tag).split("}")[-1]
+        if tag == "text":
+            start = float(node.attrib.get("start", 0) or 0)
+            duration = float(node.attrib.get("dur", 0) or 0)
+            parsed = _caption_event(
+                "".join(node.itertext()),
+                start,
+                start + max(duration, 0.01),
+                source,
+            )
+        elif tag == "p" and "t" in node.attrib:
+            start_ms = float(node.attrib.get("t", 0) or 0)
+            duration_ms = float(node.attrib.get("d", 0) or 0)
+            parsed = _caption_event(
+                "".join(node.itertext()),
+                start_ms / 1000.0,
+                (start_ms + max(duration_ms, 10)) / 1000.0,
+                source,
+            )
+        elif tag == "p" and "begin" in node.attrib:
+            start = parse_time_expression(node.attrib.get("begin"))
+            end = parse_time_expression(node.attrib.get("end"))
+            duration = parse_time_expression(node.attrib.get("dur"))
+            if end is None and start is not None and duration is not None:
+                end = start + duration
+            parsed = _caption_event(
+                "".join(node.itertext()),
+                start or 0,
+                end if end is not None else (start or 0) + 0.01,
+                source,
+            )
+        else:
+            parsed = None
+        if parsed:
+            processed.append(parsed)
+    return processed
+
+
+def _fetch_yt_captions_piped(youtube_id: str):
+    """Fetch English TTML captions through a constrained Piped API fallback.
+
+    Piped is only a transport for YouTube's timedtext payload. Both the API and
+    returned subtitle URL are allow-listed so a compromised response cannot
+    turn the alignment worker into an arbitrary URL fetcher.
+    """
+    import requests
+    from urllib.parse import urlparse
+
+    default_apis = ["https://pipedapi.wireway.ch"]
+    configured = [
+        value.strip().rstrip("/")
+        for value in os.environ.get("YOUTUBE_CAPTION_API_BASE_URLS", "").split(",")
+        if value.strip()
+    ]
+    api_bases = configured or default_apis
+    allowed_hosts = {
+        "pipedapi.wireway.ch",
+        "pipedproxy.wireway.ch",
+    }
+    allowed_hosts.update(
+        value.strip().casefold()
+        for value in os.environ.get("YOUTUBE_CAPTION_ALLOWED_HOSTS", "").split(",")
+        if value.strip()
+    )
+    failures = []
+    for base_url in api_bases:
+        parsed_base = urlparse(base_url)
+        if (
+            parsed_base.scheme != "https"
+            or not parsed_base.hostname
+            or parsed_base.username
+            or parsed_base.password
+        ):
+            failures.append(f"invalid_api_base={base_url[:120]}")
+            continue
+        allowed_hosts.add(parsed_base.hostname.casefold())
+        try:
+            response = requests.get(
+                f"{base_url}/streams/{youtube_id}",
+                headers={"Accept": "application/json"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            subtitles = [
+                row for row in (payload.get("subtitles") or [])
+                if str(row.get("code") or "").casefold().startswith("en")
+                and row.get("url")
+            ]
+            subtitles.sort(
+                key=lambda row: (
+                    bool(row.get("autoGenerated")),
+                    str(row.get("code") or "") != "en",
+                )
+            )
+            for track in subtitles:
+                track_url = str(track["url"])
+                parsed_track = urlparse(track_url)
+                if (
+                    parsed_track.scheme != "https"
+                    or not parsed_track.hostname
+                    or parsed_track.hostname.casefold() not in allowed_hosts
+                    or parsed_track.username
+                    or parsed_track.password
+                ):
+                    failures.append(
+                        f"blocked_caption_host={parsed_track.hostname or 'missing'}"
+                    )
+                    continue
+                caption_response = requests.get(track_url, timeout=30)
+                caption_response.raise_for_status()
+                kind = "asr" if track.get("autoGenerated") else "manual"
+                source = f"youtube_piped_{parsed_base.hostname}_{kind}"
+                processed = _parse_timedtext_captions(
+                    caption_response.content,
+                    source,
+                )
+                if processed:
+                    return processed
+            raise RuntimeError("no_usable_english_caption_track")
+        except Exception as exc:
+            failures.append(f"{parsed_base.hostname}={str(exc)[:180]}")
+    raise RuntimeError("; ".join(failures))
+
+
+def _fetch_yt_captions_innertube(youtube_id: str):
+    """Resolve timedtext through several unauthenticated player clients.
+
+    The profiles mirror current yt-dlp client definitions. YouTube applies
+    challenges selectively, so one client failure must not collapse source
+    verification when another public player surface still exposes captions.
+    """
+    import requests
+
+    profiles = [
+        {
+            "label": "web_embedded",
+            "number": "56",
+            "client": {
+                "clientName": "WEB_EMBEDDED_PLAYER",
+                "clientVersion": "2.20260708.00.00",
+                "userAgent": "Mozilla/5.0 AppleWebKit/537.36 Chrome/138 Safari/537.36",
+            },
+            "thirdParty": {"embedUrl": "https://www.reddit.com/"},
+        },
+        {
+            "label": "tv",
+            "number": "7",
+            "client": {
+                "clientName": "TVHTML5",
+                "clientVersion": "7.20260707.07.00",
+                "userAgent": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold",
+            },
+        },
+        {
+            "label": "tv_simply",
+            "number": "75",
+            "client": {
+                "clientName": "TVHTML5_SIMPLY",
+                "clientVersion": "1.0",
+                "userAgent": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+            },
+        },
+        {
+            "label": "ios",
+            "number": "5",
+            "client": {
+                "clientName": "IOS",
+                "clientVersion": "21.26.4",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "userAgent": "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22D82",
+            },
+        },
+        {
+            "label": "android_vr",
+            "number": "28",
+            "client": {
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.65.10",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "androidSdkVersion": 32,
+                "userAgent": "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L) gzip",
+                "osName": "Android",
+                "osVersion": "12L",
+            },
+        },
+        {
+            "label": "android",
+            "number": "3",
+            "client": {
+                "clientName": "ANDROID",
+                "clientVersion": os.environ.get("YOUTUBE_ANDROID_CLIENT_VERSION", "20.10.38"),
+                "androidSdkVersion": 35,
+                "userAgent": "com.google.android.youtube/20.10.38",
+            },
+        },
+    ]
+    failures = []
+    for profile in profiles:
+        client = {**profile["client"], "hl": "en", "gl": "US"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": client["userAgent"],
+            "X-YouTube-Client-Name": profile["number"],
+            "X-YouTube-Client-Version": client["clientVersion"],
+        }
+        context = {"client": client}
+        if profile.get("thirdParty"):
+            context["thirdParty"] = profile["thirdParty"]
+        payload = {
+            "context": context,
+            "videoId": youtube_id,
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+        }
+        try:
+            player = requests.post(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            player.raise_for_status()
+            player_payload = player.json()
+            playability = player_payload.get("playabilityStatus") or {}
+            if playability.get("status") != "OK":
+                raise RuntimeError(
+                    f"{playability.get('status')}:{playability.get('reason') or 'unknown'}"
+                )
+            tracks = (
+                ((player_payload.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {})
+                .get("captionTracks", [])
+            )
+            english_tracks = [
+                track for track in tracks
+                if str(track.get("languageCode") or "").casefold().startswith("en")
+            ]
+            if not english_tracks:
+                raise RuntimeError("no_english_caption_track")
+            english_tracks.sort(
+                key=lambda track: (
+                    track.get("kind") == "asr",
+                    track.get("languageCode") != "en",
+                )
+            )
+            track = english_tracks[0]
+            base_url = str(track.get("baseUrl") or "")
+            if not base_url:
+                raise RuntimeError("caption_track_missing_url")
+            kind = "manual" if track.get("kind") != "asr" else "asr"
+            source = f"youtube_innertube_{profile['label']}_{kind}"
+            separator = "&" if "?" in base_url else "?"
+            json_response = requests.get(
+                f"{base_url}{separator}fmt=json3",
+                headers=headers,
+                timeout=20,
+            )
+            if json_response.ok:
+                try:
+                    parsed = _parse_json3_captions(json_response.json(), source)
+                    if parsed:
+                        return parsed
+                except Exception:
+                    pass
+            xml_response = requests.get(base_url, headers=headers, timeout=20)
+            xml_response.raise_for_status()
+            parsed = _parse_timedtext_captions(xml_response.content, source)
+            if parsed:
+                return parsed
+            raise RuntimeError("empty_timedtext_payload")
+        except Exception as exc:
+            failures.append(f"{profile['label']}={str(exc)[:180]}")
+    raise RuntimeError("; ".join(failures))
+
+
+def get_yt_captions(youtube_id: str) -> list | None:
+    """Fetch captions through independent sources and cache them per container."""
     if youtube_id in _caption_cache:
         return _caption_cache[youtube_id]
 
+    import html
+    import requests
+    import yt_dlp
+    from youtube_transcript_api import YouTubeTranscriptApi
+
     try:
         print(f"  🎬 Fetching YouTube captions for {youtube_id} via transcript API...")
-        transcript = YouTubeTranscriptApi().fetch(youtube_id, languages=['en'])
+        transcript = YouTubeTranscriptApi().fetch(youtube_id, languages=["en"])
         processed = []
         for snippet in transcript:
-            text = html.unescape(str(getattr(snippet, 'text', '') or '')).strip()
-            if not text:
-                continue
-            start = float(getattr(snippet, 'start', 0) or 0)
-            duration = float(getattr(snippet, 'duration', 0) or 0)
-            processed.append({
-                'start': start,
-                'end': start + duration,
-                'raw_text': text,
-                'norm_text': normalize_text(text),
-                'word_count': len(text.split()),
-            })
+            text = html.unescape(str(getattr(snippet, "text", "") or "")).strip()
+            start = float(getattr(snippet, "start", 0) or 0)
+            duration = float(getattr(snippet, "duration", 0) or 0)
+            parsed = _caption_event(
+                text,
+                start,
+                start + max(duration, 0.01),
+                "youtube_transcript_api",
+            )
+            if parsed:
+                processed.append(parsed)
         if processed:
             print(f"  ✅ Parsed {len(processed)} transcript API events for {youtube_id}")
             _caption_cache[youtube_id] = processed
             return processed
     except Exception as exc:
         print(f"  ⚠️  Transcript API unavailable for {youtube_id}: {exc}")
-    
+
+    try:
+        print(f"  🎬 Fetching YouTube captions for {youtube_id} via Android player...")
+        processed = _fetch_yt_captions_innertube(youtube_id)
+        if processed:
+            print(f"  ✅ Parsed {len(processed)} Android timedtext events for {youtube_id}")
+            _caption_cache[youtube_id] = processed
+            return processed
+    except Exception as exc:
+        print(f"  ⚠️  Android timedtext unavailable for {youtube_id}: {exc}")
+
+    try:
+        print(f"  🎬 Fetching YouTube captions for {youtube_id} via Piped transport...")
+        processed = _fetch_yt_captions_piped(youtube_id)
+        if processed:
+            print(f"  ✅ Parsed {len(processed)} Piped timedtext events for {youtube_id}")
+            _caption_cache[youtube_id] = processed
+            return processed
+    except Exception as exc:
+        print(f"  ⚠️  Piped caption transport unavailable for {youtube_id}: {exc}")
+
     try:
         print(f"  🎬 Fetching YouTube captions for {youtube_id} via yt-dlp...")
         ydl_opts = {
-            'skip_download': True,
-            'writeautosubs': True,
-            'subtitleslangs': ['en.*'],
-            'quiet': True,
-            'no_warnings': True
+            "skip_download": True,
+            "writeautosubs": True,
+            "subtitleslangs": ["en.*"],
+            "quiet": True,
+            "no_warnings": True,
         }
-        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_id, download=False)
-            
-            # Find the best English subtitle (auto or manual)
-            sub_url = None
-            
-            # Try manual subtitles first
-            if 'subtitles' in info and 'en' in info['subtitles']:
-                for fmt in info['subtitles']['en']:
-                    if fmt.get('ext') == 'json3':
-                        sub_url = fmt['url']
-                        break
-            
-            # Fallback to automatic captions
-            if not sub_url and 'automatic_captions' in info:
-                # Often 'en', 'en-us', etc.
-                en_keys = [k for k in info['automatic_captions'].keys() if k.startswith('en')]
-                if en_keys:
-                    # Pick first one, look for json3
-                    for fmt in info['automatic_captions'][en_keys[0]]:
-                        if fmt.get('ext') == 'json3':
-                            sub_url = fmt['url']
-                            break
-            
-            if not sub_url:
-                print(f"  ⚠️  No English json3 captions found for {youtube_id}")
-                _caption_cache[youtube_id] = None
-                return None
-            
-            # Fetch the actual json3 data
-            resp = requests.get(sub_url)
-            if resp.status_code != 200:
-                print(f"  ⚠️  Failed to download captions from {sub_url[:50]}...")
-                _caption_cache[youtube_id] = None
-                return None
-            
-            data = resp.json()
-            if 'events' not in data:
-                print(f"  ⚠️  Unrecognized caption format for {youtube_id}")
-                _caption_cache[youtube_id] = None
-                return None
-            
-            # 2. Parse caption events into {start, end, raw_text, norm_text, word_count}
-            processed = []
-            for event in data['events']:
-                if 'segs' not in event: continue
-                
-                start_ms = event.get('tStartMs', 0)
-                duration_ms = event.get('dDurationMs', 0)
-                
-                # Concatenate segments
-                text = "".join([s.get('utf8', '') for s in event['segs']]).strip()
-                if not text: continue
-                
-                processed.append({
-                    'start': start_ms / 1000.0,
-                    'end': (start_ms + duration_ms) / 1000.0,
-                    'raw_text': text,
-                    'norm_text': normalize_text(text),
-                    'word_count': len(text.split())
-                })
-            
-            print(f"  ✅ Parsed {len(processed)} caption events for {youtube_id}")
-            _caption_cache[youtube_id] = processed
-            return processed
-            
-    except Exception as e:
-        print(f"  ⚠️  Caption fetch error for {youtube_id}: {e}")
-        _caption_cache[youtube_id] = None
-        return None
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={youtube_id}",
+                download=False,
+            )
+            subtitle_groups = [
+                ("youtube_ytdlp_manual", info.get("subtitles") or {}),
+                ("youtube_ytdlp_asr", info.get("automatic_captions") or {}),
+            ]
+            for source, group in subtitle_groups:
+                english_keys = sorted(
+                    (key for key in group if key.casefold().startswith("en")),
+                    key=lambda key: (key != "en", key),
+                )
+                for language in english_keys:
+                    json_track = next(
+                        (item for item in group[language] if item.get("ext") == "json3"),
+                        None,
+                    )
+                    if not json_track:
+                        continue
+                    response = requests.get(json_track["url"], timeout=20)
+                    response.raise_for_status()
+                    processed = _parse_json3_captions(response.json(), source)
+                    if processed:
+                        print(f"  ✅ Parsed {len(processed)} yt-dlp events for {youtube_id}")
+                        _caption_cache[youtube_id] = processed
+                        return processed
+    except Exception as exc:
+        print(f"  ⚠️  yt-dlp caption fetch unavailable for {youtube_id}: {exc}")
+
+    _caption_cache[youtube_id] = None
+    return None
 
 
 @app.function(image=image, secrets=[my_secret], timeout=180)
@@ -556,6 +905,8 @@ def caption_source_check(youtube_id: str):
         "events": len(captions),
         "first_start": captions[0]["start"],
         "last_end": captions[-1]["end"],
+        "caption_source": captions[0].get("caption_source"),
+        "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
     }
 
 def align_timestamps_to_youtube_captions(
@@ -564,170 +915,514 @@ def align_timestamps_to_youtube_captions(
     whisper_start: int,
     whisper_end: int
 ) -> dict | None:
-    """Deterministic caption-alignment pipeline with strict confidence gating."""
-    from difflib import SequenceMatcher
-    
+    """Return only verified alignments for backward-compatible callers."""
+    result = align_timestamps_to_youtube_captions_detailed(
+        quote_text,
+        youtube_id,
+        whisper_start,
+        whisper_end,
+    )
+    return result if result.get("status") == "verified" else None
+
+
+def align_timestamps_to_youtube_captions_detailed(
+    quote_text: str,
+    youtube_id: str,
+    whisper_start: float,
+    whisper_end: float,
+) -> dict:
+    """Align one take to the specific YouTube clock or return a gated failure."""
     captions = get_yt_captions(youtube_id)
     if not captions:
-        return None
+        return {
+            "status": "failed",
+            "error_code": "captions_unavailable",
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+            "details": {"youtube_id": youtube_id},
+        }
 
-    # Step 2: Normalize quote text
-    norm_quote = normalize_text(quote_text)
-    quote_words = norm_quote.split()
-    quote_word_count = len(quote_words)
-    if quote_word_count < 5:
-        return None # Too short for reliable alignment
+    aligned = align_quote_to_segments(
+        quote_text,
+        captions,
+        expected_start=whisper_start,
+        expected_end=whisper_end,
+        global_fallback=True,
+        max_window_events=32,
+    )
+    if not aligned:
+        return {
+            "status": "failed",
+            "error_code": "no_unique_high_confidence_match",
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+            "details": {
+                "youtube_id": youtube_id,
+                "caption_events": len(captions),
+                "caption_source": captions[0].get("caption_source", "unknown"),
+            },
+        }
 
-    # Step 3: Find quote location via sliding-window matching
-    best_candidate = None
-    best_composite_score = 0
-    second_best_composite = 0
-    
-    # Candidate size scales with quote length
-    min_win = max(1, int(quote_word_count * 0.55))
-    max_win = int(quote_word_count * 2.2)
-    
-    # To optimize, we search in a +/- 5 minute window around the whisper timestamp
-    SEARCH_RADIUS = 300 # seconds
-    search_start_time = max(0, whisper_start - SEARCH_RADIUS)
-    search_end_time = whisper_end + SEARCH_RADIUS
-    
-    # Find relevant caption indices
-    start_idx = 0
-    end_idx = len(captions)
-    for i, c in enumerate(captions):
-        if c['start'] < search_start_time: start_idx = i
-        if c['start'] > search_end_time: 
-            end_idx = i
-            break
-            
-    # Sliding window over indices
-    for i in range(start_idx, end_idx):
-        for win_size in range(1, 15): # Most quotes span < 15 caption events
-            if i + win_size > len(captions): break
-            
-            window_events = captions[i : i+win_size]
-            window_text = " ".join([e['norm_text'] for e in window_events])
-            window_words = window_text.split()
-            
-            # Length guardrails
-            if len(window_words) < min_win: continue
-            if len(window_words) > max_win: break
-            
-            # Scoring
-            sm_ratio = SequenceMatcher(None, norm_quote, window_text).ratio()
-            
-            # Token metrics
-            needle_set = set(quote_words)
-            candidate_set = set(window_words)
-            common = needle_set & candidate_set
-            
-            f1 = 0
-            recall = 0
-            if common:
-                prec = len(common) / len(candidate_set)
-                rec = len(common) / len(needle_set)
-                f1 = 2 * (prec * rec) / (prec + rec)
-                recall = rec
-            
-            # Composite Score: 0.6 * SM + 0.25 * F1 + 0.15 * Recall
-            composite = (0.6 * sm_ratio) + (0.25 * f1) + (0.15 * recall)
-            
-            if composite > best_composite_score:
-                # Check for overlap with existing best to track ambiguity
-                is_overlapping = False
-                if best_candidate:
-                    if not (i + win_size <= best_candidate['start_idx'] or i >= best_candidate['end_idx']):
-                        is_overlapping = True
-                
-                if not is_overlapping:
-                    second_best_composite = best_composite_score
-                
-                best_composite_score = composite
-                best_candidate = {
-                    'start_idx': i,
-                    'end_idx': i + win_size,
-                    'start_time': window_events[0]['start'],
-                    'end_time': window_events[-1]['end']
-                }
-            elif composite > second_best_composite:
-                # Track non-overlapping rivals for ambiguity check
-                is_overlapping = (not (i + win_size <= best_candidate['start_idx'] or i >= best_candidate['end_idx']))
-                if not is_overlapping:
-                    second_best_composite = composite
-
-    # Step 4: Confidence/ambiguity gates
-    if not best_candidate:
-        return None
-        
-    # Thresholds (Tuned based on user policy)
-    MIN_COMPOSITE = 0.75
-    MIN_MARGIN = 0.04 # Strict margin over second best
-    
-    if quote_word_count > 30:
-        MIN_COMPOSITE = 0.70 # Looser for very long quotes
-        MIN_MARGIN = 0.03
-        
-    is_ambiguous = (best_composite_score - second_best_composite) < MIN_MARGIN
-    
-    if best_composite_score < MIN_COMPOSITE or is_ambiguous:
-        reason = "low_confidence" if best_composite_score < MIN_COMPOSITE else "ambiguous_match"
-        print(f"  ⚠️ YT Alignment rejected ({reason}): score={best_composite_score:.2f}, margin={best_composite_score-second_best_composite:.3f}")
-        return None
-
-    # Step 5: Context window expansion (±30s) + sentence-safe alignment
-    exact_start = best_candidate['start_time']
-    exact_end = best_candidate['end_time']
-    
-    padded_start = max(0, int(exact_start - 30))
-    padded_end = int(exact_end + 30)
-    
-    # Sentence boundary alignment logic
-    # We look for punctuation (.!?) or gaps > 1.5s as sentence boundaries
-    final_start = padded_start
-    final_end = padded_end
-    
-    # Find nearest sentence start at/before padded_start
-    # Search within 15s of the padded start
-    for i in range(len(captions)-1, -1, -1):
-        c = captions[i]
-        if c['start'] <= padded_start:
-            # Check if this or previous event ended a sentence
-            is_sentence_boundary = False
-            if i > 0:
-                prev = captions[i-1]
-                if any(p in prev['raw_text'] for p in ['.', '!', '?']):
-                    is_sentence_boundary = True
-                elif c['start'] - prev['end'] > 1.5:
-                    is_sentence_boundary = True
-            
-            if is_sentence_boundary:
-                final_start = int(c['start'])
-                break
-        if c['start'] < padded_start - 15: break
-
-    # Find nearest sentence end at/after padded_end
-    for i in range(len(captions)):
-        c = captions[i]
-        if c['end'] >= padded_end:
-            if any(p in c['raw_text'] for p in ['.', '!', '?']):
-                final_end = int(c['end'])
-                break
-            # Or if next event starts after a big gap
-            if i + 1 < len(captions):
-                if captions[i+1]['start'] - c['end'] > 1.5:
-                    final_end = int(c['end'])
-                    break
-        if c['end'] > padded_end + 15: break
-            
-    confidence = round(best_composite_score, 3)
-    print(f"  🎯 YT Deterministic Match: {final_start}s–{final_end}s (conf={confidence}, margin={best_composite_score-second_best_composite:.3f})")
-    
-    return {
-        'start': final_start,
-        'end': final_end,
-        'confidence': confidence
+    # Give the viewer a small natural lead-in without turning the take into a
+    # broad context clip. The prior 30-second padding obscured whether the quote
+    # itself had been located correctly.
+    final_start = round(max(0.0, float(aligned["start"]) - 1.5), 3)
+    final_end = round(max(final_start + 1.0, float(aligned["end"]) + 1.5), 3)
+    confidence = float(aligned["confidence"])
+    caption_source = captions[0].get("caption_source", "unknown")
+    details = {
+        "youtube_id": youtube_id,
+        "caption_source": caption_source,
+        "caption_events": len(captions),
+        "match_start": aligned["start"],
+        "match_end": aligned["end"],
+        "match_margin": aligned.get("margin"),
+        "search_scope": aligned.get("search_scope"),
+        "rss_hint_start": float(whisper_start),
+        "rss_hint_end": float(whisper_end),
+        "start_drift_seconds": round(final_start - float(whisper_start), 3),
+        "end_drift_seconds": round(final_end - float(whisper_end), 3),
     }
+    if captions[0].get("caption_bundle_sha256"):
+        details["caption_bundle_sha256"] = captions[0]["caption_bundle_sha256"]
+    print(
+        "  🎯 YT per-take match: "
+        f"{final_start}s–{final_end}s (conf={confidence:.3f}, "
+        f"source={caption_source}, drift={details['start_drift_seconds']:+.1f}s)"
+    )
+    return {
+        "status": "verified",
+        "start": final_start,
+        "end": final_end,
+        "confidence": confidence,
+        "method": "youtube_caption_text_match",
+        "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+        "details": details,
+    }
+
+
+def record_youtube_alignment_result(
+    supabase,
+    *,
+    quote_table,
+    quote_id,
+    youtube_id,
+    rss_start,
+    rss_end,
+    alignment,
+    processing_job_id=None,
+):
+    """Apply an alignment and append its before/after evidence atomically."""
+    verified = alignment.get("status") == "verified"
+    payload = {
+        "p_quote_table": quote_table,
+        "p_quote_id": str(quote_id),
+        "p_status": "verified" if verified else "failed",
+        "p_youtube_id": youtube_id,
+        "p_rss_start": rss_start,
+        "p_rss_end": rss_end,
+        "p_youtube_start": alignment.get("start") if verified else None,
+        "p_youtube_end": alignment.get("end") if verified else None,
+        "p_confidence": alignment.get("confidence") if verified else None,
+        "p_method": alignment.get("method", "youtube_caption_text_match"),
+        "p_alignment_version": alignment.get(
+            "alignment_version",
+            YOUTUBE_ALIGNMENT_VERSION,
+        ),
+        "p_details": {
+            **(alignment.get("details") or {}),
+            **({"error_code": alignment.get("error_code")} if not verified else {}),
+        },
+        "p_processing_job_id": processing_job_id,
+    }
+    return supabase.rpc("apply_youtube_alignment_result", payload).execute().data
+
+
+def resolve_quote_source_span(supabase, row, quote_table):
+    """Recover the RSS span from immutable transcript evidence when available."""
+    rss_start = row.get("rss_timestamp_start")
+    rss_end = row.get("rss_timestamp_end")
+    if quote_table != "test_quotes":
+        return rss_start, rss_end
+    if row.get("episode_guid") and row.get("source_start_segment") is not None:
+        try:
+            artifact = (
+                supabase.table("episode_processing_artifacts")
+                .select("transcript_segments")
+                .eq("episode_guid", row["episode_guid"])
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            segments = (artifact.data or [{}])[0].get("transcript_segments") or []
+            by_id = {
+                int(segment.get("id", index)): segment
+                for index, segment in enumerate(segments)
+            }
+            start_segment = by_id.get(int(row["source_start_segment"]))
+            end_segment = by_id.get(int(row.get("source_end_segment") or row["source_start_segment"]))
+            if start_segment and end_segment:
+                return (
+                    float(start_segment.get("start", rss_start or 0)),
+                    float(end_segment.get("end", rss_end or 0)),
+                )
+        except Exception as exc:
+            print(f"  ⚠️ Unable to recover transcript span for {row.get('id')}: {exc}")
+    return rss_start, rss_end
+
+
+def align_stored_quote(supabase, row, quote_table, *, dry_run=False, processing_job_id=None):
+    """Align one stored take and optionally apply the append-only audited result."""
+    quote_text = row.get("quote_text") if quote_table == "test_quotes" else row.get("text")
+    youtube_id = str(row.get("youtube_id") or "").strip()
+    if not youtube_id:
+        return {"quote_id": row.get("id"), "status": "not_applicable"}
+    rss_start, rss_end = resolve_quote_source_span(supabase, row, quote_table)
+    expected_start = float(
+        rss_start if rss_start is not None else row.get("timestamp_start") or 0
+    )
+    expected_end = float(
+        rss_end if rss_end is not None else row.get("timestamp_end") or expected_start + 30
+    )
+    alignment = align_timestamps_to_youtube_captions_detailed(
+        quote_text or "",
+        youtube_id,
+        expected_start,
+        expected_end,
+    )
+    result = {
+        "quote_id": str(row.get("id")),
+        "quote_table": quote_table,
+        "status": alignment.get("status"),
+        "youtube_id": youtube_id,
+        "rss_start": rss_start,
+        "rss_end": rss_end,
+        "youtube_start": alignment.get("start"),
+        "youtube_end": alignment.get("end"),
+        "confidence": alignment.get("confidence"),
+        "error_code": alignment.get("error_code"),
+        "dry_run": dry_run,
+    }
+    if not dry_run:
+        record_youtube_alignment_result(
+            supabase,
+            quote_table=quote_table,
+            quote_id=row["id"],
+            youtube_id=youtube_id,
+            rss_start=rss_start,
+            rss_end=rss_end,
+            alignment=alignment,
+            processing_job_id=processing_job_id,
+        )
+    return result
+
+
+def select_youtube_alignment_rows(supabase, scope: str, limit: int):
+    """Return one bounded, deterministic set of unverified alignment targets."""
+    quote_table = "quotes" if scope == "production" else "test_quotes"
+    select_fields = (
+        "id,text,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
+        "rss_timestamp_end,youtube_alignment_status,created_at"
+        if quote_table == "quotes" else
+        "id,quote_text,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
+        "rss_timestamp_end,youtube_alignment_status,episode_guid,"
+        "source_start_segment,source_end_segment,processing_job_id,created_at"
+    )
+    query = (
+        supabase.table(quote_table)
+        .select(select_fields)
+        .not_.is_("youtube_id", "null")
+        .in_(
+            "youtube_alignment_status",
+            ["pending", "failed", "legacy_unverified", "manual_review_required"],
+        )
+    )
+    if scope == "recent_test":
+        query = query.not_.is_("processing_job_id", "null")
+    rows = (
+        query.order("created_at", desc=True)
+        .limit(max(1, min(int(limit), 250)))
+        .execute()
+    ).data or []
+    return quote_table, rows
+
+
+@app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
+def backfill_youtube_alignments(
+    scope: str = "recent_test",
+    limit: int = 25,
+    dry_run: bool = True,
+    job_id: str = None,
+):
+    """Run a bounded, auditable per-take YouTube alignment repair."""
+    from supabase import create_client
+
+    if scope not in {"recent_test", "all_test", "production"}:
+        raise ValueError("scope must be recent_test, all_test, or production")
+    bounded_limit = max(1, min(int(limit), 250))
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    quote_table, rows = select_youtube_alignment_rows(supabase, scope, bounded_limit)
+
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        started_at=utcnow_iso(),
+        progress={"phase": "youtube_alignment", "current": 0, "total": len(rows)},
+    )
+    results = []
+    for index, row in enumerate(rows, start=1):
+        try:
+            result = align_stored_quote(
+                supabase,
+                row,
+                quote_table,
+                dry_run=dry_run,
+                processing_job_id=job_id,
+            )
+        except Exception as exc:
+            result = {
+                "quote_id": str(row.get("id")),
+                "quote_table": quote_table,
+                "status": "failed",
+                "error_code": "alignment_worker_error",
+                "error": str(exc)[:1000],
+                "dry_run": dry_run,
+            }
+        results.append(result)
+        update_processing_job(
+            supabase,
+            job_id,
+            "claimed",
+            progress={
+                "phase": "youtube_alignment",
+                "current": index,
+                "total": len(rows),
+                "verified": sum(item.get("status") == "verified" for item in results),
+                "failed": sum(item.get("status") == "failed" for item in results),
+                "dry_run": dry_run,
+            },
+        )
+
+    verified = sum(item.get("status") == "verified" for item in results)
+    failed = sum(item.get("status") == "failed" for item in results)
+    result = {
+        "success": failed == 0,
+        "partial_success": bool(verified and failed),
+        "scope": scope,
+        "dry_run": dry_run,
+        "attempted": len(results),
+        "verified": verified,
+        "failed": failed,
+        "items": results,
+        "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+    }
+    final_state = "succeeded" if failed == 0 else "succeeded_with_warnings"
+    update_processing_job(
+        supabase,
+        job_id,
+        final_state,
+        result=result,
+        progress={
+            "phase": "youtube_alignment_complete",
+            "current": len(results),
+            "total": len(results),
+            "verified": verified,
+            "failed": failed,
+            "dry_run": dry_run,
+        },
+        error_code="youtube_alignment_incomplete" if failed else None,
+        error_message=(f"{failed} takes still require manual source verification" if failed else None),
+        completed_at=utcnow_iso(),
+    )
+    return result
+
+
+@app.function(image=image, secrets=[my_secret], timeout=300)
+def list_youtube_alignment_relay_targets(scope: str = "recent_test", limit: int = 25):
+    """Return only IDs needed by the operator caption relay; no secrets leave Modal."""
+    from supabase import create_client
+
+    if scope not in {"recent_test", "all_test", "production"}:
+        raise ValueError("unsupported alignment scope")
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    quote_table, rows = select_youtube_alignment_rows(supabase, scope, limit)
+    return {
+        "scope": scope,
+        "quote_table": quote_table,
+        "quote_ids": [str(row["id"]) for row in rows],
+        "youtube_ids": sorted({str(row["youtube_id"]) for row in rows}),
+    }
+
+
+@app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
+def apply_relayed_youtube_alignments(
+    scope: str,
+    quote_ids: list,
+    compressed_caption_bundle: bytes,
+    bundle_sha256: str,
+    dry_run: bool = True,
+):
+    """Apply a constrained operator-relayed caption bundle inside Modal.
+
+    The relay solves YouTube's cloud-IP blocking without exposing the Supabase
+    service key. The bundle is hash-checked, bounded, and its provenance is
+    attached to each append-only alignment attempt.
+    """
+    import gzip
+    from supabase import create_client
+
+    if scope not in {"recent_test", "all_test", "production"}:
+        raise ValueError("unsupported alignment scope")
+    if not quote_ids or len(quote_ids) > 250:
+        raise ValueError("relay requires between 1 and 250 quote IDs")
+    if len(compressed_caption_bundle) > 4_000_000:
+        raise ValueError("compressed caption bundle exceeds 4 MB")
+    actual_sha256 = hashlib.sha256(compressed_caption_bundle).hexdigest()
+    if actual_sha256 != bundle_sha256:
+        raise ValueError("caption bundle digest mismatch")
+    raw_bundle = gzip.decompress(compressed_caption_bundle)
+    if len(raw_bundle) > 15_000_000:
+        raise ValueError("caption bundle exceeds 15 MB after decompression")
+    payload = json.loads(raw_bundle.decode("utf-8"))
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("caption bundle must contain keyed YouTube tracks")
+
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    quote_table, candidate_rows = select_youtube_alignment_rows(supabase, scope, 250)
+    requested = {str(value) for value in quote_ids}
+    rows = [row for row in candidate_rows if str(row.get("id")) in requested]
+    if {str(row.get("id")) for row in rows} != requested:
+        raise ValueError("one or more relay targets are no longer eligible")
+
+    required_videos = {str(row.get("youtube_id")) for row in rows}
+    if set(payload) != required_videos:
+        raise ValueError("caption bundle video IDs do not match relay targets")
+    for youtube_id, events in payload.items():
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_id):
+            raise ValueError("invalid YouTube ID in caption bundle")
+        if not isinstance(events, list) or not (1 <= len(events) <= 10_000):
+            raise ValueError("caption track has an invalid event count")
+        processed = []
+        previous_start = -1.0
+        for event in events:
+            start = float(event.get("start", 0))
+            end = float(event.get("end", start))
+            if start < previous_start or end <= start or end > 86_400:
+                raise ValueError("caption events must be ordered and bounded")
+            parsed = _caption_event(
+                event.get("text"),
+                start,
+                end,
+                f"{event.get('source', 'youtube_unknown')}_via_operator_relay",
+            )
+            if parsed:
+                parsed["caption_bundle_sha256"] = bundle_sha256
+                processed.append(parsed)
+                previous_start = start
+        if not processed:
+            raise ValueError("caption track contains no usable text")
+        _caption_cache[youtube_id] = processed
+
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-youtube-alignment-relay:{uuid.uuid4()}",
+        "job_type": "data_repair",
+        "source": "repair",
+        "parameters": {
+            "repair_type": "exact_youtube_source_alignment",
+            "scope": scope,
+            "quote_ids": sorted(requested),
+            "youtube_ids": sorted(required_videos),
+            "dry_run": dry_run,
+            "operator_surface": "modal_local_caption_relay",
+            "caption_bundle_sha256": bundle_sha256,
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        started_at=utcnow_iso(),
+        progress={"phase": "youtube_alignment_relay", "current": 0, "total": len(rows)},
+    )
+    results = []
+    for index, row in enumerate(rows, start=1):
+        result = align_stored_quote(
+            supabase,
+            row,
+            quote_table,
+            dry_run=dry_run,
+            processing_job_id=job_id,
+        )
+        results.append(result)
+        update_processing_job(
+            supabase,
+            job_id,
+            "claimed",
+            progress={
+                "phase": "youtube_alignment_relay",
+                "current": index,
+                "total": len(rows),
+                "verified": sum(item.get("status") == "verified" for item in results),
+                "failed": sum(item.get("status") == "failed" for item in results),
+                "dry_run": dry_run,
+            },
+        )
+    verified = sum(item.get("status") == "verified" for item in results)
+    failed = sum(item.get("status") == "failed" for item in results)
+    final = {
+        "success": failed == 0,
+        "partial_success": bool(verified and failed),
+        "scope": scope,
+        "dry_run": dry_run,
+        "attempted": len(results),
+        "verified": verified,
+        "failed": failed,
+        "items": results,
+        "caption_bundle_sha256": bundle_sha256,
+        "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+    }
+    update_processing_job(
+        supabase,
+        job_id,
+        "succeeded" if failed == 0 else "succeeded_with_warnings",
+        result=final,
+        progress={
+            "phase": "youtube_alignment_relay_complete",
+            "current": len(results),
+            "total": len(results),
+            "verified": verified,
+            "failed": failed,
+            "dry_run": dry_run,
+        },
+        error_code="youtube_alignment_incomplete" if failed else None,
+        error_message=(f"{failed} takes still require manual source verification" if failed else None),
+        completed_at=utcnow_iso(),
+    )
+    return {"job_id": job_id, **final}
+
+
+@app.function(image=image, secrets=[my_secret], timeout=300)
+def align_single_youtube_quote(quote_id: str, quote_table: str = "test_quotes"):
+    """Retry one source alignment from the editorial workspace."""
+    from supabase import create_client
+
+    if quote_table not in {"test_quotes", "quotes"}:
+        raise ValueError("unsupported quote table")
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    fields = (
+        "id,text,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
+        "rss_timestamp_end,youtube_alignment_status,created_at"
+        if quote_table == "quotes" else
+        "id,quote_text,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
+        "rss_timestamp_end,youtube_alignment_status,episode_guid,source_start_segment,"
+        "source_end_segment,processing_job_id,created_at"
+    )
+    response = supabase.table(quote_table).select(fields).eq("id", quote_id).single().execute()
+    if not response.data:
+        return {"success": False, "error": "quote not found"}
+    result = align_stored_quote(supabase, response.data, quote_table, dry_run=False)
+    return {"success": result.get("status") == "verified", **result}
 
 
 @app.function(image=image, secrets=[my_secret], timeout=600)
@@ -741,7 +1436,9 @@ def promote_quote_to_production(quote_id: str, reviewer_id: str = None):
             supabase.table("test_quotes")
             .select(
                 "quote_text,speaker_name,speaker_title,speaker_company,category,"
-                "approval_status,context_review_status,mapping_review_status"
+                "youtube_id,youtube_alignment_status,youtube_timestamp_start,"
+                "youtube_timestamp_end,approval_status,context_review_status,"
+                "mapping_review_status"
             )
             .eq("id", quote_id)
             .single()
@@ -1809,10 +2506,16 @@ def missing_take_verification_fields(record):
         "category": "category",
         "category_id": "category directory match",
     }
-    return [
+    missing = [
         label for field, label in required.items()
         if not str((record or {}).get(field) or "").strip()
     ]
+    if str((record or {}).get("youtube_id") or "").strip() and (
+        (record or {}).get("youtube_alignment_status")
+        not in {"verified", "manual_verified"}
+    ):
+        missing.append("exact YouTube segment")
+    return missing
 
 
 def editorial_gate_invalidations(before, updates):
@@ -1934,79 +2637,125 @@ def build_caption_evidence(captions, start_time, end_time, padding_seconds=45, m
     }
 
 
-def align_quote_to_segments(quote_text, segments, expected_start, expected_end):
-    """Strictly align a published quote to timestamped transcript segments."""
+def align_quote_to_segments(
+    quote_text,
+    segments,
+    expected_start,
+    expected_end,
+    *,
+    global_fallback=False,
+    max_window_events=15,
+):
+    """Strictly align a quote to timestamped segments with ambiguity gating.
+
+    The RSS timestamp is used only as a fast search hint. When source edits make
+    that clock unreliable, ``global_fallback`` searches the full YouTube track
+    and still requires a unique high-confidence textual match.
+    """
     from difflib import SequenceMatcher
 
     normalized_quote = normalize_text(quote_text)
     quote_words = normalized_quote.split()
     if len(quote_words) < 5 or not segments:
         return None
+    minimum_words = max(1, int(len(quote_words) * 0.55))
+    maximum_words = max(minimum_words + 1, int(len(quote_words) * 2.2))
+    quote_word_set = set(quote_words)
+
+    def evaluate(relevant):
+        best = None
+        runner_up = 0.0
+        for position, (source_index, _segment) in enumerate(relevant):
+            for window_size in range(1, max_window_events + 1):
+                window = relevant[position:position + window_size]
+                if len(window) != window_size:
+                    break
+                # Never bridge a filtered-out time region during the local pass.
+                if any(
+                    window[offset + 1][0] != window[offset][0] + 1
+                    for offset in range(len(window) - 1)
+                ):
+                    break
+                window_words = " ".join(
+                    normalize_text(row.get("raw_text") or row.get("text") or "")
+                    for _, row in window
+                ).split()
+                if len(window_words) < minimum_words:
+                    continue
+                if len(window_words) > maximum_words:
+                    break
+                # Compare token sequences, not raw characters. Character-level
+                # SequenceMatcher enables auto-junk on long quotes and can
+                # incorrectly discard spaces/common letters, causing a
+                # near-verbatim 100+ word source moment to score below a short
+                # generic phrase.
+                sequence_score = SequenceMatcher(
+                    None,
+                    quote_words,
+                    window_words,
+                    autojunk=False,
+                ).ratio()
+                candidate_word_set = set(window_words)
+                common = quote_word_set & candidate_word_set
+                f1 = 0.0
+                recall = 0.0
+                if common:
+                    precision = len(common) / len(candidate_word_set)
+                    recall = len(common) / len(quote_word_set)
+                    f1 = 2 * precision * recall / (precision + recall)
+                score = (0.6 * sequence_score) + (0.25 * f1) + (0.15 * recall)
+                candidate = {
+                    "score": score,
+                    "start_index": source_index,
+                    "end_index": window[-1][0],
+                    "start": float(window[0][1].get("start", 0)),
+                    "end": float(window[-1][1].get("end", 0)),
+                }
+                if best is None or score > best["score"]:
+                    if best is not None and (
+                        candidate["start_index"] > best["end_index"]
+                        or candidate["end_index"] < best["start_index"]
+                    ):
+                        runner_up = max(runner_up, best["score"])
+                    best = candidate
+                elif best is not None and (
+                    candidate["start_index"] > best["end_index"]
+                    or candidate["end_index"] < best["start_index"]
+                ):
+                    runner_up = max(runner_up, score)
+        return best, runner_up
+
     search_start = max(0.0, float(expected_start) - 300)
     search_end = float(expected_end) + 300
-    relevant = [
+    local_segments = [
         (index, segment)
         for index, segment in enumerate(segments)
         if float(segment.get("end", 0)) >= search_start
         and float(segment.get("start", 0)) <= search_end
     ]
-    minimum_words = max(1, int(len(quote_words) * 0.55))
-    maximum_words = int(len(quote_words) * 2.2)
-    best = None
-    runner_up = 0.0
-    quote_word_set = set(quote_words)
-    for position, (source_index, _segment) in enumerate(relevant):
-        for window_size in range(1, 16):
-            window = relevant[position:position + window_size]
-            if len(window) != window_size:
-                break
-            window_words = " ".join(
-                normalize_text(row.get("raw_text") or row.get("text") or "")
-                for _, row in window
-            ).split()
-            if len(window_words) < minimum_words:
-                continue
-            if len(window_words) > maximum_words:
-                break
-            window_text = " ".join(window_words)
-            sequence_score = SequenceMatcher(None, normalized_quote, window_text).ratio()
-            common = quote_word_set & set(window_words)
-            f1 = 0.0
-            recall = 0.0
-            if common:
-                precision = len(common) / len(set(window_words))
-                recall = len(common) / len(quote_word_set)
-                f1 = 2 * precision * recall / (precision + recall)
-            score = (0.6 * sequence_score) + (0.25 * f1) + (0.15 * recall)
-            candidate = {
-                "score": score,
-                "start_index": source_index,
-                "end_index": window[-1][0],
-                "start": float(window[0][1].get("start", 0)),
-                "end": float(window[-1][1].get("end", 0)),
-            }
-            if best is None or score > best["score"]:
-                if best is not None and (
-                    candidate["start_index"] > best["end_index"]
-                    or candidate["end_index"] < best["start_index"]
-                ):
-                    runner_up = max(runner_up, best["score"])
-                best = candidate
-            elif best is not None and (
-                candidate["start_index"] > best["end_index"]
-                or candidate["end_index"] < best["start_index"]
-            ):
-                runner_up = max(runner_up, score)
-    if not best:
-        return None
+    best, runner_up = evaluate(local_segments)
+    search_scope = "rss_hint_window"
+
     minimum_score = 0.70 if len(quote_words) > 30 else 0.75
     minimum_margin = 0.03 if len(quote_words) > 30 else 0.04
-    if best["score"] < minimum_score or best["score"] - runner_up < minimum_margin:
+    local_passes = bool(
+        best
+        and best["score"] >= minimum_score
+        and best["score"] - runner_up >= minimum_margin
+    )
+    if global_fallback and not local_passes:
+        best, runner_up = evaluate(list(enumerate(segments)))
+        search_scope = "full_caption_track"
+    if not best or best["score"] < minimum_score or best["score"] - runner_up < minimum_margin:
         return None
     return {
         "start": best["start"],
         "end": best["end"],
         "confidence": round(best["score"], 3),
+        "margin": round(best["score"] - runner_up, 4),
+        "search_scope": search_scope,
+        "start_segment": best["start_index"],
+        "end_segment": best["end_index"],
     }
 
 
@@ -2753,6 +3502,7 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         # Save to database. The UI sums cost per quote, so allocate the episode
         # cost across its quote rows instead of repeating the full cost.
         saved = []
+        youtube_alignment_results = []
         per_quote_cost = processing_cost / max(len(all_quotes), 1)
         candidate_set_id = str(uuid.uuid4())
         update_processing_job(
@@ -2766,18 +3516,19 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             whisper_end = int(quote.get('clip_end', (i + 1) * 60))
 
             # ── YouTube Caption Timestamp Alignment ──────────────────────────
-            # Try to replace Whisper timestamps with YouTube-native ones.
-            # Falls back silently to Whisper if captions are unavailable or
-            # the match confidence is below threshold.
-            yt_alignment = None
+            # RSS and YouTube are separate clocks. Preserve the RSS span, then
+            # require a verified per-take caption match before the UI or review
+            # workflow can call the YouTube placement exact.
+            yt_alignment = {
+                "status": "not_applicable",
+                "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                "details": {},
+            }
             if youtube_id:
-                yt_alignment = align_timestamps_to_youtube_captions(
+                yt_alignment = align_timestamps_to_youtube_captions_detailed(
                     quote['text'], youtube_id, whisper_start, whisper_end
                 )
-            
-            final_start = yt_alignment['start'] if yt_alignment else whisper_start
-            final_end   = yt_alignment['end']   if yt_alignment else whisper_end
-            yt_confidence = yt_alignment['confidence'] if yt_alignment else None
+            yt_verified = yt_alignment.get("status") == "verified"
             # ─────────────────────────────────────────────────────────────────
 
             record = {
@@ -2796,8 +3547,19 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'date_published': date_published,
                 'audio_clip_url': audio_url,
                 'episode_audio_url': audio_url,
-                'timestamp_start': final_start,
-                'timestamp_end': final_end,
+                # The compatibility timestamps remain on the RSS clock until
+                # the atomic alignment RPC applies verified YouTube values.
+                'timestamp_start': whisper_start,
+                'timestamp_end': whisper_end,
+                'rss_timestamp_start': whisper_start,
+                'rss_timestamp_end': whisper_end,
+                'youtube_timestamp_start': None,
+                'youtube_timestamp_end': None,
+                'timestamp_source': 'rss_audio',
+                'youtube_alignment_status': 'pending' if youtube_id else 'not_applicable',
+                'youtube_alignment_method': None,
+                'youtube_alignment_version': YOUTUBE_ALIGNMENT_VERSION,
+                'youtube_alignment_details': {},
                 'approval_status': 'pending',
                 'test_run': True,
                 'youtube_id': youtube_id,
@@ -2813,7 +3575,7 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                     'ranking_model',
                     os.environ.get('OPENAI_RANKING_MODEL', 'gpt-5.6-sol'),
                 ),
-                'yt_timestamp_confidence': yt_confidence, # NULL if failed, signals local bridge
+                'yt_timestamp_confidence': None,
                 'processing_job_id': job_id,
                 'candidate_fingerprint': hashlib.sha256(
                     f"{episode_guid}|{normalize_text(quote['text'])}".encode("utf-8")
@@ -2869,7 +3631,34 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             try:
                 db_res = supabase.table('test_quotes').insert(record).execute()
                 if db_res.data:
-                    print(f"✅ Saved successfully: ID {db_res.data[0]['id']}")
+                    staged_id = db_res.data[0]['id']
+                    print(f"✅ Saved successfully: ID {staged_id}")
+                    if youtube_id:
+                        try:
+                            record_youtube_alignment_result(
+                                supabase,
+                                quote_table="test_quotes",
+                                quote_id=staged_id,
+                                youtube_id=youtube_id,
+                                rss_start=whisper_start,
+                                rss_end=whisper_end,
+                                alignment=yt_alignment,
+                                processing_job_id=job_id,
+                            )
+                        except Exception as alignment_exc:
+                            yt_alignment = {
+                                "status": "failed",
+                                "error_code": "alignment_audit_write_failed",
+                                "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                                "details": {"error": str(alignment_exc)[:1000]},
+                            }
+                            print(f"❌ YouTube alignment audit failed for {staged_id}: {alignment_exc}")
+                    youtube_alignment_results.append({
+                        "quote_id": staged_id,
+                        "status": yt_alignment.get("status"),
+                        "confidence": yt_alignment.get("confidence") if yt_verified else None,
+                        "error_code": yt_alignment.get("error_code"),
+                    })
                     saved.append(quote['text'][:80])
                 else:
                     print(f"⚠️ Insert failed (no data returned): {db_res}")
@@ -2882,11 +3671,24 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
         
+        verified_alignments = sum(
+            1 for item in youtube_alignment_results
+            if item.get("status") == "verified"
+        )
+        failed_alignments = sum(
+            1 for item in youtube_alignment_results
+            if item.get("status") == "failed"
+        )
         return {
             "episode": episode.title,
             "quotes": len(saved),
             "youtube_id": youtube_id,
-            "status": "success"
+            "status": "success" if failed_alignments == 0 else "source_alignment_warning",
+            "youtube_alignment": {
+                "verified": verified_alignments,
+                "failed": failed_alignments,
+                "items": youtube_alignment_results,
+            },
         }
     except Exception as e:
         print(f"❌ Error processing {episode.title}: {str(e)}")
@@ -4876,8 +5678,15 @@ def create_audio_clip(quote_id: str):
     
     quote = result.data
     
-    start_sec = max(0, quote['timestamp_start'] - 10)
-    end_sec = quote['timestamp_end'] + 10
+    # Audio clips use the RSS/source-audio clock, never the YouTube edit clock.
+    source_start = quote.get('rss_timestamp_start')
+    source_end = quote.get('rss_timestamp_end')
+    if source_start is None:
+        source_start = quote['timestamp_start']
+    if source_end is None:
+        source_end = quote['timestamp_end']
+    start_sec = max(0, source_start - 10)
+    end_sec = source_end + 10
     duration = end_sec - start_sec
     
     print(f"📊 Clip duration: {duration} seconds ({start_sec} to {end_sec})")
@@ -5226,6 +6035,15 @@ def fastapi_app():
 
     class ClipRequest(BaseModel):
         quote_id: str
+
+    class AlignmentRetryRequest(BaseModel):
+        quote_id: str
+        quote_table: str = "test_quotes"
+
+    class AlignmentBackfillRequest(BaseModel):
+        scope: str = "recent_test"
+        limit: int = Field(default=25, ge=1, le=250)
+        dry_run: bool = True
 
     class ReviewRequest(BaseModel):
         quote_id: str
@@ -6267,18 +7085,81 @@ def fastapi_app():
         except Exception as exc:
             return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
 
+    @web_app.post("/youtube-alignments/retry")
+    async def youtube_alignment_retry_endpoint(
+        req: AlignmentRetryRequest,
+        admin=Depends(require_admin),
+    ):
+        if req.quote_table not in {"test_quotes", "quotes"}:
+            raise HTTPException(status_code=422, detail="Unsupported quote table")
+        result = await align_single_youtube_quote.remote.aio(
+            req.quote_id,
+            req.quote_table,
+        )
+        refreshed = (
+            service_client().table(req.quote_table)
+            .select("*")
+            .eq("id", req.quote_id)
+            .single()
+            .execute()
+        ).data
+        return {**result, "quote": refreshed}
+
+    @web_app.post("/youtube-alignments/backfill")
+    async def youtube_alignment_backfill_endpoint(
+        req: AlignmentBackfillRequest,
+        admin=Depends(require_admin),
+    ):
+        if req.scope not in {"recent_test", "all_test", "production"}:
+            raise HTTPException(status_code=422, detail="Unsupported alignment scope")
+        supabase = service_client()
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"youtube-alignment:{uuid.uuid4()}",
+            "job_type": "data_repair",
+            "source": "repair",
+            "requested_by": admin["id"],
+            "parameters": {
+                "repair_type": "exact_youtube_source_alignment",
+                "scope": req.scope,
+                "limit": req.limit,
+                "dry_run": req.dry_run,
+                "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+            },
+        }).execute()
+        job_id = inserted.data[0]["id"]
+        function_call = await backfill_youtube_alignments.spawn.aio(
+            scope=req.scope,
+            limit=req.limit,
+            dry_run=req.dry_run,
+            job_id=job_id,
+        )
+        supabase.table("processing_jobs").update({
+            "modal_call_id": function_call.object_id,
+            "updated_at": utcnow_iso(),
+        }).eq("id", job_id).execute()
+        return JSONResponse(
+            status_code=202,
+            content={
+                "success": True,
+                "job_id": job_id,
+                "state": "queued",
+                "status_url": f"/jobs/{job_id}",
+            },
+        )
+
     @web_app.post("/review-quote")
     async def review_quote_endpoint(req: ReviewRequest, admin=Depends(require_admin)):
         allowed_actions = {
             "approve", "reject", "edit", "approve_context",
             "reject_context", "approve_mapping", "reject_mapping", "undo",
-            "create_speaker",
+            "create_speaker", "verify_alignment",
         }
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported review action")
         if req.action in {
             "approve", "reject", "approve_context", "reject_context",
             "approve_mapping", "reject_mapping", "create_speaker",
+            "verify_alignment",
         } and not req.reviewer_expertise:
             raise HTTPException(status_code=422, detail="Reviewer expertise is required for an editorial decision")
 
@@ -6289,6 +7170,70 @@ def fastapi_app():
         if not staged_result.data:
             raise HTTPException(status_code=404, detail="Quote not found")
         before = staged_result.data
+        if req.action == "verify_alignment":
+            youtube_id = str(req.youtube_id or before.get("youtube_id") or "").strip()
+            manual_start = (
+                req.timestamp_start
+                if req.timestamp_start is not None
+                else before.get("timestamp_start")
+            )
+            manual_end = (
+                req.timestamp_end
+                if req.timestamp_end is not None
+                else before.get("timestamp_end")
+            )
+            if not youtube_id:
+                raise HTTPException(status_code=422, detail="A YouTube ID is required")
+            if manual_start is None or manual_end is None or manual_end <= manual_start:
+                raise HTTPException(status_code=422, detail="Confirm an ordered YouTube start and end time")
+            supabase.rpc("apply_youtube_alignment_result", {
+                "p_quote_table": "test_quotes",
+                "p_quote_id": str(req.quote_id),
+                "p_status": "manual_verified",
+                "p_youtube_id": youtube_id,
+                "p_rss_start": before.get("rss_timestamp_start"),
+                "p_rss_end": before.get("rss_timestamp_end"),
+                "p_youtube_start": manual_start,
+                "p_youtube_end": manual_end,
+                "p_confidence": None,
+                "p_method": "sme_manual_source_verification",
+                "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                "p_details": {
+                    "reviewer_id": admin["id"],
+                    "reviewer_expertise": req.reviewer_expertise,
+                    "reason_detail": req.reason_detail,
+                },
+                "p_processing_job_id": before.get("processing_job_id"),
+            }).execute()
+            after = (
+                supabase.table("test_quotes")
+                .select("*")
+                .eq("id", req.quote_id)
+                .single()
+                .execute()
+            ).data
+            decision = supabase.table("curation_decisions").insert({
+                "quote_id": req.quote_id,
+                "reviewer_id": admin["id"],
+                "decision": "verify_source",
+                "edited_quote_text": before.get("quote_text"),
+                "reason_detail": req.reason_detail,
+                "reviewer_expertise": req.reviewer_expertise,
+                "candidate_rank": before.get("candidate_rank"),
+                "candidate_set_id": before.get("candidate_set_id"),
+                "model_version": before.get("extraction_model"),
+                "prompt_version": before.get("extraction_prompt_version"),
+                "metadata": {
+                    "before": before,
+                    "after": after,
+                    "youtube_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                },
+            }).execute()
+            return {
+                "success": True,
+                "quote": after,
+                "decision_id": decision.data[0]["id"] if decision.data else None,
+            }
         if req.add_to_gold_set:
             if req.action not in {"approve", "reject"}:
                 raise HTTPException(
@@ -6319,6 +7264,11 @@ def fastapi_app():
                 "speaker_title", "speaker_company", "speaker_linkedin",
                 "youtube_id", "podcast_name", "episode_name",
                 "timestamp_start", "timestamp_end", "youtube_offset",
+                "rss_timestamp_start", "rss_timestamp_end",
+                "youtube_timestamp_start", "youtube_timestamp_end",
+                "timestamp_source", "youtube_alignment_status",
+                "youtube_alignment_method", "youtube_alignment_version",
+                "youtube_alignment_details", "youtube_aligned_at",
                 "rejection_reason", "editorial_notes", "proposed_theme_name",
                 "proposed_theme_summary", "proposed_question_text",
                 "proposed_question_summary", "proposed_people",
@@ -6486,6 +7436,26 @@ def fastapi_app():
             next_end = updates.get("timestamp_end", before.get("timestamp_end"))
             if next_start is not None and next_end is not None and next_end <= next_start:
                 raise HTTPException(status_code=422, detail="Quote end time must be after start time")
+            source_fields_changed = any(
+                field in updates and updates[field] != before.get(field)
+                for field in ("youtube_id", "timestamp_start", "timestamp_end", "youtube_offset")
+            )
+            if source_fields_changed and str(updates.get("youtube_id", before.get("youtube_id")) or "").strip():
+                updates.update({
+                    "youtube_timestamp_start": next_start,
+                    "youtube_timestamp_end": next_end,
+                    "youtube_offset": 0,
+                    "yt_timestamp_confidence": None,
+                    "timestamp_source": "youtube_manual_pending",
+                    "youtube_alignment_status": "manual_review_required",
+                    "youtube_alignment_method": "sme_manual_edit_pending_verification",
+                    "youtube_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                    "youtube_alignment_details": {
+                        "edited_by": admin["id"],
+                        "edited_at": utcnow_iso(),
+                    },
+                    "youtube_aligned_at": None,
+                })
             if req.theme_match_action and req.theme_match_action not in {
                 "existing_theme", "propose_new", "abstain",
             }:
@@ -6603,6 +7573,11 @@ def fastapi_app():
                     "speaker_title", "speaker_company", "speaker_linkedin",
                     "youtube_id", "podcast_name", "episode_name",
                     "timestamp_start", "timestamp_end", "youtube_offset",
+                    "rss_timestamp_start", "rss_timestamp_end",
+                    "youtube_timestamp_start", "youtube_timestamp_end",
+                    "timestamp_source", "youtube_alignment_status",
+                    "youtube_alignment_method", "youtube_alignment_version",
+                    "youtube_alignment_details", "youtube_aligned_at",
                     "rejection_reason", "editorial_notes", "proposed_theme_name",
                     "proposed_theme_summary", "proposed_question_text",
                     "proposed_question_summary", "proposed_people",
@@ -6844,6 +7819,42 @@ def trigger_staged_analysis_backfill(
     return {"job_id": job_id, **result}
 
 
+@app.function(image=image, secrets=[my_secret], timeout=3700)
+def trigger_youtube_alignment_backfill(
+    alignment_scope: str = "recent_test",
+    backfill_limit: int = 25,
+    dry_run: bool = True,
+):
+    """Create an auditable operator job for exact YouTube source repair."""
+    from supabase import create_client
+
+    if alignment_scope not in {"recent_test", "all_test", "production"}:
+        raise ValueError("Unsupported alignment scope")
+    bounded_limit = max(1, min(backfill_limit, 250))
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-youtube-alignment:{uuid.uuid4()}",
+        "job_type": "data_repair",
+        "source": "repair",
+        "parameters": {
+            "repair_type": "exact_youtube_source_alignment",
+            "scope": alignment_scope,
+            "limit": bounded_limit,
+            "dry_run": dry_run,
+            "operator_surface": "modal_cli",
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    result = backfill_youtube_alignments.remote(
+        scope=alignment_scope,
+        limit=bounded_limit,
+        dry_run=dry_run,
+        job_id=job_id,
+    )
+    return {"job_id": job_id, **result}
+
+
 @app.local_entrypoint()
 def main(
     action: str = "health",
@@ -6851,6 +7862,8 @@ def main(
     days_back: int = 7,
     backfill_limit: int = 12,
     youtube_id: str = "V1M1mDyuJKM",
+    alignment_scope: str = "recent_test",
+    dry_run: bool = True,
 ):
     """Operator-only CLI entrypoint for audited smoke checks and bounded runs."""
     import json
@@ -6870,10 +7883,55 @@ def main(
         result = trigger_historical_backfill.remote(backfill_limit=backfill_limit)
     elif action == "caption-check":
         result = caption_source_check.remote(youtube_id=youtube_id)
+    elif action == "youtube-alignment-backfill":
+        result = trigger_youtube_alignment_backfill.remote(
+            alignment_scope=alignment_scope,
+            backfill_limit=backfill_limit,
+            dry_run=dry_run,
+        )
+    elif action == "youtube-alignment-relay":
+        import gzip
+
+        targets = list_youtube_alignment_relay_targets.remote(
+            scope=alignment_scope,
+            limit=backfill_limit,
+        )
+        caption_payload = {}
+        for target_youtube_id in targets["youtube_ids"]:
+            captions = get_yt_captions(target_youtube_id)
+            if not captions:
+                raise RuntimeError(
+                    f"Local caption acquisition failed for {target_youtube_id}; "
+                    "no database changes were made"
+                )
+            caption_payload[target_youtube_id] = [
+                {
+                    "start": row["start"],
+                    "end": row["end"],
+                    "text": row["raw_text"],
+                    "source": row.get("caption_source", "youtube_unknown"),
+                }
+                for row in captions
+            ]
+        serialized = json.dumps(
+            caption_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        compressed = gzip.compress(serialized, mtime=0)
+        bundle_sha256 = hashlib.sha256(compressed).hexdigest()
+        result = apply_relayed_youtube_alignments.remote(
+            scope=alignment_scope,
+            quote_ids=targets["quote_ids"],
+            compressed_caption_bundle=compressed,
+            bundle_sha256=bundle_sha256,
+            dry_run=dry_run,
+        )
     else:
         raise ValueError(
             "action must be health, openai-check, process, scheduled-check, "
-            "historical-backfill, or caption-check"
+            "historical-backfill, caption-check, youtube-alignment-backfill, "
+            "or youtube-alignment-relay"
         )
 
     print(json.dumps(result, indent=2, default=str))
