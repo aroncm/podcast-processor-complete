@@ -29,16 +29,86 @@ image = modal.Image.debian_slim() \
 #   modal secret create podtakes-secrets --from-dotenv .env
 my_secret = modal.Secret.from_name("podtakes-secrets")
 
-PIPELINE_VERSION = "podtakes-sme-v2"
-EXTRACTION_PROMPT_VERSION = "take-candidates-v2"
-RANKING_PROMPT_VERSION = "adtech-sme-ranking-v3"
-CONTEXT_PROMPT_VERSION = "adtech-sme-context-v2"
-MAPPING_PROMPT_VERSION = "adtech-conversation-mapping-v1"
+PIPELINE_VERSION = "podthreads-hybrid-v3"
+TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v1"
+EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v3"
+RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
+CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
+MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v2"
 HISTORICAL_MAPPING_PROMPT_VERSION = "adtech-historical-conversation-mapping-v1"
+EDITORIAL_RUBRIC_VERSION = "podthreads-operator-take-rubric-v2"
+MIN_QUOTE_WORDS = 20
+IDEAL_QUOTE_WORDS_MIN = 30
+IDEAL_QUOTE_WORDS_MAX = 50
+MAX_QUOTE_WORDS = 80
 
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def quote_word_count(text: str) -> int:
+    return len(str(text or "").strip().split())
+
+
+def candidate_has_publishable_length(text: str) -> bool:
+    """Keep the quote readable while allowing a complete spoken thought."""
+    word_count = quote_word_count(text)
+    return MIN_QUOTE_WORDS <= word_count <= MAX_QUOTE_WORDS
+
+
+def apply_transcript_corrections(segments, proposed_corrections, minimum_confidence=0.94):
+    """Apply only narrow, high-confidence term fixes while preserving raw text.
+
+    The returned segments retain ``raw_text`` and an audit list. Corrections are
+    display/extraction aids until an SME approves the staged take; they never
+    replace the immutable raw transcript artifact.
+    """
+    import re
+
+    corrected_segments = [{**segment, "raw_text": segment.get("text", "")} for segment in segments]
+    applied = []
+    rejected = []
+    for proposal in proposed_corrections or []:
+        try:
+            segment_id = int(proposal.get("segment_id"))
+            original = str(proposal.get("original_phrase") or "").strip()
+            replacement = str(proposal.get("corrected_phrase") or "").strip()
+            confidence = float(proposal.get("confidence", 0))
+            if segment_id < 0 or segment_id >= len(corrected_segments):
+                raise ValueError("segment_out_of_range")
+            if confidence < minimum_confidence:
+                raise ValueError("below_confidence_gate")
+            if not original or not replacement or original.casefold() == replacement.casefold():
+                raise ValueError("empty_or_unchanged")
+            if len(original.split()) > 8 or len(replacement.split()) > 8:
+                raise ValueError("replacement_too_broad")
+
+            current_text = corrected_segments[segment_id].get("text", "")
+            pattern = re.compile(re.escape(original), re.IGNORECASE)
+            if not pattern.search(current_text):
+                raise ValueError("phrase_not_found")
+            corrected_text = pattern.sub(replacement, current_text, count=1)
+            corrected_segments[segment_id]["text"] = corrected_text
+            audit_row = {
+                **proposal,
+                "segment_id": segment_id,
+                "confidence": round(confidence, 4),
+                "raw_segment_text": corrected_segments[segment_id]["raw_text"],
+                "corrected_segment_text": corrected_text,
+                "status": "applied_for_sme_review",
+            }
+            applied.append(audit_row)
+        except Exception as exc:
+            rejected.append({**proposal, "status": "not_applied", "reason": str(exc)})
+    return corrected_segments, applied, rejected
+
+
+def corrections_for_segment_range(corrections, start_segment, end_segment):
+    return [
+        correction for correction in (corrections or [])
+        if int(start_segment) <= int(correction.get("segment_id", -1)) <= int(end_segment)
+    ]
 
 
 def update_processing_job(supabase, job_id: str | None, state: str, **fields) -> None:
@@ -93,6 +163,7 @@ def _process_episode_with_ai_impl(
         os.environ['SUPABASE_KEY']
     )
     client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
+    register_pipeline_model_versions(supabase)
     update_processing_job(
         supabase,
         job_id,
@@ -720,13 +791,52 @@ def trigger_scheduled_processor():
 def fetch_curation_examples(supabase) -> str:
     """Load balanced SME examples; never learn from approvals alone."""
     try:
+        try:
+            locked_set = (
+                supabase.table("editorial_gold_sets")
+                .select("id,version")
+                .eq("status", "locked")
+                .order("locked_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if locked_set.data:
+                gold_items = (
+                    supabase.table("editorial_gold_set_items")
+                    .select("label,preferred_quote_text,rationale")
+                    .eq("gold_set_id", locked_set.data[0]["id"])
+                    .order("created_at", desc=True)
+                    .limit(24)
+                    .execute()
+                )
+                positives = [row for row in (gold_items.data or []) if row.get("label") == "positive"][:8]
+                negatives = [row for row in (gold_items.data or []) if row.get("label") == "negative"][:8]
+                if positives and negatives:
+                    sections = [
+                        f"LOCKED SME GOLD SET: {locked_set.data[0]['version']}",
+                        "Infer the editorial principles; never copy wording.",
+                        "APPROVED HIGH-SIGNAL TAKES:",
+                    ]
+                    sections.extend(
+                        f"+ {row.get('preferred_quote_text', '')}\n  Editorial reason: {row.get('rationale', '')}"
+                        for row in positives
+                    )
+                    sections.append("REJECTED OR GENERIC TAKES:")
+                    sections.extend(
+                        f"- {row.get('preferred_quote_text', '')}\n  Rejection reason: {row.get('rationale', '')}"
+                        for row in negatives
+                    )
+                    return "\n".join(sections)
+        except Exception as gold_exc:
+            print(f"⚠️ Locked gold set unavailable: {gold_exc}")
+
         approved_res = (
             supabase.table("test_quotes")
             .select("quote_text, editorial_context, ranking_reason")
             .in_("approval_status", ["approved", "promoted"])
             .eq("used_for_training", True)
             .order("updated_at", desc=True)
-            .limit(8)
+            .limit(40)
             .execute()
         )
         rejected_res = (
@@ -734,12 +844,15 @@ def fetch_curation_examples(supabase) -> str:
             .select("quote_text, rejection_reason")
             .eq("approval_status", "rejected")
             .order("updated_at", desc=True)
-            .limit(8)
+            .limit(80)
             .execute()
         )
 
-        approved = approved_res.data or []
-        rejected = rejected_res.data or []
+        approved = (approved_res.data or [])[:8]
+        rejected = [
+            row for row in (rejected_res.data or [])
+            if str(row.get("rejection_reason") or "").strip()
+        ][:8]
         if not approved and not rejected:
             return ""
 
@@ -764,9 +877,113 @@ def fetch_curation_examples(supabase) -> str:
         return ""
 
 
+def register_pipeline_model_versions(supabase) -> None:
+    """Record stage-specific provenance without marking the hybrid as active."""
+    versions = [
+        {
+            "id": (
+                f"{os.environ.get('OPENAI_TERMINOLOGY_MODEL', os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'))}:"
+                f"{TRANSCRIPT_CORRECTION_PROMPT_VERSION}:{PIPELINE_VERSION}"
+            ),
+            "component": "terminology",
+            "provider": "openai",
+            "model_name": os.environ.get(
+                "OPENAI_TERMINOLOGY_MODEL",
+                os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+            ),
+            "prompt_version": TRANSCRIPT_CORRECTION_PROMPT_VERSION,
+            "rubric_version": EDITORIAL_RUBRIC_VERSION,
+            "status": "candidate",
+            "configuration": {
+                "minimum_confidence": 0.94,
+                "raw_transcript_immutable": True,
+            },
+        },
+        {
+            "id": f"{os.environ.get('OPENAI_CANDIDATE_MODEL', 'gpt-5.6-terra')}:{EXTRACTION_PROMPT_VERSION}:{PIPELINE_VERSION}",
+            "component": "extraction",
+            "provider": "openai",
+            "model_name": os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra"),
+            "prompt_version": EXTRACTION_PROMPT_VERSION,
+            "rubric_version": EDITORIAL_RUBRIC_VERSION,
+            "status": "shadow",
+            "configuration": {
+                "minimum_words": MIN_QUOTE_WORDS,
+                "ideal_words": [IDEAL_QUOTE_WORDS_MIN, IDEAL_QUOTE_WORDS_MAX],
+                "maximum_words": MAX_QUOTE_WORDS,
+                "complete_transcript": True,
+                "source_grounding_required": True,
+            },
+        },
+        {
+            "id": (
+                f"{os.environ.get('OPENAI_RANKING_MODEL', os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'))}:"
+                f"{RANKING_PROMPT_VERSION}:{PIPELINE_VERSION}"
+            ),
+            "component": "ranking",
+            "provider": "openai",
+            "model_name": os.environ.get(
+                "OPENAI_RANKING_MODEL",
+                os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+            ),
+            "prompt_version": RANKING_PROMPT_VERSION,
+            "rubric_version": EDITORIAL_RUBRIC_VERSION,
+            "status": "shadow",
+            "configuration": {
+                "selection_isolated_from_analysis": True,
+                "minimum_quality": float(os.environ.get("MIN_QUOTE_QUALITY", "0.74")),
+            },
+        },
+        {
+            "id": f"{os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol')}:{CONTEXT_PROMPT_VERSION}:{PIPELINE_VERSION}",
+            "component": "context",
+            "provider": "openai",
+            "model_name": os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+            "prompt_version": CONTEXT_PROMPT_VERSION,
+            "rubric_version": EDITORIAL_RUBRIC_VERSION,
+            "status": "candidate",
+            "configuration": {"selection_can_be_changed": False},
+        },
+        {
+            "id": f"{os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol')}:{MAPPING_PROMPT_VERSION}:{PIPELINE_VERSION}",
+            "component": "mapping",
+            "provider": "openai",
+            "model_name": os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+            "prompt_version": MAPPING_PROMPT_VERSION,
+            "rubric_version": EDITORIAL_RUBRIC_VERSION,
+            "status": "candidate",
+            "configuration": {
+                "controlled_theme_registry": True,
+                "auto_publish": False,
+            },
+        },
+    ]
+    try:
+        supabase.table("model_versions").upsert(versions, on_conflict="id").execute()
+    except Exception as exc:
+        print(f"AUDIT_WARNING model provenance registration failed: {exc}")
+
+
 def fetch_conversation_taxonomy(supabase) -> str:
     """Give mapping a reviewed vocabulary so equivalent ideas converge over time."""
     try:
+        registry = []
+        try:
+            registry_result = (
+                supabase.table("adtech_theme_registry")
+                .select(
+                    "canonical_name,definition,aliases,inclusion_criteria,"
+                    "exclusion_criteria,positive_examples,counter_examples"
+                )
+                .eq("status", "active")
+                .order("canonical_name")
+                .limit(80)
+                .execute()
+            )
+            registry = registry_result.data or []
+        except Exception as registry_exc:
+            print(f"⚠️ Controlled theme registry unavailable: {registry_exc}")
+
         themes_result = (
             supabase.table("conversation_themes")
             .select("id,name,summary")
@@ -794,11 +1011,12 @@ def fetch_conversation_taxonomy(supabase) -> str:
         themes = themes_result.data or []
         questions = questions_result.data or []
         entities = entities_result.data or []
-        if not themes and not questions and not entities:
+        if not registry and not themes and not questions and not entities:
             return ""
 
         theme_names = {row["id"]: row.get("name") for row in themes}
         reviewed_graph = {
+            "active_theme_registry": registry,
             "themes": [
                 {"name": row.get("name"), "summary": row.get("summary")}
                 for row in themes
@@ -825,6 +1043,123 @@ def fetch_conversation_taxonomy(supabase) -> str:
         # The v2 migration may not yet be applied during a controlled rollout.
         print(f"⚠️ Conversation vocabulary unavailable: {exc}")
         return ""
+
+
+def fetch_terminology_glossary(supabase, podcast: str, episode: str) -> str:
+    """Load reviewed names and AdTech language to improve transcript display."""
+    glossary = {
+        "podcast": podcast,
+        "episode": episode,
+        "themes": [],
+        "entities": [],
+    }
+    try:
+        registry = (
+            supabase.table("adtech_theme_registry")
+            .select("canonical_name,aliases")
+            .eq("status", "active")
+            .order("canonical_name")
+            .limit(80)
+            .execute()
+        )
+        glossary["themes"] = registry.data or []
+    except Exception as exc:
+        print(f"⚠️ Theme glossary unavailable: {exc}")
+    try:
+        entities = (
+            supabase.table("conversation_entities")
+            .select("entity_type,name")
+            .eq("publication_status", "published")
+            .order("name")
+            .limit(400)
+            .execute()
+        )
+        glossary["entities"] = entities.data or []
+    except Exception as exc:
+        print(f"⚠️ Entity glossary unavailable: {exc}")
+    return json.dumps(glossary, ensure_ascii=False)
+
+
+def propose_transcript_corrections(
+    segments,
+    podcast,
+    episode,
+    client,
+    terminology_glossary="",
+):
+    """Propose narrow terminology fixes; no prose rewriting is permitted."""
+    if not segments:
+        return []
+    model = os.environ.get(
+        "OPENAI_TERMINOLOGY_MODEL",
+        os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+    )
+    reasoning_effort = os.environ.get("OPENAI_TERMINOLOGY_REASONING", "medium")
+    correction_schema = {
+        "type": "object",
+        "properties": {
+            "corrections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "segment_id": {"type": "integer"},
+                        "original_phrase": {"type": "string"},
+                        "corrected_phrase": {"type": "string"},
+                        "correction_type": {
+                            "type": "string",
+                            "enum": ["industry_term", "person", "company", "product"],
+                        },
+                        "confidence": {"type": "number"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": [
+                        "segment_id", "original_phrase", "corrected_phrase",
+                        "correction_type", "confidence", "rationale",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["corrections"],
+        "additionalProperties": False,
+    }
+    proposals = []
+    for chunk_index, chunk_text in enumerate(
+        build_extraction_chunks(segments, max_chars=15000, overlap_segments=0),
+        start=1,
+    ):
+        data = call_openai_structured(
+            client,
+            model=model,
+            system_prompt=(
+                "You are a conservative transcript terminology editor for an expert AdTech "
+                "publication. Correct only unmistakable mistranscriptions of industry terms, "
+                "named people, companies, or products. Never improve grammar, paraphrase, "
+                "change a claim, or infer a term from weak context. Abstain when uncertain."
+            ),
+            user_prompt=f"""
+Podcast: {podcast}
+Episode: {episode}
+Transcript section: {chunk_index}
+
+Reviewed terminology and entity glossary:
+{terminology_glossary or "No reviewed glossary entries are available."}
+
+Return only high-confidence phrase replacements. Each `original_phrase` must
+appear exactly in its numbered segment. Confidence below 0.94 should be omitted.
+Do not rewrite a full sentence. Keep each phrase to eight words or fewer.
+
+TRANSCRIPT WITH GLOBAL SEGMENT IDS:
+{chunk_text}
+""",
+            schema_name="podthreads_transcript_corrections",
+            schema=correction_schema,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=4000,
+        )
+        proposals.extend(data.get("corrections", []))
+    return proposals
 
 
 def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
@@ -978,9 +1313,13 @@ def deduplicate_candidates(candidates):
 
 def context_evidence_is_source_bounded(evidence_items, start_segment, end_segment):
     """Direct evidence must point inside the exact transcript span supporting the take."""
-    for evidence in evidence_items:
-        if evidence.get("evidence_type") != "direct_transcript":
-            continue
+    direct_evidence = [
+        evidence for evidence in (evidence_items or [])
+        if evidence.get("evidence_type") == "direct_transcript"
+    ]
+    if not direct_evidence:
+        return False
+    for evidence in direct_evidence:
         evidence_segments = evidence.get("segment_ids") or []
         if not evidence_segments or any(
             int(segment_id) < int(start_segment) or int(segment_id) > int(end_segment)
@@ -1397,6 +1736,11 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
     conversation_taxonomy = fetch_conversation_taxonomy(supabase)
     if conversation_taxonomy:
         print("  🕸️ Loaded the SME-approved conversation vocabulary")
+    terminology_glossary = fetch_terminology_glossary(
+        supabase,
+        feed.get("name", ""),
+        getattr(episode, "title", ""),
+    )
 
     
     try:
@@ -1499,9 +1843,36 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             supabase,
             job_id=job_id,
         )
-        transcript_text = transcription["text"]
-        segments = transcription["segments"]
-        print(f"✅ Transcription complete: {len(transcript_text)} characters, {len(segments)} segments")
+        raw_transcript_text = transcription["text"]
+        raw_segments = transcription["segments"]
+        print(f"✅ Transcription complete: {len(raw_transcript_text)} characters, {len(raw_segments)} segments")
+
+        # Correct only unmistakable AdTech terms and named entities. The raw
+        # transcript remains immutable and is stored alongside every correction.
+        update_processing_job(
+            supabase,
+            job_id,
+            "transcribing",
+            progress={"phase": "terminology_correction"},
+        )
+        correction_proposals = propose_transcript_corrections(
+            raw_segments,
+            feed["name"],
+            episode.title,
+            client,
+            terminology_glossary=terminology_glossary,
+        )
+        segments, applied_corrections, rejected_corrections = apply_transcript_corrections(
+            raw_segments,
+            correction_proposals,
+        )
+        corrected_transcript_text = "\n".join(
+            segment.get("text", "") for segment in segments
+        ).strip()
+        print(
+            f"📝 Terminology pass: {len(applied_corrections)} applied for review; "
+            f"{len(rejected_corrections)} withheld"
+        )
 
         artifact_payload = {
             "processing_job_id": job_id,
@@ -1509,9 +1880,18 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             "podcast_name": feed["name"],
             "episode_name": episode.title,
             "source_audio_url": audio_url,
-            "transcript_text": transcript_text,
-            "transcript_segments": segments,
+            "transcript_text": raw_transcript_text,
+            "transcript_segments": raw_segments,
+            "corrected_transcript_text": corrected_transcript_text,
+            "corrected_transcript_segments": segments,
+            "transcript_corrections": applied_corrections,
+            "rejected_transcript_corrections": rejected_corrections,
             "transcript_model": transcription["model"],
+            "terminology_model": os.environ.get(
+                "OPENAI_TERMINOLOGY_MODEL",
+                os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+            ),
+            "terminology_prompt_version": TRANSCRIPT_CORRECTION_PROMPT_VERSION,
             "transcript_duration_seconds": round(duration_minutes * 60, 3),
             "transcription_cost_usd": round(processing_cost, 4),
             "extraction_prompt_version": EXTRACTION_PROMPT_VERSION,
@@ -1569,7 +1949,15 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                     source_excerpt = " ".join(
                         segment["text"] for segment in segments[start_id:end_id + 1]
                     ).strip()
+                    raw_source_excerpt = " ".join(
+                        segment["text"] for segment in raw_segments[start_id:end_id + 1]
+                    ).strip()
                     candidate_text = candidate.get("text", "").strip()
+                    if not candidate_has_publishable_length(candidate_text):
+                        raise ValueError(
+                            f"quote length outside {MIN_QUOTE_WORDS}-{MAX_QUOTE_WORDS} words "
+                            f"({quote_word_count(candidate_text)} words)"
+                        )
                     source_normalized = normalize_text(source_excerpt)
                     candidate_normalized = normalize_text(candidate_text)
                     if not candidate_normalized or candidate_normalized not in source_normalized:
@@ -1594,6 +1982,12 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                         "start_seg": start_id,
                         "end_seg": end_id,
                         "source_transcript_excerpt": source_excerpt,
+                        "raw_source_transcript_excerpt": raw_source_excerpt,
+                        "transcript_corrections": corrections_for_segment_range(
+                            applied_corrections,
+                            start_id,
+                            end_id,
+                        ),
                     })
                     all_candidates.append(candidate)
                 except Exception as exc:
@@ -1608,14 +2002,20 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             "ranking",
             progress={"grounded_candidates": len(all_candidates)},
         )
-        all_quotes = rank_and_contextualize_quotes(
-            all_candidates[:20],
+        ranked_quotes = rank_quote_candidates(
+            all_candidates[:30],
             feed['name'],
             episode.title,
             client,
             curation_examples=curation_examples,
+        )[:5]
+        all_quotes = contextualize_and_map_quotes(
+            ranked_quotes,
+            feed['name'],
+            episode.title,
+            client,
             conversation_taxonomy=conversation_taxonomy,
-        )[:8]
+        )
 
         update_processing_job(
             supabase,
@@ -1672,6 +2072,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'podcast_name': feed['name'],
                 'episode_name': episode.title[:100],
                 'speaker_name': quote.get('speaker', 'Unknown'),
+                'speaker_title': quote.get('speaker_title'),
+                'speaker_company': quote.get('speaker_company'),
                 'category': quote.get('category', 'Other'),
                 'quote_text': quote['text'],
                 'date_published': date_published,
@@ -1688,7 +2090,11 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'quality_score': round(quote.get('quality_score', 0.0), 3),
                 'extraction_model': quote.get(
                     'extraction_model',
-                    os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                    os.environ.get('OPENAI_CANDIDATE_MODEL', 'gpt-5.6-terra'),
+                ),
+                'ranking_model': quote.get(
+                    'ranking_model',
+                    os.environ.get('OPENAI_RANKING_MODEL', 'gpt-5.6-sol'),
                 ),
                 'yt_timestamp_confidence': yt_confidence, # NULL if failed, signals local bridge
                 'processing_job_id': job_id,
@@ -1698,17 +2104,28 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'candidate_set_id': candidate_set_id,
                 'candidate_rank': i + 1,
                 'ranking_reason': quote.get('ranking_reason'),
+                'quote_word_count': quote_word_count(quote['text']),
                 'pipeline_version': PIPELINE_VERSION,
                 'extraction_prompt_version': EXTRACTION_PROMPT_VERSION,
                 'ranking_prompt_version': RANKING_PROMPT_VERSION,
                 'original_quote_text': quote['text'],
                 'source_transcript_excerpt': quote.get('source_transcript_excerpt'),
+                'raw_source_transcript_excerpt': quote.get('raw_source_transcript_excerpt'),
+                'transcript_corrections': quote.get('transcript_corrections', []),
+                'terminology_model': os.environ.get(
+                    'OPENAI_TERMINOLOGY_MODEL',
+                    os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                ),
+                'terminology_prompt_version': TRANSCRIPT_CORRECTION_PROMPT_VERSION,
                 'source_start_segment': quote.get('start_seg'),
                 'source_end_segment': quote.get('end_seg'),
                 'editorial_context': quote.get('editorial_context'),
                 'context_evidence': quote.get('context_evidence', []),
                 'context_confidence': quote.get('context_confidence'),
-                'context_model': os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                'context_model': quote.get(
+                    'context_model',
+                    os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                ),
                 'context_prompt_version': CONTEXT_PROMPT_VERSION,
                 # Context is never public until an SME approves it explicitly.
                 'context_review_status': 'unreviewed',
@@ -1720,8 +2137,13 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'proposed_companies': quote.get('related_companies', []),
                 'connection_context': quote.get('connection_context'),
                 'mapping_confidence': quote.get('mapping_confidence'),
-                'mapping_model': os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                'theme_match_action': quote.get('theme_match_action', 'abstain'),
+                'mapping_model': quote.get(
+                    'mapping_model',
+                    os.environ.get('OPENAI_EDITORIAL_MODEL', 'gpt-5.6-sol'),
+                ),
                 'mapping_prompt_version': MAPPING_PROMPT_VERSION,
+                'analysis_review_flags': quote.get('analysis_review_flags', {}),
                 # Themes, questions, and entities have their own SME gate.
                 'mapping_review_status': 'unreviewed',
             }
@@ -1814,7 +2236,7 @@ def call_openai_structured(
 
 
 def extract_quotes(text, podcast, episode, client, chunk_num=0, curation_examples=""):
-    """Generate zero to three literal, transcript-grounded candidates per chunk."""
+    """Retrieve readable, literal candidates using the proven legacy taste bar."""
     model = os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra")
     reasoning_effort = os.environ.get("OPENAI_CANDIDATE_REASONING", "low")
     candidate_schema = {
@@ -1860,21 +2282,30 @@ Podcast: {podcast}
 Episode: {episode}
 Transcript section: {chunk_num}
 
-Select zero to three candidate takes from the transcript below. Zero is the
+Select zero to four candidate takes from the transcript below. Zero is the
 correct answer when this section contains no genuinely high-signal take.
 
 Hard requirements:
 - `text` must be copied verbatim from contiguous transcript segments.
 - Segment IDs must exactly bound the quoted source.
+- The quote must be 20-80 words; 30-50 words is ideal. Choose the shortest
+  contiguous span that preserves the speaker's complete thought.
+- The quote must be self-contained enough to understand without a generated
+  explanation. Do not start or end mid-thought.
+- It must be at least one of: counterintuitive, convention-challenging,
+  specific and memorable, genuinely thought-provoking, or surprising.
 - Prefer a specific prediction, causal claim, economic tradeoff, market-structure
-  argument, counter-position, or reusable framework.
+  argument, counter-position, vivid example, or reusable framework.
 - A candidate should matter to an adtech operator, publisher, marketer, agency,
   platform, investor, or regulator because it changes a decision or assumption.
-- Penalize vague futurism, slogans, product pitches, biography, scene-setting,
-  summaries, and advice a smart generalist could give in any industry.
+- Reject generic advice, common knowledge, motivational platitudes, interview
+  transitions, incomplete thoughts, vague philosophy, scene-setting, biography,
+  sales pitches, slogans, and commentary a smart generalist could give in any
+  industry.
 - Scores are numbers from 0 to 1. `genericness_risk` is higher when the take is
   interchangeable with generic business or AI commentary.
 - Do not manufacture controversy. Do not rewrite or improve the speaker's words.
+- Quality over quantity. Never fill a quota.
 
 {curation_examples}
 
@@ -1882,11 +2313,12 @@ TRANSCRIPT WITH GLOBAL SEGMENT IDS:
 {text}
 """
     system_prompt = """
-You are the candidate-retrieval layer for PodTakes. You understand adtech market
-structure and terminology, but this step is extractive, not generative. Recall
-matters, yet literal source fidelity is mandatory. Abstain instead of filling a
-quota. Return only candidates that a senior industry editor would plausibly
-consider; final judgment happens in a separate SME-ranking stage.
+You are the candidate-retrieval layer for PodThreads. Preserve the editorial
+instinct of the original PodTakes curator: find the statements that challenge,
+surprise, or deeply illuminate, while rejecting generic business fluff. You
+understand AdTech market structure and terminology, but this step is extractive,
+not generative. Literal source fidelity and readable quote packaging are both
+mandatory. Final judgment happens in a separate SME-ranking stage.
 """
     data = call_openai_structured(
         client,
@@ -1898,7 +2330,7 @@ consider; final judgment happens in a separate SME-ranking stage.
         reasoning_effort=reasoning_effort,
         max_output_tokens=5000,
     )
-    candidates = data.get("candidates", [])[:3]
+    candidates = data.get("candidates", [])[:4]
     for candidate in candidates:
         for key in (
             "novelty", "provocation", "domain_specificity",
@@ -1906,23 +2338,33 @@ consider; final judgment happens in a separate SME-ranking stage.
         ):
             candidate[key] = max(0.0, min(1.0, float(candidate.get(key, 0))))
         candidate["extraction_model"] = model
-    return candidates
+        candidate["extraction_prompt_version"] = EXTRACTION_PROMPT_VERSION
+        candidate["quote_word_count"] = quote_word_count(candidate.get("text", ""))
+    return [
+        candidate for candidate in candidates
+        if candidate_has_publishable_length(candidate.get("text", ""))
+    ]
 
 
-def rank_and_contextualize_quotes(
+def rank_quote_candidates(
     candidates,
     podcast,
     episode,
     client,
     curation_examples="",
-    conversation_taxonomy="",
 ):
-    """Apply an adtech-specific editorial rubric and draft evidence-linked context."""
+    """Choose takes without allowing downstream analysis to influence selection."""
     if not candidates:
         return []
 
-    model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
-    reasoning_effort = os.environ.get("OPENAI_EDITORIAL_REASONING", "high")
+    model = os.environ.get(
+        "OPENAI_RANKING_MODEL",
+        os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+    )
+    reasoning_effort = os.environ.get(
+        "OPENAI_RANKING_REASONING",
+        os.environ.get("OPENAI_EDITORIAL_REASONING", "high"),
+    )
     selection_schema = {
         "type": "object",
         "properties": {
@@ -1934,82 +2376,19 @@ def rank_and_contextualize_quotes(
                         "candidate_index": {"type": "integer"},
                         "quality_score": {"type": "number"},
                         "ranking_reason": {"type": "string"},
-                        "editorial_context": {"type": "string"},
-                        "context_confidence": {"type": "number"},
                         "genericness_check": {"type": "string", "enum": ["pass", "fail"]},
-                        "context_evidence": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "statement": {"type": "string"},
-                                    "support": {"type": "string"},
-                                    "evidence_type": {
-                                        "type": "string",
-                                        "enum": [
-                                            "direct_transcript",
-                                            "domain_inference",
-                                            "editorial_judgment"
-                                        ],
-                                    },
-                                    "segment_ids": {"type": "array", "items": {"type": "integer"}},
-                                },
-                                "required": ["statement", "support", "evidence_type", "segment_ids"],
-                                "additionalProperties": False,
-                            },
-                        },
-                        "theme_name": {"type": "string"},
-                        "theme_summary": {"type": "string"},
-                        "question_text": {"type": "string"},
-                        "question_summary": {"type": "string"},
-                        "connection_context": {"type": "string"},
-                        "mapping_confidence": {"type": "number"},
-                        "related_people": {
-                            "type": "array",
-                            "items": {"$ref": "#/$defs/entity_connection"},
-                        },
-                        "related_companies": {
-                            "type": "array",
-                            "items": {"$ref": "#/$defs/entity_connection"},
-                        },
+                        "self_contained_check": {"type": "string", "enum": ["pass", "fail"]},
+                        "word_count_check": {"type": "string", "enum": ["pass", "fail"]},
                     },
                     "required": [
                         "candidate_index", "quality_score", "ranking_reason",
-                        "editorial_context", "context_confidence",
-                        "genericness_check", "context_evidence", "theme_name",
-                        "theme_summary", "question_text", "question_summary",
-                        "connection_context", "mapping_confidence",
-                        "related_people", "related_companies"
+                        "genericness_check", "self_contained_check", "word_count_check"
                     ],
                     "additionalProperties": False,
                 },
             }
         },
         "required": ["selections"],
-        "$defs": {
-            "entity_connection": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "relationship": {"type": "string"},
-                    "description": {"type": "string"},
-                    "evidence_type": {
-                        "type": "string",
-                        "enum": [
-                            "direct_transcript", "episode_metadata",
-                            "speaker_identity", "editorial_connection"
-                        ],
-                    },
-                    "evidence": {"type": "string"},
-                    "segment_ids": {"type": "array", "items": {"type": "integer"}},
-                },
-                "required": [
-                    "name", "relationship", "description", "evidence_type",
-                    "evidence", "segment_ids"
-                ],
-                "additionalProperties": False,
-            }
-        },
         "additionalProperties": False,
     }
 
@@ -2025,6 +2404,7 @@ def rank_and_contextualize_quotes(
             "causal_mechanism": candidate.get("causal_mechanism"),
             "source_segment_ids": [candidate.get("start_seg"), candidate.get("end_seg")],
             "source_excerpt": candidate.get("source_transcript_excerpt"),
+            "word_count": quote_word_count(candidate.get("text", "")),
             "retrieval_scores": {
                 key: candidate.get(key)
                 for key in (
@@ -2038,70 +2418,49 @@ def rank_and_contextualize_quotes(
 Podcast: {podcast}
 Episode: {episode}
 
-Rank up to eight takes. Select none when the candidates do not clear the bar.
+Rank up to five takes. Select none when the candidates do not clear the bar.
 
 Editorial standard:
-1. The take makes a specific claim and exposes a real causal mechanism,
-   incentive, tradeoff, prediction, or non-obvious market implication.
-2. The analysis demonstrates adtech fluency where relevant: auction mechanics,
-   identity/addressability, measurement and incrementality, privacy, supply-path
-   economics, publisher monetization, agency/brand incentives, CTV, retail media,
-   walled gardens, or AI's effect on media and advertising economics.
-3. `editorial_context` must situate this exact take in the industry conversation
-   in 60-110 words. Connect it to a real mechanism, stakeholder tension, prior
-   idea, or adjacent debate. Do not paraphrase the quote, announce its importance,
-   render a verdict, or use a claim/consequence template.
-4. Distinguish transcript facts from domain inference in `context_evidence`.
-   Never invent a company fact, market statistic, event, or speaker intent.
-5. `genericness_check` must be `fail` if the analysis could be attached to an
-   unrelated business quote with only noun substitutions.
-6. Avoid generic AI prose such as "in today's rapidly evolving landscape",
-   "underscores the importance", "game changer", or "businesses must adapt".
-7. Propose one durable `theme_name` broad enough to connect multiple episodes,
-   and one open `question_text` that this take helps answer. A theme is not a
-   category label or episode summary. `connection_context` should explain how
-   the speaker joins that conversation in 35-80 words without hype.
-8. Add people and companies only when their relationship is supported by the
-   speaker identity, episode metadata, the quoted transcript, or a clearly
-   labeled editorial connection. Never infer employment, partnership, or an
-   organizational relationship from general industry knowledge.
-9. When the approved graph below already contains the same theme, question, or
-   entity, reuse its exact name. Propose a new label only when the distinction is
-   meaningful enough that an SME should preserve it as a separate node.
-10. Scores are from 0 to 1. Reserve 0.90+ for unusually specific, consequential,
-   source-grounded insight.
+1. Preserve the original PodTakes standard: the quote should challenge,
+   surprise, or deeply illuminate. It must be specific and memorable rather
+   than merely competent commentary.
+2. The take changes an AdTech operator's understanding of a decision,
+   incentive, tradeoff, prediction, market structure, or causal mechanism.
+3. It must be understandable as a standalone spoken moment. Fail fragments,
+   pronoun-dependent excerpts, and quotes that require generated context to make
+   sense.
+4. It must contain 20-80 words; 30-50 is the preferred editorial package.
+5. Fail generic advice, common knowledge, motivational language, sales pitches,
+   vague futurism, summaries, scene-setting, and claims portable to any industry.
+6. Do not reward controversy for its own sake. Provocation is useful only when
+   grounded in a concrete industry idea.
+7. Scores are from 0 to 1. Reserve 0.90+ for unusually specific, memorable,
+   source-grounded insight. Quality over quantity.
 
 {curation_examples}
-
-EXISTING SME-APPROVED CONVERSATION GRAPH:
-{conversation_taxonomy or "No approved graph vocabulary exists yet."}
 
 CANDIDATES:
 {json.dumps(compact_candidates, ensure_ascii=False)}
 """
     system_prompt = """
-You are PodTakes' senior industry editor. Your standard is an expert adtech
-publication, not an AI summary product. Your job is to identify decision-relevant
-insight, place it inside ongoing industry discourse, and propose connections for
-SME review. Do not optimize for quantity, engagement bait, or superficial
-controversy. Write like an operator who knows the history, incentives, people,
-and companies involved. Every factual statement still needs direct transcript
-support or an explicit inference label, but the editorial posture is connective,
-not prosecutorial.
+You are PodThreads' senior quote editor. Your only task in this step is choosing
+the strongest spoken takes. Do not write context, infer a theme, or reward a quote
+because it would be easy to analyze. Apply the proven original PodTakes taste:
+specific, memorable, counterintuitive, surprising, or genuinely illuminating.
+Reject polished generic business commentary and incomplete transcript fragments.
 """
     data = call_openai_structured(
         client,
         model=model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        schema_name="podtakes_editorial_selection",
+        schema_name="podthreads_quote_ranking",
         schema=selection_schema,
         reasoning_effort=reasoning_effort,
-        max_output_tokens=9000,
+        max_output_tokens=5000,
     )
 
-    minimum_quality = float(os.environ.get("MIN_EDITORIAL_QUALITY", "0.78"))
-    minimum_context_confidence = float(os.environ.get("MIN_CONTEXT_CONFIDENCE", "0.72"))
+    minimum_quality = float(os.environ.get("MIN_QUOTE_QUALITY", "0.74"))
     selected = []
     used_indices = set()
     for selection in data.get("selections", []):
@@ -2109,57 +2468,692 @@ not prosecutorial.
         if index < 0 or index >= len(candidates) or index in used_indices:
             continue
         quality = max(0.0, min(1.0, float(selection.get("quality_score", 0))))
-        confidence = max(0.0, min(1.0, float(selection.get("context_confidence", 0))))
         if quality < minimum_quality:
-            continue
-        if confidence < minimum_context_confidence:
             continue
         if selection.get("genericness_check") != "pass":
             continue
-        editorial_context = str(selection.get("editorial_context", "")).strip()
-        if len(editorial_context.split()) < 35:
+        if selection.get("self_contained_check") != "pass":
             continue
-        evidence_items = selection.get("context_evidence", [])
-        candidate_start = int(candidates[index].get("start_seg", -1))
-        candidate_end = int(candidates[index].get("end_seg", -1))
-        if not context_evidence_is_source_bounded(
-            evidence_items,
-            candidate_start,
-            candidate_end,
-        ):
+        if selection.get("word_count_check") != "pass":
             continue
-
-        mapping_is_reviewable = conversation_mapping_is_reviewable(
-            selection,
-            candidate_start,
-            candidate_end,
-        )
+        if not candidate_has_publishable_length(candidates[index].get("text", "")):
+            continue
 
         candidate = dict(candidates[index])
         candidate.update({
             "quality_score": quality,
             "ranking_reason": selection.get("ranking_reason"),
-            "editorial_context": editorial_context,
-            "context_confidence": confidence,
-            "context_evidence": evidence_items,
-            "theme_name": selection.get("theme_name") if mapping_is_reviewable else None,
-            "theme_summary": selection.get("theme_summary") if mapping_is_reviewable else None,
-            "question_text": selection.get("question_text") if mapping_is_reviewable else None,
-            "question_summary": selection.get("question_summary") if mapping_is_reviewable else None,
-            "connection_context": selection.get("connection_context") if mapping_is_reviewable else None,
-            "mapping_confidence": (
-                max(0.0, min(1.0, float(selection.get("mapping_confidence", 0))))
-                if mapping_is_reviewable else 0.0
-            ),
-            "related_people": selection.get("related_people", []) if mapping_is_reviewable else [],
-            "related_companies": selection.get("related_companies", []) if mapping_is_reviewable else [],
-            "extraction_model": model,
+            "ranking_model": model,
+            "ranking_prompt_version": RANKING_PROMPT_VERSION,
         })
         selected.append(candidate)
         used_indices.add(index)
 
     selected.sort(key=lambda item: item.get("quality_score", 0), reverse=True)
     return selected
+
+
+def _taxonomy_theme_names(conversation_taxonomy: str) -> set[str]:
+    if not conversation_taxonomy:
+        return set()
+    try:
+        taxonomy = json.loads(conversation_taxonomy)
+    except (TypeError, json.JSONDecodeError):
+        return set()
+    names = {
+        str(item.get("canonical_name") or "").strip()
+        for item in taxonomy.get("active_theme_registry", [])
+    }
+    names.update(
+        str(item.get("name") or "").strip()
+        for item in taxonomy.get("themes", [])
+    )
+    return {name for name in names if name}
+
+
+def theme_match_is_controlled(action: str, theme_name: str, conversation_taxonomy: str) -> bool:
+    known = {name.casefold() for name in _taxonomy_theme_names(conversation_taxonomy)}
+    normalized = str(theme_name or "").strip().casefold()
+    if action == "existing_theme":
+        return bool(normalized and normalized in known)
+    if action == "propose_new":
+        return bool(normalized and normalized not in known)
+    return action == "abstain" and not normalized
+
+
+def contextualize_and_map_quotes(
+    selected_candidates,
+    podcast,
+    episode,
+    client,
+    conversation_taxonomy="",
+):
+    """Draft connective analysis after quote selection; never change the selection."""
+    if not selected_candidates:
+        return []
+
+    model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+    reasoning_effort = os.environ.get("OPENAI_EDITORIAL_REASONING", "high")
+    entity_connection = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "relationship": {"type": "string"},
+            "description": {"type": "string"},
+            "evidence_type": {
+                "type": "string",
+                "enum": [
+                    "direct_transcript", "episode_metadata",
+                    "speaker_identity", "editorial_connection",
+                ],
+            },
+            "evidence": {"type": "string"},
+            "segment_ids": {"type": "array", "items": {"type": "integer"}},
+        },
+        "required": [
+            "name", "relationship", "description", "evidence_type",
+            "evidence", "segment_ids",
+        ],
+        "additionalProperties": False,
+    }
+    analysis_schema = {
+        "type": "object",
+        "properties": {
+            "analyses": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "candidate_index": {"type": "integer"},
+                        "editorial_context": {"type": "string"},
+                        "context_confidence": {"type": "number"},
+                        "genericness_check": {"type": "string", "enum": ["pass", "fail"]},
+                        "context_evidence": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "statement": {"type": "string"},
+                                    "support": {"type": "string"},
+                                    "evidence_type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "direct_transcript", "domain_inference",
+                                            "editorial_judgment",
+                                        ],
+                                    },
+                                    "segment_ids": {"type": "array", "items": {"type": "integer"}},
+                                },
+                                "required": ["statement", "support", "evidence_type", "segment_ids"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "theme_match_action": {
+                            "type": "string",
+                            "enum": ["existing_theme", "propose_new", "abstain"],
+                        },
+                        "theme_name": {"type": "string"},
+                        "theme_summary": {"type": "string"},
+                        "question_text": {"type": "string"},
+                        "question_summary": {"type": "string"},
+                        "connection_context": {"type": "string"},
+                        "mapping_confidence": {"type": "number"},
+                        "related_people": {"type": "array", "items": {"$ref": "#/$defs/entity_connection"}},
+                        "related_companies": {"type": "array", "items": {"$ref": "#/$defs/entity_connection"}},
+                        "speaker_title": {"type": "string"},
+                        "speaker_company": {"type": "string"},
+                        "speaker_metadata_source": {
+                            "type": "string",
+                            "enum": ["direct_transcript", "episode_metadata", "unknown"],
+                        },
+                    },
+                    "required": [
+                        "candidate_index", "editorial_context", "context_confidence",
+                        "genericness_check", "context_evidence", "theme_match_action",
+                        "theme_name", "theme_summary", "question_text",
+                        "question_summary", "connection_context", "mapping_confidence",
+                        "related_people", "related_companies", "speaker_title",
+                        "speaker_company", "speaker_metadata_source",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["analyses"],
+        "$defs": {"entity_connection": entity_connection},
+        "additionalProperties": False,
+    }
+    compact = [
+        {
+            "candidate_index": index,
+            "quote": candidate.get("text"),
+            "speaker": candidate.get("speaker"),
+            "source_segment_ids": [candidate.get("start_seg"), candidate.get("end_seg")],
+            "source_excerpt": candidate.get("source_transcript_excerpt"),
+            "ranking_reason": candidate.get("ranking_reason"),
+        }
+        for index, candidate in enumerate(selected_candidates)
+    ]
+    data = call_openai_structured(
+        client,
+        model=model,
+        system_prompt="""
+You are PodThreads' senior AdTech editor. The quote selection is already final;
+never rerank, expand, shorten, or reject it. Draft context that connects the
+speaker's idea to the industry's ongoing themes, questions, people, companies,
+incentives, and operating history. Write from inside the industry. The posture is
+connective, not fact-checking or prosecutorial. Avoid generic AI language,
+importance announcements, verdicts, and claim/consequence templates.
+""",
+        user_prompt=f"""
+Podcast: {podcast}
+Episode: {episode}
+
+For every selected take:
+1. Write 45-90 words of `editorial_context` that adds specific industry context
+   rather than paraphrasing the quote. Connect mechanisms, stakeholder tensions,
+   related ideas, or a live operator debate. No hype.
+2. Separate transcript facts from domain inference in `context_evidence`. Never
+   invent statistics, corporate relationships, or speaker intent.
+3. Map first to an exact active theme in the controlled registry. Use
+   `existing_theme` only with its exact canonical name. Use `propose_new` only
+   when no active theme can responsibly contain the idea. Use `abstain` and blank
+   mapping fields when evidence is too thin. Never turn a category into a theme.
+4. Put the take under one open question within the theme. Reuse an existing
+   question verbatim when it is substantively the same.
+5. Add people and companies only with labeled evidence. Speaker title and company
+   must come from the transcript or episode metadata; otherwise return blank
+   strings and `unknown`.
+
+CONTROLLED THEME REGISTRY AND APPROVED GRAPH:
+{conversation_taxonomy or "No controlled themes are active. Propose cautiously or abstain."}
+
+SELECTED TAKES:
+{json.dumps(compact, ensure_ascii=False)}
+""",
+        schema_name="podthreads_connective_analysis",
+        schema=analysis_schema,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=10000,
+    )
+
+    analyses_by_index = {
+        int(item.get("candidate_index", -1)): item
+        for item in data.get("analyses", [])
+        if 0 <= int(item.get("candidate_index", -1)) < len(selected_candidates)
+    }
+    minimum_context_confidence = float(os.environ.get("MIN_CONTEXT_CONFIDENCE", "0.72"))
+    enriched = []
+    for index, original in enumerate(selected_candidates):
+        candidate = dict(original)
+        analysis = analyses_by_index.get(index, {})
+        start_segment = int(candidate.get("start_seg", -1))
+        end_segment = int(candidate.get("end_seg", -1))
+        evidence_items = analysis.get("context_evidence", [])
+        context_text = str(analysis.get("editorial_context") or "").strip()
+        context_confidence = max(
+            0.0,
+            min(1.0, float(analysis.get("context_confidence", 0) or 0)),
+        )
+        context_is_reviewable = (
+            analysis.get("genericness_check") == "pass"
+            and context_confidence >= minimum_context_confidence
+            and 30 <= quote_word_count(context_text) <= 120
+            and context_evidence_is_source_bounded(
+                evidence_items,
+                start_segment,
+                end_segment,
+            )
+        )
+        action = str(analysis.get("theme_match_action") or "abstain")
+        theme_name = str(analysis.get("theme_name") or "").strip()
+        controlled_action = theme_match_is_controlled(
+            action,
+            theme_name,
+            conversation_taxonomy,
+        )
+        mapping_is_reviewable = controlled_action and action != "abstain" and conversation_mapping_is_reviewable(
+            analysis,
+            start_segment,
+            end_segment,
+        )
+        metadata_source = analysis.get("speaker_metadata_source")
+        candidate.update({
+            "editorial_context": context_text if context_is_reviewable else None,
+            "context_confidence": context_confidence if context_is_reviewable else 0.0,
+            "context_evidence": evidence_items if context_is_reviewable else [],
+            "context_model": model,
+            "context_prompt_version": CONTEXT_PROMPT_VERSION,
+            "theme_match_action": action if mapping_is_reviewable else "abstain",
+            "theme_name": theme_name if mapping_is_reviewable else None,
+            "theme_summary": analysis.get("theme_summary") if mapping_is_reviewable else None,
+            "question_text": analysis.get("question_text") if mapping_is_reviewable else None,
+            "question_summary": analysis.get("question_summary") if mapping_is_reviewable else None,
+            "connection_context": analysis.get("connection_context") if mapping_is_reviewable else None,
+            "mapping_confidence": (
+                max(0.0, min(1.0, float(analysis.get("mapping_confidence", 0) or 0)))
+                if mapping_is_reviewable else 0.0
+            ),
+            "related_people": analysis.get("related_people", []) if mapping_is_reviewable else [],
+            "related_companies": analysis.get("related_companies", []) if mapping_is_reviewable else [],
+            "mapping_model": model,
+            "mapping_prompt_version": MAPPING_PROMPT_VERSION,
+            "speaker_title": analysis.get("speaker_title") if metadata_source != "unknown" else None,
+            "speaker_company": analysis.get("speaker_company") if metadata_source != "unknown" else None,
+            "analysis_review_flags": {
+                "context_reviewable": context_is_reviewable,
+                "mapping_reviewable": mapping_is_reviewable,
+                "controlled_theme_action": controlled_action,
+            },
+        })
+        enriched.append(candidate)
+    return enriched
+
+
+def rank_and_contextualize_quotes(
+    candidates,
+    podcast,
+    episode,
+    client,
+    curation_examples="",
+    conversation_taxonomy="",
+):
+    """Compatibility wrapper for older callers; selection remains isolated."""
+    ranked = rank_quote_candidates(
+        candidates,
+        podcast,
+        episode,
+        client,
+        curation_examples=curation_examples,
+    )
+    return contextualize_and_map_quotes(
+        ranked,
+        podcast,
+        episode,
+        client,
+        conversation_taxonomy=conversation_taxonomy,
+    )
+
+
+BAKEOFF_STRATEGY_MANIFEST = {
+    "legacy_quality_bar": {
+        "label": "Restored legacy quality bar",
+        "prompt_version": "legacy-gpt4-quality-source-bounded-v1",
+        "historical_model": "gpt-4-turbo-preview",
+        "purpose": "Preserves the original 20-80 word, self-contained, exceptional-take rubric.",
+    },
+    "source_grounded_v2": {
+        "label": "Pre-hybrid source-grounded v2",
+        "prompt_version": "take-candidates-v2-snapshot",
+        "purpose": "Captures the longer mechanism-first candidate behavior being replaced.",
+    },
+    "hybrid_v3": {
+        "label": "PodThreads hybrid v3",
+        "prompt_version": EXTRACTION_PROMPT_VERSION,
+        "ranking_prompt_version": RANKING_PROMPT_VERSION,
+        "purpose": "Combines the legacy taste bar with complete-transcript source controls.",
+    },
+}
+
+
+def _bakeoff_candidate_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "start_segment_id": {"type": "integer"},
+                        "end_segment_id": {"type": "integer"},
+                        "speaker": {"type": "string"},
+                        "category": {"type": "string"},
+                        "quality_score": {"type": "number"},
+                        "extraction_reason": {"type": "string"},
+                    },
+                    "required": [
+                        "text", "start_segment_id", "end_segment_id", "speaker",
+                        "category", "quality_score", "extraction_reason",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["candidates"],
+        "additionalProperties": False,
+    }
+
+
+def extract_bakeoff_baseline_candidates(
+    text,
+    podcast,
+    episode,
+    client,
+    strategy_key,
+    chunk_num=0,
+):
+    """Run frozen prompt baselines through the same strict source contract."""
+    if strategy_key not in {"legacy_quality_bar", "source_grounded_v2"}:
+        raise ValueError("Unsupported bakeoff baseline strategy")
+
+    if strategy_key == "legacy_quality_bar":
+        model = os.environ.get(
+            "OPENAI_LEGACY_BASELINE_MODEL",
+            os.environ.get("OPENAI_RANKING_MODEL", "gpt-5.6-sol"),
+        )
+        prompt_version = BAKEOFF_STRATEGY_MANIFEST[strategy_key]["prompt_version"]
+        system_prompt = (
+            "You are the original PodTakes curator. Extract only exceptional, "
+            "thought-provoking quotes that challenge, surprise, or deeply illuminate. "
+            "Quality over quantity. Literal source fidelity is mandatory."
+        )
+        criteria = """
+- Quote 20-80 words; 30-50 is ideal.
+- Self-contained and understandable without generated context.
+- At least one of: hot take that challenges conventional wisdom,
+  counterintuitive insight, specific and memorable example or prediction,
+  thought-provoking framework, or surprising revelation.
+- Reject generic advice, obvious statements, motivational platitudes, interview
+  transitions, incomplete thoughts, vague philosophy, biography, and sales pitches.
+"""
+    else:
+        model = os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra")
+        prompt_version = BAKEOFF_STRATEGY_MANIFEST[strategy_key]["prompt_version"]
+        system_prompt = (
+            "You are the source-grounded v2 candidate retrieval layer. Prefer "
+            "specific AdTech claims, mechanisms, incentives, and non-obvious implications."
+        )
+        criteria = """
+- Prefer a specific prediction, causal claim, economic tradeoff, market-structure
+  argument, counter-position, or reusable framework.
+- The take should change an AdTech operator, publisher, marketer, agency,
+  platform, investor, or regulator's decision or assumption.
+- Penalize vague futurism, slogans, product pitches, biography, scene-setting,
+  summaries, and generic business or AI commentary.
+"""
+
+    data = call_openai_structured(
+        client,
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=f"""
+Podcast: {podcast}
+Episode: {episode}
+Transcript section: {chunk_num}
+
+Select zero to five candidates. Zero is correct when no candidate clears the bar.
+`text` must be copied from contiguous transcript segments and the segment IDs
+must exactly bound its source. Do not rewrite the speaker.
+
+{criteria}
+
+TRANSCRIPT WITH GLOBAL SEGMENT IDS:
+{text}
+""",
+        schema_name=f"podthreads_{strategy_key}_candidates",
+        schema=_bakeoff_candidate_schema(),
+        reasoning_effort=(
+            os.environ.get("OPENAI_LEGACY_BASELINE_REASONING", "high")
+            if strategy_key == "legacy_quality_bar"
+            else os.environ.get("OPENAI_CANDIDATE_REASONING", "low")
+        ),
+        max_output_tokens=6000,
+    )
+    candidates = data.get("candidates", [])[:5]
+    for candidate in candidates:
+        candidate["quality_score"] = max(
+            0.0,
+            min(1.0, float(candidate.get("quality_score", 0))),
+        )
+        # Let the existing deterministic deduplicator preserve the strongest span.
+        candidate["domain_specificity"] = candidate["quality_score"]
+        candidate["novelty"] = candidate["quality_score"]
+        candidate["provocation"] = candidate["quality_score"]
+        candidate["evidence_quality"] = candidate["quality_score"]
+        candidate["genericness_risk"] = 1 - candidate["quality_score"]
+        candidate["extraction_model"] = model
+        candidate["extraction_prompt_version"] = prompt_version
+    return candidates
+
+
+def ground_bakeoff_candidate(candidate, corrected_segments, raw_segments):
+    """Return a source-bounded bakeoff item or ``None`` for an unsafe span."""
+    try:
+        start_id = int(candidate.get("start_segment_id"))
+        end_id = int(candidate.get("end_segment_id"))
+        if start_id < 0 or end_id < start_id or end_id >= len(corrected_segments):
+            return None
+        source_excerpt = " ".join(
+            segment.get("text", "")
+            for segment in corrected_segments[start_id:end_id + 1]
+        ).strip()
+        raw_excerpt = " ".join(
+            segment.get("text", "")
+            for segment in raw_segments[start_id:end_id + 1]
+        ).strip()
+        quote_text = str(candidate.get("text") or "").strip()
+        quote_normalized = normalize_text(quote_text)
+        source_normalized = normalize_text(source_excerpt)
+        if not quote_normalized:
+            return None
+        if quote_normalized not in source_normalized:
+            from difflib import SequenceMatcher
+            if SequenceMatcher(None, quote_normalized, source_normalized).ratio() < 0.62:
+                return None
+        return {
+            **candidate,
+            "start_seg": start_id,
+            "end_seg": end_id,
+            "source_transcript_excerpt": source_excerpt,
+            "raw_source_transcript_excerpt": raw_excerpt,
+            "quote_word_count": quote_word_count(quote_text),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+@app.function(image=image, secrets=[my_secret], timeout=21600, cpu=2)
+def run_extraction_bakeoff(
+    episode_limit: int = 5,
+    job_id: str = None,
+    created_by: str = None,
+):
+    """Generate a blinded three-strategy bakeoff from saved episode artifacts."""
+    from openai import OpenAI
+    from supabase import create_client
+
+    bounded_limit = max(1, min(int(episode_limit or 5), 15))
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    run_id = None
+    register_pipeline_model_versions(supabase)
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        claimed_at=utcnow_iso(),
+        started_at=utcnow_iso(),
+        progress={"phase": "loading_held_out_artifacts"},
+    )
+    try:
+        artifacts_result = (
+            supabase.table("episode_processing_artifacts")
+            .select(
+                "episode_guid,podcast_name,episode_name,transcript_segments,"
+                "corrected_transcript_segments,transcript_corrections,pipeline_version,updated_at"
+            )
+            .eq("artifact_status", "complete")
+            .order("updated_at", desc=True)
+            .limit(bounded_limit)
+            .execute()
+        )
+        artifacts = [
+            artifact for artifact in (artifacts_result.data or [])
+            if artifact.get("transcript_segments")
+        ]
+        if not artifacts:
+            raise RuntimeError("No complete transcript artifacts are available for a bakeoff")
+
+        dataset_fingerprint = hashlib.sha256(
+            "|".join(sorted(str(row.get("episode_guid")) for row in artifacts)).encode("utf-8")
+        ).hexdigest()[:16]
+        thresholds = {
+            "top5_sme_approval": 0.75,
+            "source_alignment": 0.98,
+            "speaker_accuracy": 0.98,
+            "terminology_error_rate": 0.01,
+            "maximum_median_words": IDEAL_QUOTE_WORDS_MAX,
+        }
+        inserted_run = supabase.table("extraction_bakeoff_runs").insert({
+            "processing_job_id": job_id,
+            "dataset_version": f"heldout-artifacts:{dataset_fingerprint}",
+            "pipeline_version": PIPELINE_VERSION,
+            "status": "running",
+            "strategy_manifest": BAKEOFF_STRATEGY_MANIFEST,
+            "episode_count": len(artifacts),
+            "thresholds": thresholds,
+            "created_by": created_by,
+        }).execute()
+        run_id = inserted_run.data[0]["id"]
+        staged_items = []
+        strategy_keys = list(BAKEOFF_STRATEGY_MANIFEST)
+        total_steps = len(artifacts) * len(strategy_keys)
+        completed_steps = 0
+
+        for artifact in artifacts:
+            raw_segments = artifact.get("transcript_segments") or []
+            corrected_segments = artifact.get("corrected_transcript_segments") or raw_segments
+            chunks = build_extraction_chunks(corrected_segments)
+            for strategy_key in strategy_keys:
+                all_candidates = []
+                for chunk_index, chunk_text in enumerate(chunks, start=1):
+                    if strategy_key == "hybrid_v3":
+                        candidates = extract_quotes(
+                            chunk_text,
+                            artifact["podcast_name"],
+                            artifact["episode_name"],
+                            client,
+                            chunk_num=chunk_index,
+                            curation_examples="",
+                        )
+                    else:
+                        candidates = extract_bakeoff_baseline_candidates(
+                            chunk_text,
+                            artifact["podcast_name"],
+                            artifact["episode_name"],
+                            client,
+                            strategy_key,
+                            chunk_num=chunk_index,
+                        )
+                    for candidate in candidates:
+                        grounded = ground_bakeoff_candidate(
+                            candidate,
+                            corrected_segments,
+                            raw_segments,
+                        )
+                        if grounded:
+                            all_candidates.append(grounded)
+                deduped = deduplicate_candidates(all_candidates)
+                if strategy_key == "hybrid_v3":
+                    finalists = rank_quote_candidates(
+                        deduped[:30],
+                        artifact["podcast_name"],
+                        artifact["episode_name"],
+                        client,
+                        curation_examples="",
+                    )[:5]
+                else:
+                    finalists = sorted(
+                        deduped,
+                        key=lambda item: float(item.get("quality_score", 0)),
+                        reverse=True,
+                    )[:5]
+
+                for candidate_rank, candidate in enumerate(finalists, start=1):
+                    blind_seed = (
+                        f"{run_id}|{artifact['episode_guid']}|{strategy_key}|{candidate_rank}"
+                    )
+                    blind_label = hashlib.sha256(blind_seed.encode("utf-8")).hexdigest()[:8].upper()
+                    staged_items.append({
+                        "bakeoff_run_id": run_id,
+                        "episode_guid": artifact["episode_guid"],
+                        "podcast_name": artifact["podcast_name"],
+                        "episode_name": artifact["episode_name"],
+                        "blind_label": blind_label,
+                        "strategy_key": strategy_key,
+                        "candidate_rank": candidate_rank,
+                        "quote_text": candidate.get("text"),
+                        "speaker_name": candidate.get("speaker"),
+                        "source_transcript_excerpt": candidate.get("source_transcript_excerpt"),
+                        "raw_source_transcript_excerpt": candidate.get("raw_source_transcript_excerpt"),
+                        "source_start_segment": candidate.get("start_seg"),
+                        "source_end_segment": candidate.get("end_seg"),
+                        "quote_word_count": quote_word_count(candidate.get("text", "")),
+                        "extraction_model": candidate.get("extraction_model") or "unknown",
+                        "extraction_prompt_version": candidate.get("extraction_prompt_version") or BAKEOFF_STRATEGY_MANIFEST[strategy_key]["prompt_version"],
+                        "ranking_model": candidate.get("ranking_model"),
+                        "ranking_prompt_version": candidate.get("ranking_prompt_version"),
+                        "generated_score": candidate.get("quality_score"),
+                        "metadata": {
+                            "artifact_pipeline_version": artifact.get("pipeline_version"),
+                            "transcript_correction_count": len(artifact.get("transcript_corrections") or []),
+                        },
+                    })
+                completed_steps += 1
+                update_processing_job(
+                    supabase,
+                    job_id,
+                    "extracting",
+                    progress={
+                        "bakeoff_run_id": run_id,
+                        "completed_strategy_episodes": completed_steps,
+                        "total_strategy_episodes": total_steps,
+                    },
+                )
+
+        if not staged_items:
+            raise RuntimeError("Bakeoff strategies produced no source-grounded candidates")
+        supabase.table("extraction_bakeoff_items").insert(staged_items).execute()
+        supabase.table("extraction_bakeoff_runs").update({
+            "status": "reviewing",
+            "metrics": {"candidate_count": len(staged_items), "reviewed_count": 0},
+        }).eq("id", run_id).execute()
+        result = {
+            "success": True,
+            "bakeoff_run_id": run_id,
+            "episode_count": len(artifacts),
+            "candidate_count": len(staged_items),
+            "status": "reviewing",
+        }
+        update_processing_job(
+            supabase,
+            job_id,
+            "succeeded",
+            result=result,
+            completed_at=utcnow_iso(),
+        )
+        return result
+    except Exception as exc:
+        if run_id:
+            try:
+                supabase.table("extraction_bakeoff_runs").update({
+                    "status": "failed",
+                    "completed_at": utcnow_iso(),
+                    "metrics": {"error": str(exc)[:1000]},
+                }).eq("id", run_id).execute()
+            except Exception as audit_exc:
+                print(f"AUDIT_WARNING failed to close bakeoff run {run_id}: {audit_exc}")
+        update_processing_job(
+            supabase,
+            job_id,
+            "failed",
+            error_code=type(exc).__name__,
+            error_message=str(exc)[:4000],
+            completed_at=utcnow_iso(),
+        )
+        raise
 
 
 @app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
@@ -2264,7 +3258,10 @@ def backfill_historical_conversation_mappings(
             .execute()
         ).data or []
         taxonomy = fetch_conversation_taxonomy(supabase)
-        model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+        model = os.environ.get(
+            "OPENAI_RANKING_MODEL",
+            os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+        )
         for index, raw_quote in enumerate(candidates):
             counts["considered"] += 1
             quote_id = str(raw_quote["id"])
@@ -2492,12 +3489,15 @@ def run_editorial_evaluation(sample_limit: int = 40, job_id: str = None):
             "provider": "openai",
             "model_name": model,
             "prompt_version": RANKING_PROMPT_VERSION,
-            "rubric_version": "sme-rubric-v1",
+            "rubric_version": EDITORIAL_RUBRIC_VERSION,
             "status": "active",
             "configuration": {
-                "reasoning_effort": os.environ.get("OPENAI_EDITORIAL_REASONING", "high"),
-                "minimum_quality": float(os.environ.get("MIN_EDITORIAL_QUALITY", "0.78")),
-                "minimum_context_confidence": float(os.environ.get("MIN_CONTEXT_CONFIDENCE", "0.72")),
+                "reasoning_effort": os.environ.get(
+                    "OPENAI_RANKING_REASONING",
+                    os.environ.get("OPENAI_EDITORIAL_REASONING", "high"),
+                ),
+                "minimum_quality": float(os.environ.get("MIN_QUOTE_QUALITY", "0.74")),
+                "quote_length_words": [MIN_QUOTE_WORDS, MAX_QUOTE_WORDS],
             },
             "deployed_at": utcnow_iso(),
         }, on_conflict="id").execute()
@@ -2538,7 +3538,7 @@ def run_editorial_evaluation(sample_limit: int = 40, job_id: str = None):
                     "evidence_quality": 0.5,
                     "genericness_risk": 0.5,
                 })
-            selections = rank_and_contextualize_quotes(
+            selections = rank_quote_candidates(
                 candidates,
                 "Held-out evaluation set",
                 "Mixed source-backed SME decisions",
@@ -2850,8 +3850,9 @@ def scheduled_processor():
         .limit(1)
         .execute()
     )
-    if setting.data and not setting.data[0].get('value', False):
-        print("⏸️ Automated processing is disabled")
+    automation_enabled = bool(setting.data and setting.data[0].get('value') is True)
+    if not automation_enabled:
+        print("⏸️ Automated processing is disabled or not explicitly configured")
         return {"success": True, "status": "disabled", "processed_count": 0}
 
     log = supabase.table('automation_logs').insert({
@@ -2930,6 +3931,133 @@ def scheduled_processor():
             }).eq('id', log_id).execute()
         raise
 
+
+def ensure_draft_gold_set(supabase, created_by=None):
+    existing = (
+        supabase.table("editorial_gold_sets")
+        .select("*")
+        .eq("status", "drafting")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return existing.data[0]
+    version = f"podthreads-gold-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    inserted = supabase.table("editorial_gold_sets").insert({
+        "name": "PodThreads AdTech Editorial Gold Set",
+        "version": version,
+        "rubric_version": EDITORIAL_RUBRIC_VERSION,
+        "status": "drafting",
+        "target_positive_count": 60,
+        "target_negative_count": 40,
+        "notes": "Explicit SME choices only; pending legacy candidates are excluded.",
+        "created_by": created_by,
+    }).execute()
+    return inserted.data[0]
+
+
+def add_gold_set_item(
+    supabase,
+    *,
+    created_by,
+    label,
+    preferred_quote_text,
+    source_transcript_excerpt,
+    rationale,
+    reviewer_expertise,
+    failure_codes=None,
+    test_quote_id=None,
+    published_quote_id=None,
+    bakeoff_item_id=None,
+):
+    gold_set = ensure_draft_gold_set(supabase, created_by=created_by)
+    failure_codes = failure_codes or []
+    payload = {
+        "gold_set_id": gold_set["id"],
+        "test_quote_id": test_quote_id,
+        "published_quote_id": published_quote_id,
+        "bakeoff_item_id": bakeoff_item_id,
+        "label": label,
+        "preferred_quote_text": preferred_quote_text,
+        "source_transcript_excerpt": source_transcript_excerpt,
+        "rationale": rationale,
+        "failure_codes": failure_codes,
+        "reviewer_expertise": reviewer_expertise or [],
+        "source_alignment_verified": "source_alignment" not in failure_codes,
+        "terminology_verified": "terminology" not in failure_codes,
+        "speaker_verified": "speaker_attribution" not in failure_codes,
+        "created_by": created_by,
+    }
+    return supabase.table("editorial_gold_set_items").insert(payload).execute().data[0]
+
+
+def latest_bakeoff_review_map(review_rows):
+    latest = {}
+    for review in sorted(
+        review_rows or [],
+        key=lambda row: str(row.get("created_at") or ""),
+        reverse=True,
+    ):
+        latest.setdefault(review.get("bakeoff_item_id"), review)
+    return latest
+
+
+def calculate_bakeoff_metrics(items, review_rows):
+    from statistics import median
+
+    latest_reviews = latest_bakeoff_review_map(review_rows)
+    by_strategy = {}
+    for item in items or []:
+        strategy = item.get("strategy_key")
+        bucket = by_strategy.setdefault(strategy, {
+            "candidate_count": 0,
+            "reviewed_count": 0,
+            "approved_count": 0,
+            "ratings": [],
+            "word_counts": [],
+            "edited_count": 0,
+            "preferred_count": 0,
+            "failure_counts": {},
+        })
+        bucket["candidate_count"] += 1
+        bucket["word_counts"].append(int(item.get("quote_word_count") or 0))
+        review = latest_reviews.get(item.get("id"))
+        if not review:
+            continue
+        bucket["reviewed_count"] += 1
+        bucket["approved_count"] += int(review.get("decision") == "approve")
+        bucket["ratings"].append(int(review.get("quality_rating") or 0))
+        bucket["edited_count"] += int(bool(str(review.get("edited_quote_text") or "").strip()))
+        bucket["preferred_count"] += int(bool(review.get("preferred_in_episode")))
+        for failure_code in review.get("failure_codes") or []:
+            bucket["failure_counts"][failure_code] = bucket["failure_counts"].get(failure_code, 0) + 1
+
+    metrics = {
+        "candidate_count": len(items or []),
+        "reviewed_count": len(latest_reviews),
+        "review_coverage": round(len(latest_reviews) / max(len(items or []), 1), 4),
+        "strategies": {},
+    }
+    for strategy, bucket in by_strategy.items():
+        reviewed = bucket["reviewed_count"]
+        failures = bucket["failure_counts"]
+        metrics["strategies"][strategy] = {
+            "candidate_count": bucket["candidate_count"],
+            "reviewed_count": reviewed,
+            "approval_rate": round(bucket["approved_count"] / max(reviewed, 1), 4),
+            "average_rating": round(sum(bucket["ratings"]) / max(len(bucket["ratings"]), 1), 3),
+            "edit_rate": round(bucket["edited_count"] / max(reviewed, 1), 4),
+            "preferred_count": bucket["preferred_count"],
+            "median_words": median(bucket["word_counts"]) if bucket["word_counts"] else 0,
+            "source_alignment": round(1 - failures.get("source_alignment", 0) / max(reviewed, 1), 4),
+            "speaker_accuracy": round(1 - failures.get("speaker_attribution", 0) / max(reviewed, 1), 4),
+            "terminology_error_rate": round(failures.get("terminology", 0) / max(reviewed, 1), 4),
+            "generic_rejection_rate": round(failures.get("generic", 0) / max(reviewed, 1), 4),
+            "failure_counts": failures,
+        }
+    return metrics
+
 # ==========================================
 # FastAPI Web Endpoints (Nested to avoid local deps)
 # ==========================================
@@ -3005,6 +4133,9 @@ def fastapi_app():
         reason_detail: str | None = None
         reviewer_expertise: list[str] = Field(default_factory=list)
         target_decision_id: str | None = None
+        add_to_gold_set: bool = False
+        gold_rationale: str | None = None
+        gold_failure_codes: list[str] = Field(default_factory=list)
 
     class AutomationRequest(BaseModel):
         enabled: bool
@@ -3018,6 +4149,40 @@ def fastapi_app():
 
     class EvaluationRequest(BaseModel):
         sample_limit: int = Field(default=40, ge=12, le=100)
+
+    class BakeoffRunRequest(BaseModel):
+        episode_limit: int = Field(default=5, ge=1, le=15)
+
+    class BakeoffReviewRequest(BaseModel):
+        bakeoff_item_id: str
+        decision: str
+        quality_rating: int = Field(ge=1, le=5)
+        preferred_in_episode: bool = False
+        edited_quote_text: str | None = None
+        failure_codes: list[str] = Field(default_factory=list)
+        notes: str | None = None
+        reviewer_expertise: list[str] = Field(default_factory=list)
+        add_to_gold_set: bool = False
+        supersedes_review_id: str | None = None
+
+    class BakeoffRevealRequest(BaseModel):
+        bakeoff_run_id: str
+
+    class ThemeRegistryRequest(BaseModel):
+        theme_registry_id: str | None = None
+        action: str
+        canonical_name: str | None = None
+        definition: str | None = None
+        aliases: list[str] | None = None
+        inclusion_criteria: list[str] | None = None
+        exclusion_criteria: list[str] | None = None
+        positive_examples: list[str] | None = None
+        counter_examples: list[str] | None = None
+        reason: str
+        reviewer_expertise: list[str] = Field(default_factory=list)
+
+    class GoldSetLockRequest(BaseModel):
+        gold_set_id: str
 
     class HistoricalBackfillRequest(BaseModel):
         limit: int = Field(default=12, ge=1, le=50)
@@ -3181,6 +4346,386 @@ def fastapi_app():
             status_code=202,
             content={"success": True, "job_id": job_id, "state": "queued"},
         )
+
+    @web_app.post("/bakeoffs/run")
+    async def run_bakeoff_endpoint(req: BakeoffRunRequest, admin=Depends(require_admin)):
+        supabase = service_client()
+        active = (
+            supabase.table("extraction_bakeoff_runs")
+            .select("id,status")
+            .in_("status", ["running", "reviewing"])
+            .order("started_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if active.data:
+            raise HTTPException(
+                status_code=409,
+                detail="Complete or reveal the active bakeoff before starting another.",
+            )
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"extraction-bakeoff:{uuid.uuid4()}",
+            "job_type": "extraction_bakeoff",
+            "source": "admin",
+            "requested_by": admin["id"],
+            "parameters": {"episode_limit": req.episode_limit, "blinded": True},
+        }).execute()
+        job_id = inserted.data[0]["id"]
+        function_call = await run_extraction_bakeoff.spawn.aio(
+            episode_limit=req.episode_limit,
+            job_id=job_id,
+            created_by=admin["id"],
+        )
+        supabase.table("processing_jobs").update({
+            "modal_call_id": function_call.object_id,
+            "updated_at": utcnow_iso(),
+        }).eq("id", job_id).execute()
+        return JSONResponse(
+            status_code=202,
+            content={"success": True, "job_id": job_id, "state": "queued"},
+        )
+
+    @web_app.get("/bakeoffs/latest")
+    async def latest_bakeoff_endpoint(admin=Depends(require_admin)):
+        supabase = service_client()
+        run_result = (
+            supabase.table("extraction_bakeoff_runs")
+            .select("*")
+            .order("started_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not run_result.data:
+            return {"success": True, "run": None, "items": [], "reviews": []}
+        run = run_result.data[0]
+        items_result = (
+            supabase.table("extraction_bakeoff_items")
+            .select("*")
+            .eq("bakeoff_run_id", run["id"])
+            .order("episode_name")
+            .order("blind_label")
+            .execute()
+        )
+        items = items_result.data or []
+        item_ids = [item["id"] for item in items]
+        reviews = []
+        if item_ids:
+            review_result = (
+                supabase.table("extraction_bakeoff_reviews")
+                .select("*")
+                .in_("bakeoff_item_id", item_ids)
+                .eq("reviewer_id", admin["id"])
+                .order("created_at", desc=True)
+                .execute()
+            )
+            reviews = list(latest_bakeoff_review_map(review_result.data or []).values())
+
+        if run.get("blinded", True):
+            run = {
+                key: value for key, value in run.items()
+                if key not in {"strategy_manifest"}
+            }
+            metrics = run.get("metrics") or {}
+            run["metrics"] = {
+                "candidate_count": metrics.get("candidate_count", len(items)),
+                "reviewed_count": len(reviews),
+                "review_coverage": round(len(reviews) / max(len(items), 1), 4),
+            }
+            redacted_keys = {
+                "strategy_key", "extraction_model", "extraction_prompt_version",
+                "ranking_model", "ranking_prompt_version", "generated_score",
+            }
+            items = [
+                {key: value for key, value in item.items() if key not in redacted_keys}
+                for item in items
+            ]
+        return {"success": True, "run": run, "items": items, "reviews": reviews}
+
+    @web_app.post("/bakeoffs/review")
+    async def review_bakeoff_endpoint(req: BakeoffReviewRequest, admin=Depends(require_admin)):
+        if req.decision not in {"approve", "reject"}:
+            raise HTTPException(status_code=422, detail="Decision must be approve or reject")
+        if not req.reviewer_expertise:
+            raise HTTPException(status_code=422, detail="Reviewer expertise is required")
+        allowed_failures = {
+            "generic", "too_long", "too_short", "incomplete_thought",
+            "source_alignment", "speaker_attribution", "terminology",
+            "not_adtech_specific", "low_signal", "other",
+        }
+        unknown_failures = set(req.failure_codes) - allowed_failures
+        if unknown_failures:
+            raise HTTPException(status_code=422, detail=f"Unknown failure codes: {sorted(unknown_failures)}")
+        if req.decision == "reject" and not req.failure_codes and not (req.notes or "").strip():
+            raise HTTPException(status_code=422, detail="A rejected take needs a failure code or note")
+        if req.add_to_gold_set and not (req.notes or "").strip():
+            raise HTTPException(status_code=422, detail="Gold-set examples require an editorial rationale")
+
+        supabase = service_client()
+        item_result = (
+            supabase.table("extraction_bakeoff_items")
+            .select("*,extraction_bakeoff_runs(status,blinded)")
+            .eq("id", req.bakeoff_item_id)
+            .single()
+            .execute()
+        )
+        if not item_result.data:
+            raise HTTPException(status_code=404, detail="Bakeoff item not found")
+        item = item_result.data
+        run_state = item.get("extraction_bakeoff_runs") or {}
+        if run_state.get("status") != "reviewing" or not run_state.get("blinded", True):
+            raise HTTPException(status_code=409, detail="This bakeoff is not open for blinded review")
+
+        if req.supersedes_review_id:
+            prior = (
+                supabase.table("extraction_bakeoff_reviews")
+                .select("id")
+                .eq("id", req.supersedes_review_id)
+                .eq("bakeoff_item_id", req.bakeoff_item_id)
+                .eq("reviewer_id", admin["id"])
+                .limit(1)
+                .execute()
+            )
+            if not prior.data:
+                raise HTTPException(status_code=422, detail="Superseded review does not match this item and reviewer")
+
+        inserted = supabase.table("extraction_bakeoff_reviews").insert({
+            "bakeoff_item_id": req.bakeoff_item_id,
+            "reviewer_id": admin["id"],
+            "decision": req.decision,
+            "quality_rating": req.quality_rating,
+            "preferred_in_episode": req.preferred_in_episode,
+            "edited_quote_text": (req.edited_quote_text or "").strip() or None,
+            "failure_codes": req.failure_codes,
+            "notes": (req.notes or "").strip() or None,
+            "reviewer_expertise": req.reviewer_expertise,
+            "supersedes_review_id": req.supersedes_review_id,
+        }).execute()
+        review = inserted.data[0]
+        gold_item = None
+        gold_warning = None
+        if req.add_to_gold_set:
+            rationale = (req.notes or "").strip()
+            try:
+                gold_item = add_gold_set_item(
+                    supabase,
+                    created_by=admin["id"],
+                    label="positive" if req.decision == "approve" else "negative",
+                    preferred_quote_text=(req.edited_quote_text or item["quote_text"]).strip(),
+                    source_transcript_excerpt=item.get("source_transcript_excerpt"),
+                    rationale=rationale,
+                    reviewer_expertise=req.reviewer_expertise,
+                    failure_codes=req.failure_codes,
+                    bakeoff_item_id=req.bakeoff_item_id,
+                )
+            except Exception as exc:
+                if "duplicate key" not in str(exc).lower() and "23505" not in str(exc):
+                    gold_warning = str(exc)
+
+        return {
+            "success": True,
+            "review": review,
+            "gold_item": gold_item,
+            "gold_warning": gold_warning,
+        }
+
+    @web_app.post("/bakeoffs/reveal")
+    async def reveal_bakeoff_endpoint(req: BakeoffRevealRequest, admin=Depends(require_admin)):
+        supabase = service_client()
+        run_result = (
+            supabase.table("extraction_bakeoff_runs")
+            .select("*")
+            .eq("id", req.bakeoff_run_id)
+            .single()
+            .execute()
+        )
+        if not run_result.data:
+            raise HTTPException(status_code=404, detail="Bakeoff run not found")
+        run = run_result.data
+        items = (
+            supabase.table("extraction_bakeoff_items")
+            .select("*")
+            .eq("bakeoff_run_id", req.bakeoff_run_id)
+            .execute()
+        ).data or []
+        item_ids = [item["id"] for item in items]
+        reviews = (
+            supabase.table("extraction_bakeoff_reviews")
+            .select("*")
+            .in_("bakeoff_item_id", item_ids)
+            .eq("reviewer_id", admin["id"])
+            .order("created_at", desc=True)
+            .execute()
+        ).data or [] if item_ids else []
+        metrics = calculate_bakeoff_metrics(items, reviews)
+        if metrics["review_coverage"] < 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Review every blinded candidate before revealing strategy identity.",
+            )
+        hybrid = metrics.get("strategies", {}).get("hybrid_v3", {})
+        thresholds = run.get("thresholds") or {}
+        release_gate_passed = bool(hybrid) and all([
+            hybrid.get("approval_rate", 0) >= thresholds.get("top5_sme_approval", 0.75),
+            hybrid.get("source_alignment", 0) >= thresholds.get("source_alignment", 0.98),
+            hybrid.get("speaker_accuracy", 0) >= thresholds.get("speaker_accuracy", 0.98),
+            hybrid.get("terminology_error_rate", 1) <= thresholds.get("terminology_error_rate", 0.01),
+            hybrid.get("median_words", 999) <= thresholds.get("maximum_median_words", 50),
+        ])
+        metrics["release_gate_passed"] = release_gate_passed
+        updated = (
+            supabase.table("extraction_bakeoff_runs")
+            .update({
+                "status": "completed",
+                "blinded": False,
+                "revealed_at": utcnow_iso(),
+                "completed_at": utcnow_iso(),
+                "metrics": metrics,
+            })
+            .eq("id", req.bakeoff_run_id)
+            .execute()
+        )
+        return {
+            "success": True,
+            "run": updated.data[0] if updated.data else {**run, "metrics": metrics, "blinded": False},
+            "activation_changed": False,
+        }
+
+    @web_app.get("/theme-registry")
+    async def get_theme_registry_endpoint(admin=Depends(require_admin)):
+        supabase = service_client()
+        themes = (
+            supabase.table("adtech_theme_registry")
+            .select("*")
+            .order("status")
+            .order("canonical_name")
+            .execute()
+        ).data or []
+        return {"success": True, "themes": themes}
+
+    @web_app.post("/theme-registry")
+    async def update_theme_registry_endpoint(req: ThemeRegistryRequest, admin=Depends(require_admin)):
+        allowed_actions = {"create", "edit", "activate", "retire", "restore"}
+        if req.action not in allowed_actions:
+            raise HTTPException(status_code=422, detail="Unsupported theme registry action")
+        if not req.reviewer_expertise:
+            raise HTTPException(status_code=422, detail="Reviewer expertise is required")
+        if not req.reason.strip():
+            raise HTTPException(status_code=422, detail="An audit reason is required")
+        supabase = service_client()
+        before = {}
+        if req.action != "create":
+            if not req.theme_registry_id:
+                raise HTTPException(status_code=422, detail="theme_registry_id is required")
+            current = (
+                supabase.table("adtech_theme_registry")
+                .select("*")
+                .eq("id", req.theme_registry_id)
+                .single()
+                .execute()
+            )
+            if not current.data:
+                raise HTTPException(status_code=404, detail="Theme registry entry not found")
+            before = current.data
+
+        editable = {
+            "canonical_name": req.canonical_name,
+            "definition": req.definition,
+            "aliases": req.aliases,
+            "inclusion_criteria": req.inclusion_criteria,
+            "exclusion_criteria": req.exclusion_criteria,
+            "positive_examples": req.positive_examples,
+            "counter_examples": req.counter_examples,
+        }
+        updates = {key: value for key, value in editable.items() if value is not None}
+        if req.action == "create":
+            if not (req.canonical_name or "").strip() or not (req.definition or "").strip():
+                raise HTTPException(status_code=422, detail="Canonical name and definition are required")
+            updates.update({
+                "canonical_name": req.canonical_name.strip(),
+                "definition": req.definition.strip(),
+                "status": "proposed",
+                "metadata": {"created_by_admin_api": True},
+            })
+            inserted = supabase.table("adtech_theme_registry").insert(updates).execute()
+            after = inserted.data[0]
+        else:
+            if req.action in {"activate", "restore"}:
+                candidate = {**before, **updates}
+                if not candidate.get("inclusion_criteria") or not candidate.get("exclusion_criteria"):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Active themes require inclusion and exclusion criteria.",
+                    )
+                updates.update({"status": "active", "reviewed_by": admin["id"], "reviewed_at": utcnow_iso()})
+            elif req.action == "retire":
+                updates.update({"status": "retired", "reviewed_by": admin["id"], "reviewed_at": utcnow_iso()})
+            updates["updated_at"] = utcnow_iso()
+            changed = (
+                supabase.table("adtech_theme_registry")
+                .update(updates)
+                .eq("id", req.theme_registry_id)
+                .execute()
+            )
+            after = changed.data[0] if changed.data else {**before, **updates}
+
+        decision = supabase.table("theme_registry_decisions").insert({
+            "theme_registry_id": after["id"],
+            "reviewer_id": admin["id"],
+            "decision": req.action,
+            "before_state": before,
+            "after_state": after,
+            "reason": req.reason.strip(),
+        }).execute()
+        return {"success": True, "theme": after, "decision_id": decision.data[0]["id"]}
+
+    @web_app.post("/gold-sets/lock")
+    async def lock_gold_set_endpoint(req: GoldSetLockRequest, admin=Depends(require_admin)):
+        supabase = service_client()
+        gold_set_result = (
+            supabase.table("editorial_gold_sets")
+            .select("*")
+            .eq("id", req.gold_set_id)
+            .single()
+            .execute()
+        )
+        if not gold_set_result.data:
+            raise HTTPException(status_code=404, detail="Gold set not found")
+        gold_set = gold_set_result.data
+        items = (
+            supabase.table("editorial_gold_set_items")
+            .select("label,source_alignment_verified,terminology_verified,speaker_verified")
+            .eq("gold_set_id", req.gold_set_id)
+            .execute()
+        ).data or []
+        positives = sum(item.get("label") == "positive" for item in items)
+        negatives = sum(item.get("label") == "negative" for item in items)
+        if positives < gold_set["target_positive_count"] or negatives < gold_set["target_negative_count"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Gold set needs {gold_set['target_positive_count']} positive and "
+                    f"{gold_set['target_negative_count']} negative examples; it has "
+                    f"{positives} positive and {negatives} negative."
+                ),
+            )
+        if any(not all([
+            item.get("source_alignment_verified"),
+            item.get("terminology_verified"),
+            item.get("speaker_verified"),
+        ]) for item in items):
+            raise HTTPException(status_code=409, detail="Every gold example needs source, terminology, and speaker verification")
+        updated = (
+            supabase.table("editorial_gold_sets")
+            .update({
+                "status": "locked",
+                "locked_by": admin["id"],
+                "locked_at": utcnow_iso(),
+                "updated_at": utcnow_iso(),
+            })
+            .eq("id", req.gold_set_id)
+            .execute()
+        )
+        return {"success": True, "gold_set": updated.data[0]}
 
     @web_app.post("/historical-mappings/backfill")
     async def historical_mapping_backfill_endpoint(
@@ -3404,6 +4949,16 @@ def fastapi_app():
         if not staged_result.data:
             raise HTTPException(status_code=404, detail="Quote not found")
         before = staged_result.data
+        if req.add_to_gold_set:
+            if req.action not in {"approve", "reject"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Only an explicit take approval or rejection can become gold evidence",
+                )
+            if not (req.gold_rationale or "").strip():
+                raise HTTPException(status_code=422, detail="Gold-set examples require an editorial rationale")
+            if not str(before.get("source_transcript_excerpt") or "").strip():
+                raise HTTPException(status_code=422, detail="Gold-set examples require source transcript evidence")
         updates = {}
 
         if req.action == "undo":
@@ -3573,10 +5128,39 @@ def fastapi_app():
             ),
             "metadata": audit_metadata,
         }).execute()
+        gold_item = None
+        gold_warning = None
+        if req.add_to_gold_set:
+            if req.action not in {"approve", "reject"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Only an explicit take approval or rejection can become gold evidence",
+                )
+            if not (req.gold_rationale or "").strip():
+                raise HTTPException(status_code=422, detail="Gold-set examples require an editorial rationale")
+            if not str(after.get("source_transcript_excerpt") or "").strip():
+                raise HTTPException(status_code=422, detail="Gold-set examples require source transcript evidence")
+            try:
+                gold_item = add_gold_set_item(
+                    supabase,
+                    created_by=admin["id"],
+                    label="positive" if req.action == "approve" else "negative",
+                    preferred_quote_text=after.get("quote_text"),
+                    source_transcript_excerpt=after.get("source_transcript_excerpt"),
+                    rationale=req.gold_rationale.strip(),
+                    reviewer_expertise=req.reviewer_expertise,
+                    failure_codes=req.gold_failure_codes,
+                    test_quote_id=req.quote_id,
+                )
+            except Exception as exc:
+                if "duplicate key" not in str(exc).lower() and "23505" not in str(exc):
+                    gold_warning = str(exc)
         return {
             "success": True,
             "quote": after,
             "decision_id": decision.data[0]["id"] if decision.data else None,
+            "gold_item": gold_item,
+            "gold_warning": gold_warning,
         }
 
     @web_app.post("/approve-quote")

@@ -3,20 +3,98 @@ import unittest
 from types import SimpleNamespace
 
 from modal_app.full_processor import (
+    apply_transcript_corrections,
     build_extraction_chunks,
     build_caption_evidence,
     align_quote_to_segments,
     call_openai_structured,
+    calculate_bakeoff_metrics,
+    candidate_has_publishable_length,
     conversation_mapping_is_reviewable,
     context_evidence_is_source_bounded,
     deduplicate_candidates,
     fetch_conversation_taxonomy,
     historical_mapping_is_reviewable,
     normalize_text,
+    quote_word_count,
+    theme_match_is_controlled,
 )
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_quote_length_gate_restores_readable_legacy_range(self):
+        self.assertFalse(candidate_has_publishable_length("too short"))
+        self.assertTrue(candidate_has_publishable_length(" ".join(["signal"] * 20)))
+        self.assertTrue(candidate_has_publishable_length(" ".join(["signal"] * 80)))
+        self.assertFalse(candidate_has_publishable_length(" ".join(["signal"] * 81)))
+        self.assertEqual(quote_word_count("one two three"), 3)
+
+    def test_transcript_corrections_preserve_raw_and_require_confidence(self):
+        segments = [{"id": 0, "text": "Apple oven changed mobile measurement."}]
+        corrected, applied, rejected = apply_transcript_corrections(segments, [
+            {
+                "segment_id": 0,
+                "original_phrase": "Apple oven",
+                "corrected_phrase": "AppLovin",
+                "correction_type": "company",
+                "confidence": 0.98,
+                "rationale": "The named AdTech company fits the exact discussion.",
+            },
+            {
+                "segment_id": 0,
+                "original_phrase": "mobile measurement",
+                "corrected_phrase": "mobile attribution",
+                "correction_type": "industry_term",
+                "confidence": 0.7,
+                "rationale": "Uncertain semantic rewrite.",
+            },
+        ])
+        self.assertEqual(corrected[0]["raw_text"], segments[0]["text"])
+        self.assertIn("AppLovin", corrected[0]["text"])
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(rejected[0]["reason"], "below_confidence_gate")
+
+    def test_theme_action_must_use_controlled_registry_exactly(self):
+        taxonomy = json.dumps({
+            "active_theme_registry": [{"canonical_name": "Performance TV"}],
+            "themes": [],
+        })
+        self.assertTrue(theme_match_is_controlled("existing_theme", "Performance TV", taxonomy))
+        self.assertFalse(theme_match_is_controlled("existing_theme", "Performance CTV", taxonomy))
+        self.assertTrue(theme_match_is_controlled("propose_new", "Agentic Advertising", taxonomy))
+        self.assertTrue(theme_match_is_controlled("abstain", "", taxonomy))
+
+    def test_bakeoff_metrics_use_latest_append_only_review(self):
+        items = [{
+            "id": "item-1",
+            "strategy_key": "hybrid_v3",
+            "quote_word_count": 42,
+        }]
+        reviews = [
+            {
+                "id": "older",
+                "bakeoff_item_id": "item-1",
+                "decision": "reject",
+                "quality_rating": 2,
+                "failure_codes": ["generic"],
+                "preferred_in_episode": False,
+                "created_at": "2026-08-24T10:00:00+00:00",
+            },
+            {
+                "id": "newer",
+                "bakeoff_item_id": "item-1",
+                "decision": "approve",
+                "quality_rating": 5,
+                "failure_codes": [],
+                "preferred_in_episode": True,
+                "created_at": "2026-08-24T11:00:00+00:00",
+            },
+        ]
+        metrics = calculate_bakeoff_metrics(items, reviews)
+        self.assertEqual(metrics["review_coverage"], 1)
+        self.assertEqual(metrics["strategies"]["hybrid_v3"]["approval_rate"], 1)
+        self.assertEqual(metrics["strategies"]["hybrid_v3"]["average_rating"], 5)
+
     def test_normalize_text_handles_smart_punctuation(self):
         self.assertEqual(normalize_text('“Supply—path” isn\'t neutral.'), 'supply path isnt neutral')
 
@@ -59,6 +137,7 @@ class PipelineQualityTests(unittest.TestCase):
         invalid = [{'evidence_type': 'direct_transcript', 'segment_ids': [7, 11]}]
         self.assertTrue(context_evidence_is_source_bounded(valid, 7, 9))
         self.assertFalse(context_evidence_is_source_bounded(invalid, 7, 9))
+        self.assertFalse(context_evidence_is_source_bounded([], 7, 9))
 
     def test_conversation_mapping_requires_supported_named_connections(self):
         mapping = {
