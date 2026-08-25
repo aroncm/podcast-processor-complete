@@ -7,6 +7,7 @@ from modal_app.full_processor import (
     build_extraction_chunks,
     build_caption_evidence,
     align_quote_to_segments,
+    bind_candidate_to_directories,
     call_openai_structured,
     calculate_bakeoff_metrics,
     candidate_has_publishable_length,
@@ -69,14 +70,41 @@ class PipelineQualityTests(unittest.TestCase):
         record = {
             "quote_text": "A complete source-grounded take.",
             "speaker_name": "Operator",
+            "guest_id": "operator-1",
             "speaker_title": "",
             "speaker_company": None,
             "category": "Measurement",
+            "category_id": "measurement",
         }
         self.assertEqual(
             missing_take_verification_fields(record),
             ["speaker title", "speaker company"],
         )
+
+    def test_directory_binding_uses_only_exact_or_episode_scoped_identity(self):
+        directory = {
+            "category_by_name": {"measurement": {"id": "cat-1", "name": "Measurement"}},
+            "person_by_name": {
+                "jane operator": {
+                    "id": "guest-1", "name": "Jane Operator", "title": "CEO",
+                    "company": "Signal Co", "linkedin_url": "https://example.com/jane",
+                },
+            },
+        }
+        bound = bind_candidate_to_directories(
+            {"speaker": "Jane Operator", "category": "Measurement"},
+            directory,
+        )
+        self.assertEqual(bound["guest_id"], "guest-1")
+        self.assertEqual(bound["category_id"], "cat-1")
+        self.assertEqual(bound["speaker_company"], "Signal Co")
+
+        unresolved = bind_candidate_to_directories(
+            {"speaker": "Someone Else", "category": "Broad Business"},
+            directory,
+        )
+        self.assertIsNone(unresolved["guest_id"])
+        self.assertIsNone(unresolved["category_id"])
 
     def test_audited_edits_reopen_only_affected_editorial_gates(self):
         before = {

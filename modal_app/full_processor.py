@@ -30,9 +30,9 @@ image = modal.Image.debian_slim() \
 #   modal secret create podtakes-secrets --from-dotenv .env
 my_secret = modal.Secret.from_name("podtakes-secrets")
 
-PIPELINE_VERSION = "podthreads-hybrid-v3"
+PIPELINE_VERSION = "podthreads-hybrid-v4"
 TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v1"
-EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v3"
+EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v4-canonical-directories"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
 MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v2"
@@ -1104,6 +1104,138 @@ def fetch_terminology_glossary(supabase, podcast: str, episode: str) -> str:
     return json.dumps(glossary, ensure_ascii=False)
 
 
+def normalize_directory_value(value: str | None) -> str:
+    """Normalize a directory label for deterministic matching, not fuzzy identity."""
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def fetch_take_directories(supabase) -> dict:
+    """Load the canonical category and speaker records used by public quotes."""
+    categories = (
+        supabase.table("categories")
+        .select("id,name,description")
+        .order("name")
+        .execute()
+    ).data or []
+    people = (
+        supabase.table("guests")
+        .select("id,name,title,company,linkedin_url")
+        .order("name")
+        .limit(2000)
+        .execute()
+    ).data or []
+    return {
+        "categories": categories,
+        "people": people,
+        "category_by_name": {
+            normalize_directory_value(item.get("name")): item
+            for item in categories if normalize_directory_value(item.get("name"))
+        },
+        "person_by_name": {
+            normalize_directory_value(item.get("name")): item
+            for item in people if normalize_directory_value(item.get("name"))
+        },
+    }
+
+
+def episode_metadata_text(episode) -> str:
+    """Collect RSS identity evidence without treating it as transcript evidence."""
+    parts = [
+        getattr(episode, "title", ""),
+        getattr(episode, "author", ""),
+        getattr(episode, "summary", ""),
+        getattr(episode, "description", ""),
+    ]
+    for content in getattr(episode, "content", []) or []:
+        parts.append(getattr(content, "value", ""))
+    return re.sub(r"\s+", " ", " ".join(str(part or "") for part in parts)).strip()[:8000]
+
+
+def episode_directory_people(directory: dict, metadata: str) -> list[dict]:
+    """Return canonical people whose full names are explicitly in RSS metadata."""
+    searchable = re.sub(r"[^a-z0-9]+", " ", str(metadata or "").casefold())
+    padded = f" {searchable} "
+    matches = []
+    for person in directory.get("people", []):
+        name = re.sub(r"[^a-z0-9]+", " ", str(person.get("name") or "").casefold()).strip()
+        if len(name.split()) >= 2 and f" {name} " in padded:
+            matches.append(person)
+    return matches
+
+
+def bind_candidate_to_directories(candidate: dict, directory: dict, episode_people=None) -> dict:
+    """Attach canonical IDs only when identity/taxonomy resolution is deterministic."""
+    bound = dict(candidate or {})
+    resolution = dict(bound.get("directory_resolution") or {})
+    episode_people = episode_people or []
+
+    category = directory.get("category_by_name", {}).get(
+        normalize_directory_value(bound.get("category"))
+    )
+    if category:
+        bound["category_id"] = category.get("id")
+        bound["category"] = category.get("name")
+        resolution.update({
+            "category_status": "matched",
+            "category_source": "canonical_exact",
+        })
+    else:
+        bound["category_id"] = None
+        resolution.update({
+            "category_status": "unresolved",
+            "category_source": "model_value_not_in_directory",
+        })
+
+    speaker_key = normalize_directory_value(bound.get("speaker"))
+    person = directory.get("person_by_name", {}).get(speaker_key)
+    speaker_source = "canonical_exact"
+    if not person and speaker_key and len(speaker_key.split()) == 1:
+        first_name_matches = [
+            item for item in episode_people
+            if normalize_directory_value(item.get("name")).split(" ", 1)[0] == speaker_key
+        ]
+        if len(first_name_matches) == 1:
+            person = first_name_matches[0]
+            speaker_source = "episode_metadata_unique_first_name"
+
+    if person:
+        bound.update({
+            "guest_id": person.get("id"),
+            "speaker": person.get("name"),
+            "speaker_title": person.get("title"),
+            "speaker_company": person.get("company"),
+            "speaker_linkedin": person.get("linkedin_url"),
+        })
+        resolution.update({
+            "speaker_status": "matched",
+            "speaker_source": speaker_source,
+        })
+    else:
+        bound["guest_id"] = None
+        resolution.update({
+            "speaker_status": "unresolved",
+            "speaker_source": "no_deterministic_directory_match",
+        })
+        generic = speaker_key in {
+            "", "unknown", "unknown speaker", "unnamed", "unnamed speaker", "host", "guest",
+        }
+        if generic and len(episode_people) == 1:
+            resolution.update({
+                "speaker_suggestion_id": episode_people[0].get("id"),
+                "speaker_suggestion_name": episode_people[0].get("name"),
+                "speaker_suggestion_source": "single_person_in_episode_metadata",
+            })
+
+    bound["directory_resolution"] = resolution
+    flags = dict(bound.get("analysis_review_flags") or {})
+    flags.update({
+        "speaker_directory_status": resolution.get("speaker_status"),
+        "category_directory_status": resolution.get("category_status"),
+    })
+    bound["analysis_review_flags"] = flags
+    return bound
+
+
 def propose_transcript_corrections(
     segments,
     podcast,
@@ -1392,7 +1524,8 @@ def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
 
 TAKE_RECORD_FIELDS = {
     "quote_text", "speaker_name", "speaker_title", "speaker_company",
-    "speaker_linkedin", "category", "podcast_name", "episode_name",
+    "speaker_linkedin", "guest_id", "category", "category_id",
+    "directory_resolution", "podcast_name", "episode_name",
     "youtube_id", "timestamp_start", "timestamp_end", "youtube_offset",
 }
 CONTEXT_RECORD_FIELDS = {"editorial_context"}
@@ -1409,9 +1542,11 @@ def missing_take_verification_fields(record):
     required = {
         "quote_text": "take",
         "speaker_name": "speaker",
+        "guest_id": "speaker directory match",
         "speaker_title": "speaker title",
         "speaker_company": "speaker company",
         "category": "category",
+        "category_id": "category directory match",
     }
     return [
         label for field, label in required.items()
@@ -1880,6 +2015,17 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         feed.get("name", ""),
         getattr(episode, "title", ""),
     )
+    take_directory = fetch_take_directories(supabase)
+    rss_episode_metadata = episode_metadata_text(episode)
+    known_episode_people = episode_directory_people(
+        take_directory,
+        rss_episode_metadata,
+    )
+    print(
+        f"  🗂️ Loaded {len(take_directory.get('categories', []))} canonical categories "
+        f"and {len(take_directory.get('people', []))} speaker records; "
+        f"{len(known_episode_people)} people matched episode metadata"
+    )
 
     
     try:
@@ -2076,6 +2222,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 client,
                 chunk_num=chunk_index + 1,
                 curation_examples=curation_examples,
+                category_directory=take_directory.get("categories", []),
+                episode_people=known_episode_people,
             )
 
             for candidate in candidates:
@@ -2154,7 +2302,16 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             episode.title,
             client,
             conversation_taxonomy=conversation_taxonomy,
+            episode_metadata=rss_episode_metadata,
         )
+        all_quotes = [
+            bind_candidate_to_directories(
+                quote,
+                take_directory,
+                episode_people=known_episode_people,
+            )
+            for quote in all_quotes
+        ]
 
         update_processing_job(
             supabase,
@@ -2213,7 +2370,11 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'speaker_name': quote.get('speaker', 'Unknown'),
                 'speaker_title': quote.get('speaker_title'),
                 'speaker_company': quote.get('speaker_company'),
+                'speaker_linkedin': quote.get('speaker_linkedin'),
+                'guest_id': quote.get('guest_id'),
                 'category': quote.get('category', 'Other'),
+                'category_id': quote.get('category_id'),
+                'directory_resolution': quote.get('directory_resolution', {}),
                 'quote_text': quote['text'],
                 'date_published': date_published,
                 'audio_clip_url': audio_url,
@@ -2374,7 +2535,16 @@ def call_openai_structured(
             raise
 
 
-def extract_quotes(text, podcast, episode, client, chunk_num=0, curation_examples=""):
+def extract_quotes(
+    text,
+    podcast,
+    episode,
+    client,
+    chunk_num=0,
+    curation_examples="",
+    category_directory=None,
+    episode_people=None,
+):
     """Retrieve readable, literal candidates using the proven legacy taste bar."""
     model = os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra")
     reasoning_effort = os.environ.get("OPENAI_CANDIDATE_REASONING", "low")
@@ -2416,6 +2586,26 @@ def extract_quotes(text, podcast, episode, client, chunk_num=0, curation_example
         "additionalProperties": False,
     }
 
+    category_names = [
+        str(item.get("name") or "").strip()
+        for item in (category_directory or [])
+        if str(item.get("name") or "").strip()
+    ]
+    episode_people_payload = [
+        {
+            "name": item.get("name"),
+            "title": item.get("title"),
+            "company": item.get("company"),
+        }
+        for item in (episode_people or [])
+    ]
+    category_instruction = (
+        "`category` must be one exact value from the canonical category directory below. "
+        "Do not invent a broader or narrower label. Use `Other` only when it is present "
+        "in the directory and no more specific existing category fits."
+        if category_names else
+        "Return a concise category label; no canonical category directory was supplied for this evaluation."
+    )
     user_prompt = f"""
 Podcast: {podcast}
 Episode: {episode}
@@ -2445,8 +2635,18 @@ Hard requirements:
   interchangeable with generic business or AI commentary.
 - Do not manufacture controversy. Do not rewrite or improve the speaker's words.
 - Quality over quantity. Never fill a quota.
+- {category_instruction}
+- For `speaker`, use an exact full name from the episode people below when the
+  transcript supports that attribution. Otherwise preserve the name actually
+  spoken in the transcript or return `Unknown Speaker`; never guess a person.
 
 {curation_examples}
+
+CANONICAL CATEGORY DIRECTORY:
+{json.dumps(category_names, ensure_ascii=False)}
+
+PEOPLE EXPLICITLY NAMED IN EPISODE METADATA:
+{json.dumps(episode_people_payload, ensure_ascii=False)}
 
 TRANSCRIPT WITH GLOBAL SEGMENT IDS:
 {text}
@@ -2666,6 +2866,7 @@ def contextualize_and_map_quotes(
     episode,
     client,
     conversation_taxonomy="",
+    episode_metadata="",
 ):
     """Draft connective analysis after quote selection; never change the selection."""
     if not selected_candidates:
@@ -2787,6 +2988,9 @@ importance announcements, verdicts, and claim/consequence templates.
         user_prompt=f"""
 Podcast: {podcast}
 Episode: {episode}
+
+RSS EPISODE METADATA (identity/affiliation evidence only):
+{episode_metadata or "No episode metadata was available."}
 
 For every selected take:
 1. Write 45-90 words of `editorial_context` that adds specific industry context
@@ -3106,6 +3310,7 @@ def run_extraction_bakeoff(
     bounded_limit = max(1, min(int(episode_limit or 5), 15))
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    take_directory = fetch_take_directories(supabase)
     run_id = None
     register_pipeline_model_versions(supabase)
     update_processing_job(
@@ -3176,6 +3381,7 @@ def run_extraction_bakeoff(
                             client,
                             chunk_num=chunk_index,
                             curation_examples="",
+                            category_directory=take_directory.get("categories", []),
                         )
                     else:
                         candidates = extract_bakeoff_baseline_candidates(
@@ -4552,7 +4758,9 @@ def fastapi_app():
         connection_context: str | None = None
         theme_match_action: str | None = None
         speaker_name: str | None = None
+        guest_id: str | None = None
         category: str | None = None
+        category_id: str | None = None
         speaker_title: str | None = None
         speaker_company: str | None = None
         speaker_linkedin: str | None = None
@@ -5581,12 +5789,13 @@ def fastapi_app():
         allowed_actions = {
             "approve", "reject", "edit", "approve_context",
             "reject_context", "approve_mapping", "reject_mapping", "undo",
+            "create_speaker",
         }
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported review action")
         if req.action in {
             "approve", "reject", "approve_context", "reject_context",
-            "approve_mapping", "reject_mapping",
+            "approve_mapping", "reject_mapping", "create_speaker",
         } and not req.reviewer_expertise:
             raise HTTPException(status_code=422, detail="Reviewer expertise is required for an editorial decision")
 
@@ -5622,7 +5831,8 @@ def fastapi_app():
             restore = ((decision.data or {}).get("metadata") or {}).get("before") or {}
             allowed_restore = {
                 "approval_status", "quote_text", "editorial_context",
-                "context_review_status", "speaker_name", "category",
+                "context_review_status", "speaker_name", "guest_id",
+                "category", "category_id", "directory_resolution",
                 "speaker_title", "speaker_company", "speaker_linkedin",
                 "youtube_id", "podcast_name", "episode_name",
                 "timestamp_start", "timestamp_end", "youtube_offset",
@@ -5637,6 +5847,68 @@ def fastapi_app():
             updates = {key: value for key, value in restore.items() if key in allowed_restore}
             if not updates:
                 raise HTTPException(status_code=422, detail="Decision has no restorable state")
+        elif req.action == "create_speaker":
+            speaker_name = str(req.speaker_name or before.get("speaker_name") or "").strip()
+            speaker_title = str(req.speaker_title or before.get("speaker_title") or "").strip()
+            speaker_company = str(req.speaker_company or before.get("speaker_company") or "").strip()
+            if normalize_directory_value(speaker_name) in {
+                "", "unknown", "unknown speaker", "unnamed", "unnamed speaker", "host", "guest",
+            }:
+                raise HTTPException(status_code=422, detail="Enter the speaker's full name before adding a directory record")
+            if len(speaker_name.split()) < 2:
+                raise HTTPException(status_code=422, detail="A new speaker directory record requires a full name")
+            if not speaker_title or not speaker_company:
+                raise HTTPException(status_code=422, detail="A new speaker requires a verified title and company")
+
+            people = (
+                supabase.table("guests")
+                .select("id,name,title,company,linkedin_url")
+                .limit(2000)
+                .execute()
+            ).data or []
+            person = next(
+                (
+                    item for item in people
+                    if normalize_directory_value(item.get("name"))
+                    == normalize_directory_value(speaker_name)
+                ),
+                None,
+            )
+            if not person:
+                stable_slug = re.sub(r"[^a-z0-9]+", "-", speaker_name.casefold()).strip("-")
+                guest_id = f"{stable_slug}-{hashlib.sha256(speaker_name.casefold().encode()).hexdigest()[:8]}"
+                inserted = supabase.table("guests").insert({
+                    "id": guest_id,
+                    "slug": guest_id,
+                    "name": speaker_name,
+                    "title": speaker_title,
+                    "company": speaker_company,
+                    "linkedin_url": (req.speaker_linkedin or "").strip() or None,
+                }).execute()
+                person = inserted.data[0] if inserted.data else {
+                    "id": guest_id,
+                    "name": speaker_name,
+                    "title": speaker_title,
+                    "company": speaker_company,
+                    "linkedin_url": (req.speaker_linkedin or "").strip() or None,
+                }
+
+            resolution = dict(before.get("directory_resolution") or {})
+            resolution.update({
+                "speaker_status": "matched",
+                "speaker_source": "sme_created_or_confirmed_directory_record",
+                "speaker_resolved_at": utcnow_iso(),
+                "speaker_resolved_by": admin["id"],
+            })
+            updates = {
+                "guest_id": person.get("id"),
+                "speaker_name": person.get("name"),
+                "speaker_title": person.get("title") or speaker_title,
+                "speaker_company": person.get("company") or speaker_company,
+                "speaker_linkedin": person.get("linkedin_url") or (req.speaker_linkedin or "").strip() or None,
+                "directory_resolution": resolution,
+            }
+            updates.update(editorial_gate_invalidations(before, updates))
         else:
             editable_values = {
                 "quote_text": req.quote_text,
@@ -5666,6 +5938,67 @@ def fastapi_app():
                 for key, value in editable_values.items()
                 if value is not None
             })
+            resolution = dict(before.get("directory_resolution") or {})
+            if "guest_id" in req.model_fields_set:
+                if req.guest_id:
+                    person_result = (
+                        supabase.table("guests")
+                        .select("id,name,title,company,linkedin_url")
+                        .eq("id", req.guest_id)
+                        .single()
+                        .execute()
+                    )
+                    if not person_result.data:
+                        raise HTTPException(status_code=422, detail="Selected speaker no longer exists")
+                    person = person_result.data
+                    updates.update({
+                        "guest_id": person["id"],
+                        "speaker_name": person["name"],
+                        "speaker_title": updates.get("speaker_title") or person.get("title") or "",
+                        "speaker_company": updates.get("speaker_company") or person.get("company") or "",
+                        "speaker_linkedin": updates.get("speaker_linkedin") or person.get("linkedin_url") or "",
+                    })
+                    resolution.update({
+                        "speaker_status": "matched",
+                        "speaker_source": "sme_directory_selection",
+                        "speaker_resolved_at": utcnow_iso(),
+                        "speaker_resolved_by": admin["id"],
+                    })
+                else:
+                    updates["guest_id"] = None
+                    resolution.update({
+                        "speaker_status": "unresolved",
+                        "speaker_source": "sme_cleared_directory_selection",
+                    })
+            if "category_id" in req.model_fields_set:
+                if req.category_id:
+                    category_result = (
+                        supabase.table("categories")
+                        .select("id,name")
+                        .eq("id", req.category_id)
+                        .single()
+                        .execute()
+                    )
+                    if not category_result.data:
+                        raise HTTPException(status_code=422, detail="Selected category no longer exists")
+                    updates.update({
+                        "category_id": category_result.data["id"],
+                        "category": category_result.data["name"],
+                    })
+                    resolution.update({
+                        "category_status": "matched",
+                        "category_source": "sme_directory_selection",
+                        "category_resolved_at": utcnow_iso(),
+                        "category_resolved_by": admin["id"],
+                    })
+                else:
+                    updates["category_id"] = None
+                    resolution.update({
+                        "category_status": "unresolved",
+                        "category_source": "sme_cleared_directory_selection",
+                    })
+            if "guest_id" in req.model_fields_set or "category_id" in req.model_fields_set:
+                updates["directory_resolution"] = resolution
             next_start = updates.get("timestamp_start", before.get("timestamp_start"))
             next_end = updates.get("timestamp_end", before.get("timestamp_end"))
             if next_start is not None and next_end is not None and next_end <= next_start:
@@ -5782,7 +6115,8 @@ def fastapi_app():
                 key: before.get(key)
                 for key in (
                     "approval_status", "quote_text", "editorial_context",
-                    "context_review_status", "speaker_name", "category",
+                    "context_review_status", "speaker_name", "guest_id",
+                    "category", "category_id", "directory_resolution",
                     "speaker_title", "speaker_company", "speaker_linkedin",
                     "youtube_id", "podcast_name", "episode_name",
                     "timestamp_start", "timestamp_end", "youtube_offset",
