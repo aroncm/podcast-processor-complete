@@ -13,8 +13,10 @@ from modal_app.full_processor import (
     conversation_mapping_is_reviewable,
     context_evidence_is_source_bounded,
     deduplicate_candidates,
+    editorial_gate_invalidations,
     fetch_conversation_taxonomy,
     historical_mapping_is_reviewable,
+    missing_take_verification_fields,
     normalize_text,
     quote_word_count,
     theme_match_is_controlled,
@@ -22,6 +24,41 @@ from modal_app.full_processor import (
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_take_approval_requires_complete_human_verified_identity(self):
+        record = {
+            "quote_text": "A complete source-grounded take.",
+            "speaker_name": "Operator",
+            "speaker_title": "",
+            "speaker_company": None,
+            "category": "Measurement",
+        }
+        self.assertEqual(
+            missing_take_verification_fields(record),
+            ["speaker title", "speaker company"],
+        )
+
+    def test_audited_edits_reopen_only_affected_editorial_gates(self):
+        before = {
+            "approval_status": "approved",
+            "quote_text": "Original take",
+            "editorial_context": "Original context",
+            "proposed_theme_name": "Performance TV",
+            "context_review_status": "approved",
+            "mapping_review_status": "approved",
+        }
+        mapping_only = editorial_gate_invalidations(
+            before,
+            {"proposed_theme_name": "A different theme"},
+        )
+        self.assertNotIn("approval_status", mapping_only)
+        self.assertNotIn("context_review_status", mapping_only)
+        self.assertEqual(mapping_only["mapping_review_status"], "unreviewed")
+
+        take_edit = editorial_gate_invalidations(before, {"quote_text": "Edited take"})
+        self.assertEqual(take_edit["approval_status"], "pending")
+        self.assertEqual(take_edit["context_review_status"], "unreviewed")
+        self.assertEqual(take_edit["mapping_review_status"], "unreviewed")
+
     def test_quote_length_gate_restores_readable_legacy_range(self):
         self.assertFalse(candidate_has_publishable_length("too short"))
         self.assertTrue(candidate_has_publishable_length(" ".join(["signal"] * 20)))

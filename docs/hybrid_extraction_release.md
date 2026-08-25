@@ -71,6 +71,25 @@ The mapper must choose one of three explicit actions:
 Activating a registry entry requires a definition plus inclusion and exclusion
 criteria. Registry activation does not create a public conversation page.
 
+## Editorial workflow
+
+The Admin workspace reviews one take at a time in source-first order:
+
+1. Play the exact YouTube or audio segment.
+2. Verify or edit the verbatim take, speaker, title, company, category, and
+   source timing before approving the take.
+3. Select an active controlled theme, then reuse or create a question within
+   that theme.
+4. Review connective context and named people/company connections as separate
+   gates.
+5. Publish only after the take, context, and connection gates are approved.
+
+Unique exact speaker matches can suggest existing guest-directory metadata, but
+the values are persisted only through an audited editor action. Editing an
+approved take reopens the take, context, and mapping gates. Editing only context
+or mapping reopens only the affected gate. Publication also rechecks required
+speaker title and company metadata server-side.
+
 ## Blind bakeoff
 
 The Admin Quality & Theme Lab compares:

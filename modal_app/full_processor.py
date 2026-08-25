@@ -714,6 +714,29 @@ def promote_quote_to_production(quote_id: str, reviewer_id: str = None):
     from supabase import create_client
     supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
     try:
+        staged_result = (
+            supabase.table("test_quotes")
+            .select(
+                "quote_text,speaker_name,speaker_title,speaker_company,category,"
+                "approval_status,context_review_status,mapping_review_status"
+            )
+            .eq("id", quote_id)
+            .single()
+            .execute()
+        )
+        staged = staged_result.data or {}
+        missing = missing_take_verification_fields(staged)
+        if missing:
+            return {
+                "success": False,
+                "error": f"Verify {', '.join(missing)} before publication",
+            }
+        if staged.get("approval_status") != "approved":
+            return {"success": False, "error": "The take must be approved before publication"}
+        if staged.get("context_review_status") != "approved":
+            return {"success": False, "error": "Context must be approved before publication"}
+        if staged.get("mapping_review_status") != "approved":
+            return {"success": False, "error": "Connections must be approved before publication"}
         result = supabase.rpc(
             "promote_curated_quote_with_conversation",
             {"p_quote_id": quote_id, "p_reviewer_id": reviewer_id},
@@ -1364,6 +1387,77 @@ def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
         ):
             return False
     return True
+
+
+TAKE_RECORD_FIELDS = {
+    "quote_text", "speaker_name", "speaker_title", "speaker_company",
+    "speaker_linkedin", "category", "podcast_name", "episode_name",
+    "youtube_id", "timestamp_start", "timestamp_end", "youtube_offset",
+}
+CONTEXT_RECORD_FIELDS = {"editorial_context"}
+MAPPING_RECORD_FIELDS = {
+    "proposed_theme_name", "proposed_theme_summary",
+    "proposed_question_text", "proposed_question_summary",
+    "proposed_people", "proposed_companies", "connection_context",
+    "theme_match_action",
+}
+
+
+def missing_take_verification_fields(record):
+    """Return the human-readable metadata still required for take approval."""
+    required = {
+        "quote_text": "take",
+        "speaker_name": "speaker",
+        "speaker_title": "speaker title",
+        "speaker_company": "speaker company",
+        "category": "category",
+    }
+    return [
+        label for field, label in required.items()
+        if not str((record or {}).get(field) or "").strip()
+    ]
+
+
+def editorial_gate_invalidations(before, updates):
+    """Reopen only the approval gates affected by an audited edit."""
+    before = before or {}
+    updates = updates or {}
+    changed_take = any(
+        field in updates and updates[field] != before.get(field)
+        for field in TAKE_RECORD_FIELDS
+    )
+    changed_context = any(
+        field in updates and updates[field] != before.get(field)
+        for field in CONTEXT_RECORD_FIELDS
+    )
+    changed_mapping = any(
+        field in updates and updates[field] != before.get(field)
+        for field in MAPPING_RECORD_FIELDS
+    )
+    invalidations = {}
+    if changed_take and before.get("approval_status") == "approved":
+        invalidations.update({
+            "approval_status": "pending",
+            "context_review_status": "unreviewed",
+            "context_reviewed_by": None,
+            "context_reviewed_at": None,
+            "mapping_review_status": "unreviewed",
+            "mapping_reviewed_by": None,
+            "mapping_reviewed_at": None,
+        })
+    elif changed_context:
+        invalidations.update({
+            "context_review_status": "unreviewed",
+            "context_reviewed_by": None,
+            "context_reviewed_at": None,
+        })
+    if changed_mapping:
+        invalidations.update({
+            "mapping_review_status": "unreviewed",
+            "mapping_reviewed_by": None,
+            "mapping_reviewed_at": None,
+        })
+    return invalidations
 
 
 def build_caption_evidence(captions, start_time, end_time, padding_seconds=45, max_events=120):
@@ -4118,6 +4212,7 @@ def fastapi_app():
         proposed_people: list[dict] | None = None
         proposed_companies: list[dict] | None = None
         connection_context: str | None = None
+        theme_match_action: str | None = None
         speaker_name: str | None = None
         category: str | None = None
         speaker_title: str | None = None
@@ -4602,6 +4697,141 @@ def fastapi_app():
         ).data or []
         return {"success": True, "themes": themes}
 
+    @web_app.get("/editorial-taxonomy")
+    async def get_editorial_taxonomy_endpoint(admin=Depends(require_admin)):
+        """Return private, review-safe suggestions for the take curation workspace."""
+        supabase = service_client()
+        registry = (
+            supabase.table("adtech_theme_registry")
+            .select(
+                "id,canonical_name,definition,aliases,inclusion_criteria,"
+                "exclusion_criteria,status,registry_version"
+            )
+            .eq("status", "active")
+            .order("canonical_name")
+            .execute()
+        ).data or []
+        graph_themes = (
+            supabase.table("conversation_themes")
+            .select("id,name,summary,publication_status")
+            .order("name")
+            .execute()
+        ).data or []
+        graph_questions = (
+            supabase.table("conversation_questions")
+            .select("id,theme_id,question_text,summary,publication_status")
+            .order("question_text")
+            .execute()
+        ).data or []
+        staged_rows = (
+            supabase.table("test_quotes")
+            .select(
+                "proposed_theme_name,proposed_theme_summary,"
+                "proposed_question_text,proposed_question_summary,"
+                "mapping_review_status"
+            )
+            .in_("approval_status", ["approved", "promoted"])
+            .limit(5000)
+            .execute()
+        ).data or []
+        categories = (
+            supabase.table("categories")
+            .select("id,name,description")
+            .order("name")
+            .execute()
+        ).data or []
+        people = (
+            supabase.table("guests")
+            .select("id,name,title,company,linkedin_url")
+            .order("name")
+            .limit(2000)
+            .execute()
+        ).data or []
+        graph_entities = (
+            supabase.table("conversation_entities")
+            .select("entity_type,name,description,publication_status")
+            .order("name")
+            .limit(2000)
+            .execute()
+        ).data or []
+
+        theme_name_by_id = {
+            str(theme.get("id")): str(theme.get("name") or "").strip()
+            for theme in graph_themes
+        }
+        question_keys = set()
+        questions = []
+        for question in graph_questions:
+            if question.get("publication_status") not in {"approved", "published"}:
+                continue
+            theme_name = theme_name_by_id.get(str(question.get("theme_id")), "")
+            question_text = str(question.get("question_text") or "").strip()
+            if not theme_name or not question_text:
+                continue
+            key = (theme_name.casefold(), question_text.casefold())
+            if key in question_keys:
+                continue
+            question_keys.add(key)
+            questions.append({
+                "id": question.get("id"),
+                "theme_name": theme_name,
+                "question_text": question_text,
+                "summary": question.get("summary"),
+                "source": "published_graph",
+                "publication_status": question.get("publication_status"),
+            })
+        for row in staged_rows:
+            if row.get("mapping_review_status") != "approved":
+                continue
+            theme_name = str(row.get("proposed_theme_name") or "").strip()
+            question_text = str(row.get("proposed_question_text") or "").strip()
+            if not theme_name or not question_text:
+                continue
+            key = (theme_name.casefold(), question_text.casefold())
+            if key in question_keys:
+                continue
+            question_keys.add(key)
+            questions.append({
+                "id": f"staged:{hashlib.sha256('|'.join(key).encode('utf-8')).hexdigest()[:16]}",
+                "theme_name": theme_name,
+                "question_text": question_text,
+                "summary": row.get("proposed_question_summary"),
+                "source": "staged_review",
+                "publication_status": "staged",
+            })
+
+        company_by_name = {}
+        for person in people:
+            company = str(person.get("company") or "").strip()
+            if company:
+                company_by_name.setdefault(company.casefold(), {
+                    "name": company,
+                    "description": "Appears in verified speaker metadata.",
+                    "source": "speaker_metadata",
+                })
+        for entity in graph_entities:
+            if entity.get("entity_type") != "company":
+                continue
+            name = str(entity.get("name") or "").strip()
+            if name:
+                company_by_name[name.casefold()] = {
+                    "name": name,
+                    "description": entity.get("description"),
+                    "source": "conversation_graph",
+                }
+
+        return {
+            "success": True,
+            "themes": registry,
+            "questions": sorted(
+                questions,
+                key=lambda item: (item["theme_name"].casefold(), item["question_text"].casefold()),
+            ),
+            "categories": categories,
+            "people": people,
+            "companies": sorted(company_by_name.values(), key=lambda item: item["name"].casefold()),
+        }
+
     @web_app.post("/theme-registry")
     async def update_theme_registry_endpoint(req: ThemeRegistryRequest, admin=Depends(require_admin)):
         allowed_actions = {"create", "edit", "activate", "retire", "restore"}
@@ -4982,6 +5212,7 @@ def fastapi_app():
                 "proposed_theme_summary", "proposed_question_text",
                 "proposed_question_summary", "proposed_people",
                 "proposed_companies", "connection_context",
+                "theme_match_action",
                 "mapping_review_status", "mapping_reviewed_by",
                 "mapping_reviewed_at",
             }
@@ -4999,6 +5230,7 @@ def fastapi_app():
                 "proposed_people": req.proposed_people,
                 "proposed_companies": req.proposed_companies,
                 "connection_context": req.connection_context,
+                "theme_match_action": req.theme_match_action,
                 "speaker_name": req.speaker_name,
                 "category": req.category,
                 "speaker_title": req.speaker_title,
@@ -5020,7 +5252,20 @@ def fastapi_app():
             next_end = updates.get("timestamp_end", before.get("timestamp_end"))
             if next_start is not None and next_end is not None and next_end <= next_start:
                 raise HTTPException(status_code=422, detail="Quote end time must be after start time")
+            if req.theme_match_action and req.theme_match_action not in {
+                "existing_theme", "propose_new", "abstain",
+            }:
+                raise HTTPException(status_code=422, detail="Unsupported theme match action")
+            if req.action == "edit":
+                updates.update(editorial_gate_invalidations(before, updates))
             if req.action == "approve":
+                take_record = {**before, **updates}
+                missing = missing_take_verification_fields(take_record)
+                if missing:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Verify {', '.join(missing)} before approving this take",
+                    )
                 updates["approval_status"] = "approved"
                 updates["rejection_reason"] = None
             elif req.action == "reject":
@@ -5049,10 +5294,37 @@ def fastapi_app():
                     "question_summary": updates.get("proposed_question_summary", before.get("proposed_question_summary")),
                     "connection_context": updates.get("connection_context", before.get("connection_context")),
                 }
+                active_registry = (
+                    supabase.table("adtech_theme_registry")
+                    .select("canonical_name,definition")
+                    .eq("status", "active")
+                    .execute()
+                ).data or []
+                selected_theme = next((
+                    theme for theme in active_registry
+                    if str(theme.get("canonical_name") or "").strip().casefold()
+                    == str(mapping_values["theme"] or "").strip().casefold()
+                ), None)
+                if not selected_theme:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Select an active controlled theme before approving the mapping",
+                    )
+                canonical_theme = str(selected_theme.get("canonical_name") or "").strip()
+                mapping_values["theme"] = canonical_theme
+                mapping_values["theme_summary"] = (
+                    str(mapping_values["theme_summary"] or "").strip()
+                    or str(selected_theme.get("definition") or "").strip()
+                )
+                updates.update({
+                    "proposed_theme_name": mapping_values["theme"],
+                    "proposed_theme_summary": mapping_values["theme_summary"],
+                    "theme_match_action": "existing_theme",
+                })
                 if any(not str(value or "").strip() for value in mapping_values.values()):
                     raise HTTPException(
                         status_code=422,
-                        detail="Theme, theme summary, question, and connection context are required",
+                        detail="Theme, question, question summary, and connection context are required",
                     )
                 if len(str(mapping_values["connection_context"]).split()) < 20:
                     raise HTTPException(status_code=422, detail="Connection context is too thin for SME approval")
@@ -5100,6 +5372,7 @@ def fastapi_app():
                     "proposed_theme_summary", "proposed_question_text",
                     "proposed_question_summary", "proposed_people",
                     "proposed_companies", "connection_context",
+                    "theme_match_action",
                     "mapping_review_status", "mapping_reviewed_by",
                     "mapping_reviewed_at",
                 )
