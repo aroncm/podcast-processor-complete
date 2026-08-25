@@ -30,9 +30,9 @@ image = modal.Image.debian_slim() \
 #   modal secret create podtakes-secrets --from-dotenv .env
 my_secret = modal.Secret.from_name("podtakes-secrets")
 
-PIPELINE_VERSION = "podthreads-hybrid-v4"
+PIPELINE_VERSION = "podthreads-hybrid-v5-speaker-aware"
 TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v1"
-EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v4-canonical-directories"
+EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
 MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v2"
@@ -1135,6 +1135,10 @@ def fetch_take_directories(supabase) -> dict:
             normalize_directory_value(item.get("name")): item
             for item in people if normalize_directory_value(item.get("name"))
         },
+        "person_by_id": {
+            str(item.get("id")): item
+            for item in people if item.get("id")
+        },
     }
 
 
@@ -1163,6 +1167,138 @@ def episode_directory_people(directory: dict, metadata: str) -> list[dict]:
     return matches
 
 
+def resolve_diarized_speaker_identities(
+    segments: list[dict],
+    episode_people: list[dict],
+    episode_metadata: str,
+    client,
+) -> dict:
+    """Map diarized labels only when the transcript contains identity evidence."""
+    labeled = {}
+    for segment in segments or []:
+        label = str(segment.get("speaker_label") or "").strip()
+        text = str(segment.get("text") or "").strip()
+        if label and text:
+            labeled.setdefault(label, []).append({
+                "segment_id": segment.get("id"),
+                "text": text,
+            })
+    if not labeled or not episode_people:
+        return {}
+
+    samples = []
+    for label, rows in labeled.items():
+        sample_rows = rows[:18]
+        if len(rows) > 24:
+            sample_rows += rows[-6:]
+        samples.append({"speaker_label": label, "segments": sample_rows})
+    people_payload = [
+        {
+            "guest_id": person.get("id"),
+            "name": person.get("name"),
+            "title": person.get("title"),
+            "company": person.get("company"),
+        }
+        for person in episode_people
+    ]
+    schema = {
+        "type": "object",
+        "properties": {
+            "mappings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "speaker_label": {"type": "string"},
+                        "guest_id": {"type": "string"},
+                        "identity_basis": {
+                            "type": "string",
+                            "enum": [
+                                "explicit_self_introduction",
+                                "explicit_name_address",
+                                "interview_role_inference",
+                                "insufficient",
+                            ],
+                        },
+                        "confidence": {"type": "number"},
+                        "evidence_segment_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
+                        "reason": {"type": "string"},
+                    },
+                    "required": [
+                        "speaker_label", "guest_id", "identity_basis",
+                        "confidence", "evidence_segment_ids", "reason",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["mappings"],
+        "additionalProperties": False,
+    }
+    result = call_openai_structured(
+        client,
+        model=os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+        system_prompt="""
+You resolve speaker labels for a private editorial workflow. Identity accuracy
+is more important than coverage. A guest appearing in episode metadata does not
+prove that every non-host voice is that guest. Use insufficient unless the
+transcript itself contains a self-introduction or an explicit name address that
+connects the diarized voice to an allowed person. Interview-role inference is a
+review suggestion only and must not be represented as verified identity.
+""",
+        user_prompt=f"""
+RSS EPISODE METADATA:
+{episode_metadata}
+
+ALLOWED PEOPLE EXPLICITLY NAMED IN THAT METADATA:
+{json.dumps(people_payload, ensure_ascii=False)}
+
+DIARIZED SPEAKER SAMPLES:
+{json.dumps(samples, ensure_ascii=False)}
+
+Return one mapping per speaker label. `guest_id` must be an exact allowed ID or
+an empty string. Cite only supplied segment IDs. Prefer insufficient to a guess.
+""",
+        schema_name="podthreads_diarized_speaker_identity",
+        schema=schema,
+        reasoning_effort=os.environ.get("OPENAI_EDITORIAL_REASONING", "high"),
+        max_output_tokens=6000,
+    )
+    people_by_id = {str(person.get("id")): person for person in episode_people}
+    valid_segment_ids = {
+        int(segment.get("id")) for segment in segments
+        if segment.get("id") is not None
+    }
+    resolved = {}
+    for mapping in result.get("mappings", []):
+        label = str(mapping.get("speaker_label") or "")
+        guest_id = str(mapping.get("guest_id") or "")
+        basis = mapping.get("identity_basis")
+        confidence = max(0.0, min(1.0, float(mapping.get("confidence", 0) or 0)))
+        evidence_ids = [
+            int(value) for value in (mapping.get("evidence_segment_ids") or [])
+            if int(value) in valid_segment_ids
+        ]
+        if (
+            label in labeled
+            and guest_id in people_by_id
+            and basis in {"explicit_self_introduction", "explicit_name_address"}
+            and confidence >= 0.90
+            and evidence_ids
+        ):
+            resolved[label] = {
+                "person": people_by_id[guest_id],
+                "confidence": round(confidence, 4),
+                "identity_basis": basis,
+                "evidence_segment_ids": evidence_ids,
+                "reason": mapping.get("reason"),
+            }
+    return resolved
+
+
 def bind_candidate_to_directories(candidate: dict, directory: dict, episode_people=None) -> dict:
     """Attach canonical IDs only when identity/taxonomy resolution is deterministic."""
     bound = dict(candidate or {})
@@ -1187,8 +1323,10 @@ def bind_candidate_to_directories(candidate: dict, directory: dict, episode_peop
         })
 
     speaker_key = normalize_directory_value(bound.get("speaker"))
-    person = directory.get("person_by_name", {}).get(speaker_key)
-    speaker_source = "canonical_exact"
+    person = directory.get("person_by_id", {}).get(str(bound.get("guest_id") or ""))
+    speaker_source = str(resolution.get("speaker_source") or "canonical_exact")
+    if not person:
+        person = directory.get("person_by_name", {}).get(speaker_key)
     if not person and speaker_key and len(speaker_key.split()) == 1:
         first_name_matches = [
             item for item in episode_people
@@ -1347,7 +1485,12 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
         absolute_offset = 0.0
         transcript_parts = []
         absolute_segments = []
-        transcript_model = os.environ.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+        transcript_model = os.environ.get(
+            "OPENAI_TRANSCRIPTION_MODEL",
+            "gpt-4o-transcribe-diarize",
+        )
+        fallback_model = os.environ.get("OPENAI_TRANSCRIPTION_FALLBACK_MODEL", "whisper-1")
+        used_models = []
 
         for chunk_index, chunk_path in enumerate(chunk_paths):
             update_processing_job(
@@ -1359,13 +1502,39 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
                     "transcript_chunks": len(chunk_paths),
                 },
             )
-            with open(chunk_path, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    model=transcript_model,
-                    file=audio_file,
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"],
+            active_model = transcript_model
+            try:
+                with open(chunk_path, "rb") as audio_file:
+                    if transcript_model == "gpt-4o-transcribe-diarize":
+                        transcript = client.audio.transcriptions.create(
+                            model=transcript_model,
+                            file=audio_file,
+                            response_format="diarized_json",
+                            chunking_strategy="auto",
+                        )
+                    else:
+                        transcript = client.audio.transcriptions.create(
+                            model=transcript_model,
+                            file=audio_file,
+                            response_format="verbose_json",
+                            timestamp_granularities=["segment"],
+                        )
+            except Exception as exc:
+                if transcript_model != "gpt-4o-transcribe-diarize" or not fallback_model:
+                    raise
+                active_model = fallback_model
+                print(
+                    f"⚠️ Diarized transcription unavailable for chunk {chunk_index + 1}; "
+                    f"falling back to {fallback_model}: {type(exc).__name__}"
                 )
+                with open(chunk_path, "rb") as audio_file:
+                    transcript = client.audio.transcriptions.create(
+                        model=fallback_model,
+                        file=audio_file,
+                        response_format="verbose_json",
+                        timestamp_granularities=["segment"],
+                    )
+            used_models.append(active_model)
 
             chunk_text = getattr(transcript, "text", "") or ""
             transcript_parts.append(chunk_text)
@@ -1376,10 +1545,12 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
                     text = raw_segment.get("text", "")
                     start = float(raw_segment.get("start", 0))
                     end = float(raw_segment.get("end", start))
+                    speaker = raw_segment.get("speaker")
                 else:
                     text = getattr(raw_segment, "text", "")
                     start = float(getattr(raw_segment, "start", 0))
                     end = float(getattr(raw_segment, "end", start))
+                    speaker = getattr(raw_segment, "speaker", None)
                 max_end = max(max_end, end)
                 absolute_segments.append({
                     "id": len(absolute_segments),
@@ -1387,6 +1558,10 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
                     "start": round(start + absolute_offset, 3),
                     "end": round(end + absolute_offset, 3),
                     "chunk_index": chunk_index,
+                    "speaker_label": (
+                        f"chunk-{chunk_index}:{speaker}"
+                        if str(speaker or "").strip() else None
+                    ),
                 })
 
             if max_end <= 0:
@@ -1405,7 +1580,11 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
         return {
             "text": "\n".join(transcript_parts).strip(),
             "segments": absolute_segments,
-            "model": transcript_model,
+            "model": "+".join(dict.fromkeys(used_models)) or transcript_model,
+            "diarization_requested": transcript_model == "gpt-4o-transcribe-diarize",
+            "diarization_complete": bool(absolute_segments) and all(
+                segment.get("speaker_label") for segment in absolute_segments
+            ),
         }
     finally:
         shutil.rmtree(chunk_dir, ignore_errors=True)
@@ -1417,7 +1596,8 @@ def build_extraction_chunks(segments, max_chars=18000, overlap_segments=3):
     current_lines = []
     current_size = 0
     for segment in segments:
-        line = f"[{segment['id']}] {segment['text']}"
+        speaker = f" [speaker={segment['speaker_label']}]" if segment.get("speaker_label") else ""
+        line = f"[{segment['id']}]{speaker} {segment['text']}"
         if current_lines and current_size + len(line) + 1 > max_chars:
             chunks.append("\n".join(current_lines))
             current_lines = current_lines[-overlap_segments:]
@@ -1833,7 +2013,7 @@ def transcribe_remote_audio_window(audio_url, expected_start, expected_end, clie
             raise RuntimeError(f"RSS audio window extraction failed: {completed.stderr[-800:]}")
         with open(temp_path, "rb") as audio_file:
             transcript = client.audio.transcriptions.create(
-                model=os.environ.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1"),
+                model=os.environ.get("OPENAI_WINDOW_TRANSCRIPTION_MODEL", "whisper-1"),
                 file=audio_file,
                 response_format="verbose_json",
                 timestamp_granularities=["segment"],
@@ -2159,6 +2339,24 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             f"📝 Terminology pass: {len(applied_corrections)} applied for review; "
             f"{len(rejected_corrections)} withheld"
         )
+        speaker_identity_map = {}
+        if transcription.get("diarization_complete") and known_episode_people:
+            try:
+                speaker_identity_map = resolve_diarized_speaker_identities(
+                    segments,
+                    known_episode_people,
+                    rss_episode_metadata,
+                    client,
+                )
+                print(
+                    f"🗣️ Diarization returned labeled voices; "
+                    f"{len(speaker_identity_map)} identities met the explicit-evidence gate"
+                )
+            except Exception as exc:
+                print(
+                    "AUDIT_WARNING speaker identity resolution abstained after an error: "
+                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                )
 
         artifact_payload = {
             "processing_job_id": job_id,
@@ -2173,6 +2371,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             "transcript_corrections": applied_corrections,
             "rejected_transcript_corrections": rejected_corrections,
             "transcript_model": transcription["model"],
+            "transcript_diarization_requested": transcription.get("diarization_requested", False),
+            "transcript_diarization_complete": transcription.get("diarization_complete", False),
             "terminology_model": os.environ.get(
                 "OPENAI_TERMINOLOGY_MODEL",
                 os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
@@ -2263,6 +2463,37 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                     if end_time - start_time < 15:
                         end_time = start_time + 15
 
+                    source_speaker_labels = {
+                        str(segment.get("speaker_label") or "").strip()
+                        for segment in segments[start_id:end_id + 1]
+                        if str(segment.get("speaker_label") or "").strip()
+                    }
+                    if len(source_speaker_labels) > 1:
+                        raise ValueError("quote crosses diarized speaker boundaries")
+                    source_speaker_label = next(iter(source_speaker_labels), "")
+                    candidate_speaker_label = str(candidate.get("speaker_label") or "").strip()
+                    if source_speaker_label and candidate_speaker_label != source_speaker_label:
+                        raise ValueError("candidate speaker label does not match source segments")
+
+                    identity = speaker_identity_map.get(source_speaker_label)
+                    identity_fields = {}
+                    if identity:
+                        person = identity["person"]
+                        identity_fields = {
+                            "speaker": person.get("name"),
+                            "speaker_title": person.get("title"),
+                            "speaker_company": person.get("company"),
+                            "speaker_linkedin": person.get("linkedin_url"),
+                            "guest_id": person.get("id"),
+                            "directory_resolution": {
+                                "speaker_status": "matched",
+                                "speaker_source": "diarized_explicit_identity_evidence",
+                                "speaker_confidence": identity.get("confidence"),
+                                "speaker_identity_basis": identity.get("identity_basis"),
+                                "speaker_evidence_segment_ids": identity.get("evidence_segment_ids"),
+                            },
+                        }
+
                     candidate.update({
                         "clip_start": int(start_time),
                         "clip_end": int(end_time),
@@ -2276,6 +2507,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                             start_id,
                             end_id,
                         ),
+                        "speaker_label": source_speaker_label or None,
+                        **identity_fields,
                     })
                     all_candidates.append(candidate)
                 except Exception as exc:
@@ -2369,6 +2602,7 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'podcast_name': feed['name'],
                 'episode_name': episode.title[:100],
                 'speaker_name': quote.get('speaker', 'Unknown'),
+                'speaker_label': quote.get('speaker_label'),
                 'speaker_title': quote.get('speaker_title'),
                 'speaker_company': quote.get('speaker_company'),
                 'speaker_linkedin': quote.get('speaker_linkedin'),
@@ -2561,6 +2795,7 @@ def extract_quotes(
                         "start_segment_id": {"type": "integer"},
                         "end_segment_id": {"type": "integer"},
                         "speaker": {"type": "string"},
+                        "speaker_label": {"type": "string"},
                         "category": {"type": "string"},
                         "specific_claim": {"type": "string"},
                         "consensus_challenged": {"type": "string"},
@@ -2574,6 +2809,7 @@ def extract_quotes(
                     },
                     "required": [
                         "text", "start_segment_id", "end_segment_id", "speaker",
+                        "speaker_label",
                         "category", "specific_claim", "consensus_challenged",
                         "causal_mechanism", "novelty", "provocation",
                         "domain_specificity", "evidence_quality", "genericness_risk",
@@ -2640,6 +2876,9 @@ Hard requirements:
 - For `speaker`, use an exact full name from the episode people below when the
   transcript supports that attribution. Otherwise preserve the name actually
   spoken in the transcript or return `Unknown Speaker`; never guess a person.
+- When transcript lines include `[speaker=...]`, copy that exact label into
+  `speaker_label` and keep the quote within one labeled voice. When labels are
+  unavailable, return a blank string.
 
 {curation_examples}
 
@@ -3134,7 +3373,7 @@ BAKEOFF_STRATEGY_MANIFEST = {
         "purpose": "Captures the longer mechanism-first candidate behavior being replaced.",
     },
     "hybrid_v3": {
-        "label": "PodThreads hybrid v3",
+        "label": "Active PodThreads hybrid",
         "prompt_version": EXTRACTION_PROMPT_VERSION,
         "ranking_prompt_version": RANKING_PROMPT_VERSION,
         "purpose": "Combines the legacy taste bar with complete-transcript source controls.",

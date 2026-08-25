@@ -90,6 +90,12 @@ class PipelineQualityTests(unittest.TestCase):
                     "company": "Signal Co", "linkedin_url": "https://example.com/jane",
                 },
             },
+            "person_by_id": {
+                "guest-1": {
+                    "id": "guest-1", "name": "Jane Operator", "title": "CEO",
+                    "company": "Signal Co", "linkedin_url": "https://example.com/jane",
+                },
+            },
         }
         bound = bind_candidate_to_directories(
             {"speaker": "Jane Operator", "category": "Measurement"},
@@ -98,6 +104,20 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(bound["guest_id"], "guest-1")
         self.assertEqual(bound["category_id"], "cat-1")
         self.assertEqual(bound["speaker_company"], "Signal Co")
+
+        diarized = bind_candidate_to_directories(
+            {
+                "guest_id": "guest-1", "speaker": "Unknown Speaker",
+                "category": "Measurement",
+                "directory_resolution": {"speaker_source": "diarized_explicit_identity_evidence"},
+            },
+            directory,
+        )
+        self.assertEqual(diarized["speaker"], "Jane Operator")
+        self.assertEqual(
+            diarized["directory_resolution"]["speaker_source"],
+            "diarized_explicit_identity_evidence",
+        )
 
         unresolved = bind_candidate_to_directories(
             {"speaker": "Someone Else", "category": "Broad Business"},
@@ -206,12 +226,15 @@ class PipelineQualityTests(unittest.TestCase):
 
     def test_extraction_chunks_preserve_global_ids_and_overlap(self):
         segments = [
-            {'id': index, 'text': f'segment {index}', 'start': index * 2, 'end': index * 2 + 1}
+            {
+                'id': index, 'text': f'segment {index}', 'start': index * 2,
+                'end': index * 2 + 1, 'speaker_label': 'chunk-0:A',
+            }
             for index in range(10)
         ]
-        chunks = build_extraction_chunks(segments, max_chars=48, overlap_segments=2)
+        chunks = build_extraction_chunks(segments, max_chars=120, overlap_segments=2)
         self.assertGreater(len(chunks), 1)
-        self.assertIn('[0] segment 0', chunks[0])
+        self.assertIn('[0] [speaker=chunk-0:A] segment 0', chunks[0])
         first_tail = chunks[0].splitlines()[-2:]
         self.assertEqual(first_tail, chunks[1].splitlines()[:2])
 
