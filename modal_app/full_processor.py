@@ -36,7 +36,7 @@ TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v2-bounded
 EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
-MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v2"
+MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v3"
 HISTORICAL_MAPPING_PROMPT_VERSION = "adtech-historical-conversation-mapping-v1"
 EDITORIAL_RUBRIC_VERSION = "podthreads-operator-take-rubric-v2"
 MIN_QUOTE_WORDS = 20
@@ -1761,6 +1761,49 @@ def register_pipeline_model_versions(supabase) -> None:
         print(f"AUDIT_WARNING model provenance registration failed: {exc}")
 
 
+def merge_reviewed_question_taxonomy(themes, questions, staged_rows):
+    """Keep SME-approved Questions reusable inside their exact parent Theme."""
+    theme_names = {
+        str(row.get("id")): str(row.get("name") or "").strip()
+        for row in themes or []
+    }
+    merged = []
+    seen = set()
+    for row in questions or []:
+        theme_name = theme_names.get(str(row.get("theme_id")), "")
+        question_text = str(row.get("question_text") or "").strip()
+        if not theme_name or not question_text:
+            continue
+        key = (theme_name.casefold(), question_text.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append({
+            "theme": theme_name,
+            "question": question_text,
+            "summary": row.get("summary"),
+            "review_state": "approved_graph",
+        })
+    for row in staged_rows or []:
+        if row.get("mapping_review_status") != "approved":
+            continue
+        theme_name = str(row.get("proposed_theme_name") or "").strip()
+        question_text = str(row.get("proposed_question_text") or "").strip()
+        if not theme_name or not question_text:
+            continue
+        key = (theme_name.casefold(), question_text.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append({
+            "theme": theme_name,
+            "question": question_text,
+            "summary": row.get("proposed_question_summary"),
+            "review_state": "approved_staged_mapping",
+        })
+    return merged
+
+
 def fetch_conversation_taxonomy(supabase) -> str:
     """Give mapping a reviewed vocabulary so equivalent ideas converge over time."""
     try:
@@ -1796,6 +1839,23 @@ def fetch_conversation_taxonomy(supabase) -> str:
             .limit(240)
             .execute()
         )
+        staged_rows = []
+        try:
+            staged_result = (
+                supabase.table("test_quotes")
+                .select(
+                    "proposed_theme_name,proposed_question_text,"
+                    "proposed_question_summary,mapping_review_status"
+                )
+                .in_("approval_status", ["approved", "promoted"])
+                .eq("mapping_review_status", "approved")
+                .order("mapping_reviewed_at", desc=True)
+                .limit(500)
+                .execute()
+            )
+            staged_rows = staged_result.data or []
+        except Exception as staged_exc:
+            print(f"⚠️ Approved staged Questions unavailable: {staged_exc}")
         entities_result = (
             supabase.table("conversation_entities")
             .select("entity_type,name,description")
@@ -1808,24 +1868,20 @@ def fetch_conversation_taxonomy(supabase) -> str:
         themes = themes_result.data or []
         questions = questions_result.data or []
         entities = entities_result.data or []
-        if not registry and not themes and not questions and not entities:
+        if not registry and not themes and not questions and not staged_rows and not entities:
             return ""
 
-        theme_names = {row["id"]: row.get("name") for row in themes}
         reviewed_graph = {
             "active_theme_registry": registry,
             "themes": [
                 {"name": row.get("name"), "summary": row.get("summary")}
                 for row in themes
             ],
-            "questions": [
-                {
-                    "theme": theme_names.get(row.get("theme_id")),
-                    "question": row.get("question_text"),
-                    "summary": row.get("summary"),
-                }
-                for row in questions
-            ],
+            "questions": merge_reviewed_question_taxonomy(
+                themes,
+                questions,
+                staged_rows,
+            ),
             "entities": [
                 {
                     "type": row.get("entity_type"),
@@ -1914,6 +1970,53 @@ def prepare_category_directory_record(categories, category_name):
         "name": canonical_name,
         "description": None,
     }, True
+
+
+def prepare_theme_registry_record(
+    themes,
+    canonical_name,
+    definition,
+    inclusion_criteria,
+    exclusion_criteria,
+    *,
+    activate=False,
+):
+    """Validate an inline theme without weakening the controlled registry."""
+    name = re.sub(r"\s+", " ", str(canonical_name or "").strip())
+    summary = re.sub(r"\s+", " ", str(definition or "").strip())
+    normalized_name = normalize_directory_value(name)
+    if len(name) < 3 or len(name) > 100:
+        raise ValueError("A Theme name must be between 3 and 100 characters")
+    if len(summary.split()) < 8:
+        raise ValueError("Define the Theme specifically enough to guide future mapping")
+
+    existing = next(
+        (
+            item for item in themes
+            if normalize_directory_value(item.get("canonical_name")) == normalized_name
+        ),
+        None,
+    )
+    if existing:
+        raise ValueError(
+            f"Theme already exists as {existing.get('canonical_name')}; select the existing Theme"
+        )
+
+    included = [str(item).strip() for item in (inclusion_criteria or []) if str(item).strip()]
+    excluded = [str(item).strip() for item in (exclusion_criteria or []) if str(item).strip()]
+    if activate and (not included or not excluded):
+        raise ValueError("An active Theme requires at least one inclusion and exclusion criterion")
+
+    return {
+        "canonical_name": name,
+        "definition": summary,
+        "aliases": [],
+        "inclusion_criteria": included,
+        "exclusion_criteria": excluded,
+        "positive_examples": [],
+        "counter_examples": [],
+        "status": "active" if activate else "proposed",
+    }
 
 
 def fetch_take_directories(supabase) -> dict:
@@ -6169,6 +6272,7 @@ def fastapi_app():
         counter_examples: list[str] | None = None
         reason: str
         reviewer_expertise: list[str] = Field(default_factory=list)
+        source_quote_id: str | None = None
 
     class GoldSetLockRequest(BaseModel):
         gold_set_id: str
@@ -6735,7 +6839,7 @@ def fastapi_app():
 
     @web_app.post("/theme-registry")
     async def update_theme_registry_endpoint(req: ThemeRegistryRequest, admin=Depends(require_admin)):
-        allowed_actions = {"create", "edit", "activate", "retire", "restore"}
+        allowed_actions = {"create", "create_and_activate", "edit", "activate", "retire", "restore"}
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported theme registry action")
         if not req.reviewer_expertise:
@@ -6744,7 +6848,7 @@ def fastapi_app():
             raise HTTPException(status_code=422, detail="An audit reason is required")
         supabase = service_client()
         before = {}
-        if req.action != "create":
+        if req.action not in {"create", "create_and_activate"}:
             if not req.theme_registry_id:
                 raise HTTPException(status_code=422, detail="theme_registry_id is required")
             current = (
@@ -6768,16 +6872,40 @@ def fastapi_app():
             "counter_examples": req.counter_examples,
         }
         updates = {key: value for key, value in editable.items() if value is not None}
-        if req.action == "create":
-            if not (req.canonical_name or "").strip() or not (req.definition or "").strip():
-                raise HTTPException(status_code=422, detail="Canonical name and definition are required")
-            updates.update({
-                "canonical_name": req.canonical_name.strip(),
-                "definition": req.definition.strip(),
-                "status": "proposed",
-                "metadata": {"created_by_admin_api": True},
+        if req.action in {"create", "create_and_activate"}:
+            existing_themes = (
+                supabase.table("adtech_theme_registry")
+                .select("id,canonical_name,status")
+                .limit(1000)
+                .execute()
+            ).data or []
+            try:
+                new_theme = prepare_theme_registry_record(
+                    existing_themes,
+                    req.canonical_name,
+                    req.definition,
+                    req.inclusion_criteria,
+                    req.exclusion_criteria,
+                    activate=req.action == "create_and_activate",
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            new_theme.update({
+                key: value
+                for key, value in updates.items()
+                if key in {"aliases", "positive_examples", "counter_examples"}
             })
-            inserted = supabase.table("adtech_theme_registry").insert(updates).execute()
+            if req.action == "create_and_activate":
+                new_theme.update({
+                    "reviewed_by": admin["id"],
+                    "reviewed_at": utcnow_iso(),
+                })
+            new_theme["metadata"] = {
+                "created_by_admin_api": True,
+                "created_inline_from_quote_id": req.source_quote_id,
+                "created_active": req.action == "create_and_activate",
+            }
+            inserted = supabase.table("adtech_theme_registry").insert(new_theme).execute()
             after = inserted.data[0]
         else:
             if req.action in {"activate", "restore"}:
@@ -6802,10 +6930,12 @@ def fastapi_app():
         decision = supabase.table("theme_registry_decisions").insert({
             "theme_registry_id": after["id"],
             "reviewer_id": admin["id"],
-            "decision": req.action,
+            "decision": "create" if req.action == "create_and_activate" else req.action,
             "before_state": before,
             "after_state": after,
             "reason": req.reason.strip(),
+            "reviewer_expertise": req.reviewer_expertise,
+            "source_quote_id": req.source_quote_id,
         }).execute()
         return {"success": True, "theme": after, "decision_id": decision.data[0]["id"]}
 

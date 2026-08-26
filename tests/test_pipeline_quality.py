@@ -22,9 +22,11 @@ from modal_app.full_processor import (
     historical_mapping_is_reviewable,
     legacy_integer_timestamp,
     missing_take_verification_fields,
+    merge_reviewed_question_taxonomy,
     normalize_text,
     openai_error_is_retryable,
     prepare_category_directory_record,
+    prepare_theme_registry_record,
     quote_word_count,
     staged_analysis_should_skip_source_retry,
     staged_analysis_write_plan,
@@ -54,6 +56,40 @@ class PipelineQualityTests(unittest.TestCase):
     def test_category_creation_rejects_placeholder_labels(self):
         with self.assertRaisesRegex(ValueError, "specific industry category"):
             prepare_category_directory_record([], "Other")
+
+    def test_inline_theme_creation_requires_scope_boundaries(self):
+        with self.assertRaisesRegex(ValueError, "inclusion and exclusion"):
+            prepare_theme_registry_record(
+                [],
+                "Agentic Micropayments",
+                "How autonomous software changes the operating controls for small data payments.",
+                [],
+                [],
+                activate=True,
+            )
+
+    def test_inline_theme_creation_builds_active_controlled_record(self):
+        record = prepare_theme_registry_record(
+            [],
+            "  Agentic   Micropayments ",
+            "How autonomous software changes the operating controls for small data payments.",
+            ["Machine-initiated payments for data or content"],
+            ["Consumer checkout with no autonomous agent"],
+            activate=True,
+        )
+        self.assertEqual(record["canonical_name"], "Agentic Micropayments")
+        self.assertEqual(record["status"], "active")
+
+    def test_inline_theme_creation_rejects_normalized_duplicate(self):
+        with self.assertRaisesRegex(ValueError, "select the existing Theme"):
+            prepare_theme_registry_record(
+                [{"canonical_name": "Performance TV"}],
+                " performance tv ",
+                "How television buying becomes accountable to measured business outcomes.",
+                ["Television buying tied to outcomes"],
+                ["Generic streaming content strategy"],
+                activate=True,
+            )
 
     def test_review_payload_normalizes_legacy_integer_timestamps(self):
         self.assertEqual(legacy_integer_timestamp(2154.0), 2154)
@@ -242,6 +278,34 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertFalse(theme_match_is_controlled("existing_theme", "Performance CTV", taxonomy))
         self.assertTrue(theme_match_is_controlled("propose_new", "Agentic Advertising", taxonomy))
         self.assertTrue(theme_match_is_controlled("abstain", "", taxonomy))
+
+    def test_approved_staged_question_is_reused_under_its_parent_theme(self):
+        merged = merge_reviewed_question_taxonomy(
+            [{"id": "theme-1", "name": "Performance TV"}],
+            [{
+                "theme_id": "theme-1",
+                "question_text": "Who should control the CTV transaction layer?",
+                "summary": "Graph version",
+            }],
+            [{
+                "mapping_review_status": "approved",
+                "proposed_theme_name": "Performance TV",
+                "proposed_question_text": "Who should control the CTV transaction layer?",
+                "proposed_question_summary": "Duplicate staged version",
+            }, {
+                "mapping_review_status": "approved",
+                "proposed_theme_name": "Performance TV",
+                "proposed_question_text": "How should television incrementality be measured?",
+                "proposed_question_summary": "Approved but not yet published",
+            }, {
+                "mapping_review_status": "unreviewed",
+                "proposed_theme_name": "Performance TV",
+                "proposed_question_text": "Should an unreviewed Question leak into suggestions?",
+            }],
+        )
+        self.assertEqual(len(merged), 2)
+        self.assertEqual({item["theme"] for item in merged}, {"Performance TV"})
+        self.assertEqual(merged[1]["review_state"], "approved_staged_mapping")
 
     def test_bakeoff_metrics_use_latest_append_only_review(self):
         items = [{
