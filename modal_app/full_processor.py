@@ -1882,6 +1882,40 @@ def normalize_directory_value(value: str | None) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
 
 
+def prepare_category_directory_record(categories, category_name):
+    """Return an existing normalized match or a safe new canonical record."""
+    canonical_name = re.sub(r"\s+", " ", str(category_name or "").strip())
+    normalized_name = normalize_directory_value(canonical_name)
+    if len(canonical_name) < 2 or len(canonical_name) > 80:
+        raise ValueError("A category name must be between 2 and 80 characters")
+    if normalized_name in {"category", "other", "unknown", "uncategorized", "n/a"}:
+        raise ValueError("Enter a specific industry category name")
+
+    existing = next(
+        (
+            item for item in categories
+            if normalize_directory_value(item.get("name")) == normalized_name
+        ),
+        None,
+    )
+    if existing:
+        return existing, False
+
+    base_id = slugify(canonical_name)
+    if not base_id or base_id == "unknown":
+        raise ValueError("Enter a category name containing letters or numbers")
+    used_ids = {str(item.get("id") or "") for item in categories}
+    category_id = base_id
+    if category_id in used_ids:
+        suffix = hashlib.sha256(normalized_name.encode()).hexdigest()[:8]
+        category_id = f"{base_id}-{suffix}"
+    return {
+        "id": category_id,
+        "name": canonical_name,
+        "description": None,
+    }, True
+
+
 def fetch_take_directories(supabase) -> dict:
     """Load the canonical category and speaker records used by public quotes."""
     categories = (
@@ -7165,13 +7199,13 @@ def fastapi_app():
         allowed_actions = {
             "approve", "reject", "edit", "approve_context",
             "reject_context", "approve_mapping", "reject_mapping", "undo",
-            "create_speaker", "verify_alignment",
+            "create_speaker", "create_category", "verify_alignment",
         }
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported review action")
         if req.action in {
             "approve", "reject", "approve_context", "reject_context",
-            "approve_mapping", "reject_mapping", "create_speaker",
+            "approve_mapping", "reject_mapping", "create_speaker", "create_category",
             "verify_alignment",
         } and not req.reviewer_expertise:
             raise HTTPException(status_code=422, detail="Reviewer expertise is required for an editorial decision")
@@ -7352,6 +7386,66 @@ def fastapi_app():
                 "speaker_title": person.get("title") or speaker_title,
                 "speaker_company": person.get("company") or speaker_company,
                 "speaker_linkedin": person.get("linkedin_url") or (req.speaker_linkedin or "").strip() or None,
+                "directory_resolution": resolution,
+            }
+            updates.update(editorial_gate_invalidations(before, updates))
+        elif req.action == "create_category":
+            category_name = str(req.category or before.get("category") or "").strip()
+            categories = (
+                supabase.table("categories")
+                .select("id,name,description")
+                .limit(2000)
+                .execute()
+            ).data or []
+            try:
+                category, should_create = prepare_category_directory_record(
+                    categories,
+                    category_name,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            if should_create:
+                try:
+                    inserted = supabase.table("categories").insert(category).execute()
+                    if inserted.data:
+                        category = inserted.data[0]
+                except Exception as exc:
+                    # A concurrent reviewer may have created the same normalized
+                    # label. Re-read once and link it instead of duplicating it.
+                    refreshed = (
+                        supabase.table("categories")
+                        .select("id,name,description")
+                        .limit(2000)
+                        .execute()
+                    ).data or []
+                    matched = next(
+                        (
+                            item for item in refreshed
+                            if normalize_directory_value(item.get("name"))
+                            == normalize_directory_value(category_name)
+                        ),
+                        None,
+                    )
+                    if not matched:
+                        raise exc
+                    category = matched
+                    should_create = False
+
+            resolution = dict(before.get("directory_resolution") or {})
+            resolution.update({
+                "category_status": "matched",
+                "category_source": (
+                    "sme_created_category_directory_record"
+                    if should_create
+                    else "sme_confirmed_existing_category_record"
+                ),
+                "category_resolved_at": utcnow_iso(),
+                "category_resolved_by": admin["id"],
+            })
+            updates = {
+                "category_id": category.get("id"),
+                "category": category.get("name"),
                 "directory_resolution": resolution,
             }
             updates.update(editorial_gate_invalidations(before, updates))

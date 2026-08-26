@@ -24,6 +24,7 @@ from modal_app.full_processor import (
     missing_take_verification_fields,
     normalize_text,
     openai_error_is_retryable,
+    prepare_category_directory_record,
     quote_word_count,
     staged_analysis_should_skip_source_retry,
     staged_analysis_write_plan,
@@ -32,6 +33,28 @@ from modal_app.full_processor import (
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_category_creation_reuses_normalized_existing_record(self):
+        existing = {"id": "measurement", "name": "Measurement", "description": None}
+        resolved, should_create = prepare_category_directory_record(
+            [existing],
+            "  measurement  ",
+        )
+        self.assertEqual(resolved, existing)
+        self.assertFalse(should_create)
+
+    def test_category_creation_builds_stable_collision_safe_record(self):
+        resolved, should_create = prepare_category_directory_record(
+            [{"id": "market-structure", "name": "Different label"}],
+            "Market Structure",
+        )
+        self.assertTrue(should_create)
+        self.assertEqual(resolved["name"], "Market Structure")
+        self.assertRegex(resolved["id"], r"^market-structure-[a-f0-9]{8}$")
+
+    def test_category_creation_rejects_placeholder_labels(self):
+        with self.assertRaisesRegex(ValueError, "specific industry category"):
+            prepare_category_directory_record([], "Other")
+
     def test_review_payload_normalizes_legacy_integer_timestamps(self):
         self.assertEqual(legacy_integer_timestamp(2154.0), 2154)
         self.assertEqual(legacy_integer_timestamp("2120.0"), 2120)
