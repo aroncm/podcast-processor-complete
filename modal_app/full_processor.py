@@ -36,7 +36,7 @@ TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v2-bounded
 EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
-MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v3"
+MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v4"
 HISTORICAL_MAPPING_PROMPT_VERSION = "adtech-historical-conversation-mapping-v1"
 EDITORIAL_RUBRIC_VERSION = "podthreads-operator-take-rubric-v2"
 MIN_QUOTE_WORDS = 20
@@ -2630,6 +2630,78 @@ def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
     return True
 
 
+def merge_verified_speaker_connections(selection, candidate):
+    """Seed editable entity suggestions from the canonical staged-take identity."""
+    merged = dict(selection or {})
+    people = [dict(item) for item in (merged.get("related_people") or [])]
+    companies = [dict(item) for item in (merged.get("related_companies") or [])]
+    candidate = candidate or {}
+    guest_id = str(candidate.get("guest_id") or "").strip()
+    speaker_name = str(candidate.get("speaker") or candidate.get("speaker_name") or "").strip()
+    speaker_title = str(candidate.get("speaker_title") or "").strip()
+    speaker_company = str(candidate.get("speaker_company") or "").strip()
+
+    # Only canonical identity is safe to seed automatically. Other people and
+    # companies remain model proposals with their own labeled evidence.
+    if not guest_id or normalize_directory_value(speaker_name) in {
+        "", "unknown", "unknown speaker", "unnamed", "unnamed speaker",
+    }:
+        merged["related_people"] = people
+        merged["related_companies"] = companies
+        return merged
+
+    person_match = next(
+        (
+            item for item in people
+            if normalize_directory_value(item.get("name"))
+            == normalize_directory_value(speaker_name)
+        ),
+        None,
+    )
+    if person_match:
+        person_match.setdefault("guest_id", guest_id)
+        person_match.setdefault("directory_id", guest_id)
+    else:
+        people.insert(0, {
+            "name": speaker_name,
+            "guest_id": guest_id,
+            "directory_id": guest_id,
+            "relationship": "Speaker in this source moment",
+            "description": " · ".join(
+                value for value in (speaker_title, speaker_company) if value
+            ),
+            "evidence_type": "speaker_identity",
+            "evidence": "Canonical speaker identity attached to the verified take record.",
+            "segment_ids": [],
+        })
+
+    if speaker_company:
+        company_match = next(
+            (
+                item for item in companies
+                if normalize_directory_value(item.get("name"))
+                == normalize_directory_value(speaker_company)
+            ),
+            None,
+        )
+        if company_match:
+            company_match.setdefault("directory_id", speaker_company)
+        else:
+            companies.insert(0, {
+                "name": speaker_company,
+                "directory_id": speaker_company,
+                "relationship": "Speaker affiliation",
+                "description": f"{speaker_name} is identified with this company in the canonical speaker record.",
+                "evidence_type": "speaker_identity",
+                "evidence": "Verified speaker affiliation attached to the curated take record.",
+                "segment_ids": [],
+            })
+
+    merged["related_people"] = people
+    merged["related_companies"] = companies
+    return merged
+
+
 TAKE_RECORD_FIELDS = {
     "quote_text", "speaker_name", "speaker_title", "speaker_company",
     "speaker_linkedin", "guest_id", "category", "category_id",
@@ -2643,6 +2715,11 @@ MAPPING_RECORD_FIELDS = {
     "proposed_people", "proposed_companies", "connection_context",
     "theme_match_action",
 }
+
+
+def directory_selection_changed(before, field, proposed_id):
+    """Ignore an unchanged canonical selection in broad edit payloads."""
+    return str(proposed_id or "") != str((before or {}).get(field) or "")
 
 
 def missing_take_verification_fields(record):
@@ -3611,6 +3688,14 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             client,
             curation_examples=curation_examples,
         )[:5]
+        ranked_quotes = [
+            bind_candidate_to_directories(
+                quote,
+                take_directory,
+                episode_people=known_episode_people,
+            )
+            for quote in ranked_quotes
+        ]
         all_quotes = contextualize_and_map_quotes(
             ranked_quotes,
             feed['name'],
@@ -4362,6 +4447,9 @@ def contextualize_and_map_quotes(
             "candidate_index": index,
             "quote": candidate.get("text"),
             "speaker": candidate.get("speaker"),
+            "speaker_title": candidate.get("speaker_title"),
+            "speaker_company": candidate.get("speaker_company"),
+            "canonical_guest_id": candidate.get("guest_id"),
             "source_segment_ids": [candidate.get("start_seg"), candidate.get("end_seg")],
             "source_excerpt": candidate.get("source_transcript_excerpt"),
             "ranking_reason": candidate.get("ranking_reason"),
@@ -4398,9 +4486,14 @@ For every selected take:
    mapping fields when evidence is too thin. Never turn a category into a theme.
 4. Put the take under one open question within the theme. Reuse an existing
    question verbatim when it is substantively the same.
-5. Add people and companies only with labeled evidence. Speaker title and company
-   must come from the transcript or episode metadata; otherwise return blank
-   strings and `unknown`.
+5. Add people and companies only with labeled evidence. When a selected take
+   includes a canonical guest ID, treat its speaker name, title, and company as
+   verified take metadata: include the speaker in `related_people` and their
+   company in `related_companies`, while keeping every field editable for SME
+   review. Other entities still require transcript, episode-metadata, or clearly
+   labeled editorial-connection evidence. Speaker title and company inferred by
+   the model must come from the transcript or episode metadata; otherwise return
+   blank strings and `unknown`.
 
 CONTROLLED THEME REGISTRY AND APPROVED GRAPH:
 {conversation_taxonomy or "No controlled themes are active. Propose cautiously or abstain."}
@@ -4423,7 +4516,10 @@ SELECTED TAKES:
     enriched = []
     for index, original in enumerate(selected_candidates):
         candidate = dict(original)
-        analysis = analyses_by_index.get(index, {})
+        analysis = merge_verified_speaker_connections(
+            analyses_by_index.get(index, {}),
+            candidate,
+        )
         start_segment = int(candidate.get("start_seg", -1))
         end_segment = int(candidate.get("end_seg", -1))
         evidence_items = analysis.get("context_evidence", [])
@@ -5232,6 +5328,7 @@ def backfill_staged_take_analysis(
         "context_drafted": 0,
         "mapping_drafted": 0,
         "mapping_abstained": 0,
+        "entity_suggestions_seeded": 0,
         "source_unavailable": 0,
         "previous_source_unavailable_skipped": 0,
         "protected_existing_work": 0,
@@ -5373,6 +5470,37 @@ def backfill_staged_take_analysis(
                     else:
                         source_reason = "The aligned source window did not contain enough bounded evidence for an AI draft."
                     flags = dict(row.get("analysis_review_flags") or {})
+                    entity_updates = {}
+                    if (
+                        plan["mapping"]
+                        and str(row.get("mapping_model") or "").strip()
+                        and str(row.get("proposed_theme_name") or "").strip()
+                        and str(row.get("proposed_question_text") or "").strip()
+                    ):
+                        seeded = merge_verified_speaker_connections({
+                            "related_people": row.get("proposed_people") or [],
+                            "related_companies": row.get("proposed_companies") or [],
+                        }, {
+                            "speaker": row.get("speaker_name"),
+                            "speaker_title": row.get("speaker_title"),
+                            "speaker_company": row.get("speaker_company"),
+                            "guest_id": row.get("guest_id"),
+                        })
+                        if (
+                            seeded["related_people"] != (row.get("proposed_people") or [])
+                            or seeded["related_companies"] != (row.get("proposed_companies") or [])
+                        ):
+                            entity_updates = {
+                                "proposed_people": seeded["related_people"],
+                                "proposed_companies": seeded["related_companies"],
+                            }
+                            counts["entity_suggestions_seeded"] += 1
+                            flags.update({
+                                "entity_suggestions_seeded": True,
+                                "entity_suggestion_source": "canonical_take_identity",
+                                "entity_suggestion_version": MAPPING_PROMPT_VERSION,
+                                "entity_suggestions_require_sme_review": True,
+                            })
                     flags.update({
                         "ai_draft_status": "source_unavailable",
                         "ai_draft_job_id": job_id,
@@ -5382,6 +5510,7 @@ def backfill_staged_take_analysis(
                         "ai_draft_reason": source_reason,
                     })
                     supabase.table("test_quotes").update({
+                        **entity_updates,
                         "analysis_review_flags": flags,
                         "updated_at": utcnow_iso(),
                     }).eq("id", quote_id).execute()
@@ -5390,6 +5519,9 @@ def backfill_staged_take_analysis(
                 candidate = {
                     "text": str(row.get("quote_text") or "").strip(),
                     "speaker": str(row.get("speaker_name") or "Unknown").strip(),
+                    "speaker_title": str(row.get("speaker_title") or "").strip(),
+                    "speaker_company": str(row.get("speaker_company") or "").strip(),
+                    "guest_id": str(row.get("guest_id") or "").strip() or None,
                     "start_seg": evidence["start_segment"],
                     "end_seg": evidence["end_segment"],
                     "source_transcript_excerpt": evidence["excerpt"],
@@ -6700,6 +6832,28 @@ def fastapi_app():
             .order("canonical_name")
             .execute()
         ).data or []
+        public_themes = (
+            supabase.table("conversation_themes")
+            .select("id,slug,name,publication_status,is_featured,featured_at")
+            .order("name")
+            .execute()
+        ).data or []
+        public_by_name = {
+            str(theme.get("name") or "").strip().casefold(): theme
+            for theme in public_themes
+            if str(theme.get("name") or "").strip()
+        }
+        for theme in themes:
+            public_theme = public_by_name.get(
+                str(theme.get("canonical_name") or "").strip().casefold()
+            ) or {}
+            theme.update({
+                "public_theme_id": public_theme.get("id"),
+                "public_theme_slug": public_theme.get("slug"),
+                "public_theme_status": public_theme.get("publication_status"),
+                "is_featured": bool(public_theme.get("is_featured")),
+                "featured_at": public_theme.get("featured_at"),
+            })
         return {"success": True, "themes": themes}
 
     @web_app.get("/editorial-taxonomy")
@@ -6839,7 +6993,7 @@ def fastapi_app():
 
     @web_app.post("/theme-registry")
     async def update_theme_registry_endpoint(req: ThemeRegistryRequest, admin=Depends(require_admin)):
-        allowed_actions = {"create", "create_and_activate", "edit", "activate", "retire", "restore"}
+        allowed_actions = {"create", "create_and_activate", "edit", "activate", "retire", "restore", "feature"}
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported theme registry action")
         if not req.reviewer_expertise:
@@ -6861,6 +7015,38 @@ def fastapi_app():
             if not current.data:
                 raise HTTPException(status_code=404, detail="Theme registry entry not found")
             before = current.data
+
+        if req.action == "feature":
+            try:
+                featured_result = supabase.rpc(
+                    "set_featured_conversation_theme",
+                    {
+                        "p_theme_registry_id": req.theme_registry_id,
+                        "p_reviewer_id": admin["id"],
+                        "p_reason": req.reason.strip(),
+                        "p_reviewer_expertise": req.reviewer_expertise,
+                    },
+                ).execute()
+            except Exception as exc:
+                message = str(exc)
+                if "Publish this theme" in message or "Only an active" in message:
+                    raise HTTPException(status_code=409, detail=message) from exc
+                raise
+            result = featured_result.data or {}
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            return {
+                "success": True,
+                "theme": {
+                    **before,
+                    "public_theme_id": result.get("public_theme_id"),
+                    "public_theme_slug": result.get("public_theme_slug"),
+                    "public_theme_status": "published",
+                    "is_featured": bool(result.get("is_featured")),
+                    "featured_at": result.get("featured_at"),
+                },
+                "decision_id": result.get("decision_id"),
+            }
 
         editable = {
             "canonical_name": req.canonical_name,
@@ -7609,7 +7795,15 @@ def fastapi_app():
                 if value is not None
             })
             resolution = dict(before.get("directory_resolution") or {})
-            if "guest_id" in req.model_fields_set:
+            guest_selection_changed = (
+                "guest_id" in req.model_fields_set
+                and directory_selection_changed(before, "guest_id", req.guest_id)
+            )
+            category_selection_changed = (
+                "category_id" in req.model_fields_set
+                and directory_selection_changed(before, "category_id", req.category_id)
+            )
+            if guest_selection_changed:
                 if req.guest_id:
                     person_result = (
                         supabase.table("guests")
@@ -7640,7 +7834,7 @@ def fastapi_app():
                         "speaker_status": "unresolved",
                         "speaker_source": "sme_cleared_directory_selection",
                     })
-            if "category_id" in req.model_fields_set:
+            if category_selection_changed:
                 if req.category_id:
                     category_result = (
                         supabase.table("categories")
@@ -7667,7 +7861,7 @@ def fastapi_app():
                         "category_status": "unresolved",
                         "category_source": "sme_cleared_directory_selection",
                     })
-            if "guest_id" in req.model_fields_set or "category_id" in req.model_fields_set:
+            if guest_selection_changed or category_selection_changed:
                 updates["directory_resolution"] = resolution
             next_start = updates.get("timestamp_start", before.get("timestamp_start"))
             next_end = updates.get("timestamp_end", before.get("timestamp_end"))
@@ -8057,6 +8251,52 @@ def trigger_staged_analysis_backfill(
 
 
 @app.function(image=image, secrets=[my_secret], timeout=3700)
+def trigger_targeted_staged_analysis(
+    quote_id: str,
+    mode: str = "regenerate_unreviewed",
+):
+    """Regenerate one unlocked draft with an explicit, durable job record."""
+    from supabase import create_client
+
+    if mode not in {"fill_missing", "regenerate_unreviewed"}:
+        raise ValueError("Unsupported staged analysis mode")
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    quote_result = (
+        supabase.table("test_quotes")
+        .select("id,approval_status")
+        .eq("id", quote_id)
+        .single()
+        .execute()
+    )
+    if not quote_result.data:
+        raise ValueError("Quote not found")
+    approval_status = quote_result.data.get("approval_status")
+    if approval_status not in {"pending", "approved"}:
+        raise ValueError("Only pending or approved staged takes can be drafted")
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-targeted-staged-analysis:{quote_id}:{uuid.uuid4()}",
+        "job_type": "staged_analysis_backfill",
+        "source": "repair",
+        "parameters": {
+            "limit": 1,
+            "quote_ids": [quote_id],
+            "approval_status": approval_status,
+            "mode": mode,
+            "operator_surface": "modal_cli_targeted",
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    result = backfill_staged_take_analysis.remote(
+        limit=1,
+        quote_ids=[quote_id],
+        approval_status=approval_status,
+        mode=mode,
+        job_id=job_id,
+    )
+    return {"job_id": job_id, **result}
+
+
+@app.function(image=image, secrets=[my_secret], timeout=3700)
 def trigger_youtube_alignment_backfill(
     alignment_scope: str = "recent_test",
     backfill_limit: int = 25,
@@ -8101,6 +8341,7 @@ def main(
     youtube_id: str = "V1M1mDyuJKM",
     alignment_scope: str = "recent_test",
     dry_run: bool = True,
+    quote_id: str = "",
 ):
     """Operator-only CLI entrypoint for audited smoke checks and bounded runs."""
     import json
@@ -8118,6 +8359,10 @@ def main(
         result = scheduled_processor.remote()
     elif action == "historical-backfill":
         result = trigger_historical_backfill.remote(backfill_limit=backfill_limit)
+    elif action == "staged-analysis-quote":
+        if not quote_id:
+            raise ValueError("quote_id is required for staged-analysis-quote")
+        result = trigger_targeted_staged_analysis.remote(quote_id=quote_id)
     elif action == "caption-check":
         result = caption_source_check.remote(youtube_id=youtube_id)
     elif action == "youtube-alignment-backfill":
@@ -8167,7 +8412,7 @@ def main(
     else:
         raise ValueError(
             "action must be health, openai-check, process, scheduled-check, "
-            "historical-backfill, caption-check, youtube-alignment-backfill, "
+            "historical-backfill, staged-analysis-quote, caption-check, youtube-alignment-backfill, "
             "or youtube-alignment-relay"
         )
 

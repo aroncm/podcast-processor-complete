@@ -17,12 +17,14 @@ from modal_app.full_processor import (
     conversation_mapping_is_reviewable,
     context_evidence_is_source_bounded,
     deduplicate_candidates,
+    directory_selection_changed,
     editorial_gate_invalidations,
     fetch_conversation_taxonomy,
     historical_mapping_is_reviewable,
     legacy_integer_timestamp,
     missing_take_verification_fields,
     merge_reviewed_question_taxonomy,
+    merge_verified_speaker_connections,
     normalize_text,
     openai_error_is_retryable,
     prepare_category_directory_record,
@@ -236,6 +238,45 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(take_edit["approval_status"], "pending")
         self.assertEqual(take_edit["context_review_status"], "unreviewed")
         self.assertEqual(take_edit["mapping_review_status"], "unreviewed")
+
+    def test_unchanged_directory_selections_do_not_create_material_edits(self):
+        before = {"guest_id": "guest-1", "category_id": "measurement"}
+        self.assertFalse(directory_selection_changed(before, "guest_id", "guest-1"))
+        self.assertFalse(directory_selection_changed(before, "category_id", "measurement"))
+        self.assertTrue(directory_selection_changed(before, "guest_id", "guest-2"))
+
+    def test_verified_speaker_and_company_seed_editable_mapping_suggestions(self):
+        merged = merge_verified_speaker_connections(
+            {"related_people": [], "related_companies": []},
+            {
+                "speaker": "Ari Paparo",
+                "speaker_title": "Co-founder and Contributor",
+                "speaker_company": "Marketecture Media",
+                "guest_id": "ari-paparo",
+            },
+        )
+        self.assertEqual(merged["related_people"][0]["name"], "Ari Paparo")
+        self.assertEqual(merged["related_people"][0]["guest_id"], "ari-paparo")
+        self.assertEqual(merged["related_people"][0]["evidence_type"], "speaker_identity")
+        self.assertEqual(merged["related_companies"][0]["name"], "Marketecture Media")
+
+    def test_verified_connection_seeding_deduplicates_model_entities(self):
+        merged = merge_verified_speaker_connections(
+            {
+                "related_people": [{
+                    "name": "Ari Paparo",
+                    "relationship": "Speaker",
+                    "description": "",
+                    "evidence_type": "speaker_identity",
+                    "evidence": "Episode identity.",
+                    "segment_ids": [],
+                }],
+                "related_companies": [],
+            },
+            {"speaker": "Ari Paparo", "guest_id": "ari-paparo"},
+        )
+        self.assertEqual(len(merged["related_people"]), 1)
+        self.assertEqual(merged["related_people"][0]["directory_id"], "ari-paparo")
 
     def test_quote_length_gate_restores_readable_legacy_range(self):
         self.assertFalse(candidate_has_publishable_length("too short"))
