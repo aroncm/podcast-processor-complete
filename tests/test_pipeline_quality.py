@@ -145,8 +145,6 @@ class PipelineQualityTests(unittest.TestCase):
             "guest_id": "operator-1",
             "speaker_title": "",
             "speaker_company": None,
-            "category": "Measurement",
-            "category_id": "measurement",
         }
         self.assertEqual(
             missing_take_verification_fields(record),
@@ -160,8 +158,6 @@ class PipelineQualityTests(unittest.TestCase):
             "guest_id": "operator-1",
             "speaker_title": "CEO",
             "speaker_company": "Signal Co",
-            "category": "Measurement",
-            "category_id": "measurement",
             "youtube_id": "video-1",
             "youtube_alignment_status": "failed",
         }
@@ -170,6 +166,16 @@ class PipelineQualityTests(unittest.TestCase):
             ["exact YouTube segment"],
         )
         record["youtube_alignment_status"] = "verified"
+        self.assertEqual(missing_take_verification_fields(record), [])
+
+    def test_take_category_is_not_an_approval_requirement(self):
+        record = {
+            "quote_text": "A complete source-grounded take.",
+            "speaker_name": "Jane Operator",
+            "guest_id": "operator-1",
+            "speaker_title": "CEO",
+            "speaker_company": "Signal Co",
+        }
         self.assertEqual(missing_take_verification_fields(record), [])
 
     def test_directory_binding_uses_only_exact_or_episode_scoped_identity(self):
@@ -239,6 +245,11 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(take_edit["context_review_status"], "unreviewed")
         self.assertEqual(take_edit["mapping_review_status"], "unreviewed")
 
+        self.assertEqual(
+            editorial_gate_invalidations(before, {"category_id": "legacy-category"}),
+            {},
+        )
+
     def test_unchanged_directory_selections_do_not_create_material_edits(self):
         before = {"guest_id": "guest-1", "category_id": "measurement"}
         self.assertFalse(directory_selection_changed(before, "guest_id", "guest-1"))
@@ -259,6 +270,8 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(merged["related_people"][0]["guest_id"], "ari-paparo")
         self.assertEqual(merged["related_people"][0]["evidence_type"], "speaker_identity")
         self.assertEqual(merged["related_companies"][0]["name"], "Marketecture Media")
+        self.assertNotIn("description", merged["related_people"][0])
+        self.assertNotIn("description", merged["related_companies"][0])
 
     def test_verified_connection_seeding_deduplicates_model_entities(self):
         merged = merge_verified_speaker_connections(
@@ -277,6 +290,7 @@ class PipelineQualityTests(unittest.TestCase):
         )
         self.assertEqual(len(merged["related_people"]), 1)
         self.assertEqual(merged["related_people"][0]["directory_id"], "ari-paparo")
+        self.assertNotIn("description", merged["related_people"][0])
 
     def test_quote_length_gate_restores_readable_legacy_range(self):
         self.assertFalse(candidate_has_publishable_length("too short"))

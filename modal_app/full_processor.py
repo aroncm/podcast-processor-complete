@@ -2633,8 +2633,19 @@ def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
 def merge_verified_speaker_connections(selection, candidate):
     """Seed editable entity suggestions from the canonical staged-take identity."""
     merged = dict(selection or {})
-    people = [dict(item) for item in (merged.get("related_people") or [])]
-    companies = [dict(item) for item in (merged.get("related_companies") or [])]
+    # ``description`` duplicated the evidence and had no controlled directory
+    # meaning. Drop it while preserving the evidence-bearing fields used by the
+    # published graph.
+    people = [
+        {key: value for key, value in dict(item).items() if key != "description"}
+        for item in (merged.get("related_people") or [])
+        if isinstance(item, dict)
+    ]
+    companies = [
+        {key: value for key, value in dict(item).items() if key != "description"}
+        for item in (merged.get("related_companies") or [])
+        if isinstance(item, dict)
+    ]
     candidate = candidate or {}
     guest_id = str(candidate.get("guest_id") or "").strip()
     speaker_name = str(candidate.get("speaker") or candidate.get("speaker_name") or "").strip()
@@ -2666,10 +2677,7 @@ def merge_verified_speaker_connections(selection, candidate):
             "name": speaker_name,
             "guest_id": guest_id,
             "directory_id": guest_id,
-            "relationship": "Speaker in this source moment",
-            "description": " · ".join(
-                value for value in (speaker_title, speaker_company) if value
-            ),
+            "relationship": "Speaker",
             "evidence_type": "speaker_identity",
             "evidence": "Canonical speaker identity attached to the verified take record.",
             "segment_ids": [],
@@ -2691,7 +2699,6 @@ def merge_verified_speaker_connections(selection, candidate):
                 "name": speaker_company,
                 "directory_id": speaker_company,
                 "relationship": "Speaker affiliation",
-                "description": f"{speaker_name} is identified with this company in the canonical speaker record.",
                 "evidence_type": "speaker_identity",
                 "evidence": "Verified speaker affiliation attached to the curated take record.",
                 "segment_ids": [],
@@ -2704,7 +2711,7 @@ def merge_verified_speaker_connections(selection, candidate):
 
 TAKE_RECORD_FIELDS = {
     "quote_text", "speaker_name", "speaker_title", "speaker_company",
-    "speaker_linkedin", "guest_id", "category", "category_id",
+    "speaker_linkedin", "guest_id",
     "directory_resolution", "podcast_name", "episode_name",
     "youtube_id", "timestamp_start", "timestamp_end", "youtube_offset",
 }
@@ -2730,8 +2737,6 @@ def missing_take_verification_fields(record):
         "guest_id": "speaker directory match",
         "speaker_title": "speaker title",
         "speaker_company": "speaker company",
-        "category": "category",
-        "category_id": "category directory match",
     }
     missing = [
         label for field, label in required.items()
@@ -3132,8 +3137,17 @@ def propose_historical_conversation_mapping(
         "type": "object",
         "properties": {
             "name": {"type": "string"},
-            "relationship": {"type": "string"},
-            "description": {"type": "string"},
+            "relationship": {
+                "type": "string",
+                "enum": [
+                    "Speaker", "Host or interviewer", "Person discussed",
+                    "Person referenced", "Speaker affiliation",
+                    "Company discussed", "Product or platform operator",
+                    "Buyer or acquirer", "Seller or current owner",
+                    "Acquisition target", "Partner or customer",
+                    "Competitor or benchmark",
+                ],
+            },
             "evidence_type": {
                 "type": "string",
                 "enum": [
@@ -3144,10 +3158,7 @@ def propose_historical_conversation_mapping(
             "evidence": {"type": "string"},
             "segment_ids": {"type": "array", "items": {"type": "integer"}},
         },
-        "required": [
-            "name", "relationship", "description", "evidence_type",
-            "evidence", "segment_ids",
-        ],
+        "required": ["name", "relationship", "evidence_type", "evidence", "segment_ids"],
         "additionalProperties": False,
     }
     schema = {
@@ -4357,8 +4368,17 @@ def contextualize_and_map_quotes(
         "type": "object",
         "properties": {
             "name": {"type": "string"},
-            "relationship": {"type": "string"},
-            "description": {"type": "string"},
+            "relationship": {
+                "type": "string",
+                "enum": [
+                    "Speaker", "Host or interviewer", "Person discussed",
+                    "Person referenced", "Speaker affiliation",
+                    "Company discussed", "Product or platform operator",
+                    "Buyer or acquirer", "Seller or current owner",
+                    "Acquisition target", "Partner or customer",
+                    "Competitor or benchmark",
+                ],
+            },
             "evidence_type": {
                 "type": "string",
                 "enum": [
@@ -4369,10 +4389,7 @@ def contextualize_and_map_quotes(
             "evidence": {"type": "string"},
             "segment_ids": {"type": "array", "items": {"type": "integer"}},
         },
-        "required": [
-            "name", "relationship", "description", "evidence_type",
-            "evidence", "segment_ids",
-        ],
+        "required": ["name", "relationship", "evidence_type", "evidence", "segment_ids"],
         "additionalProperties": False,
     }
     analysis_schema = {
@@ -4493,7 +4510,9 @@ For every selected take:
    review. Other entities still require transcript, episode-metadata, or clearly
    labeled editorial-connection evidence. Speaker title and company inferred by
    the model must come from the transcript or episode metadata; otherwise return
-   blank strings and `unknown`.
+   blank strings and `unknown`. Choose the closest controlled `relationship`
+   value from the schema and put the supporting detail only in `evidence`; do
+   not create a separate freeform description.
 
 CONTROLLED THEME REGISTRY AND APPROVED GRAPH:
 {conversation_taxonomy or "No controlled themes are active. Propose cautiously or abstain."}
@@ -7863,6 +7882,33 @@ def fastapi_app():
                     })
             if guest_selection_changed or category_selection_changed:
                 updates["directory_resolution"] = resolution
+
+            mapping_payload_present = (
+                req.action == "approve_mapping"
+                or any(field in updates for field in MAPPING_RECORD_FIELDS)
+            )
+            if mapping_payload_present:
+                seeded_connections = merge_verified_speaker_connections({
+                    "related_people": updates.get(
+                        "proposed_people", before.get("proposed_people") or [],
+                    ),
+                    "related_companies": updates.get(
+                        "proposed_companies", before.get("proposed_companies") or [],
+                    ),
+                }, {
+                    "speaker": updates.get("speaker_name", before.get("speaker_name")),
+                    "speaker_title": updates.get(
+                        "speaker_title", before.get("speaker_title"),
+                    ),
+                    "speaker_company": updates.get(
+                        "speaker_company", before.get("speaker_company"),
+                    ),
+                    "guest_id": updates.get("guest_id", before.get("guest_id")),
+                })
+                updates.update({
+                    "proposed_people": seeded_connections["related_people"],
+                    "proposed_companies": seeded_connections["related_companies"],
+                })
             next_start = updates.get("timestamp_start", before.get("timestamp_start"))
             next_end = updates.get("timestamp_end", before.get("timestamp_end"))
             if next_start is not None and next_end is not None and next_end <= next_start:
@@ -7992,8 +8038,29 @@ def fastapi_app():
                 updates["mapping_review_status"] = "rejected"
 
         updates["updated_at"] = utcnow_iso()
-        updated = supabase.table("test_quotes").update(updates).eq("id", req.quote_id).execute()
-        after = updated.data[0] if updated.data else {**before, **updates}
+        supabase.table("test_quotes").update(updates).eq("id", req.quote_id).execute()
+        persisted = (
+            supabase.table("test_quotes")
+            .select("*")
+            .eq("id", req.quote_id)
+            .single()
+            .execute()
+        )
+        if not persisted.data:
+            raise HTTPException(status_code=500, detail="Saved take could not be reloaded")
+        after = persisted.data
+        mismatched_fields = [
+            key for key, expected in updates.items()
+            if key != "updated_at" and after.get(key) != expected
+        ]
+        if mismatched_fields:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Saved take did not retain: "
+                    + ", ".join(sorted(mismatched_fields))
+                ),
+            )
         audit_metadata = {
             "before": {
                 key: before.get(key)
@@ -8018,7 +8085,28 @@ def fastapi_app():
                     "mapping_reviewed_at",
                 )
             },
-            "after": updates,
+            "after": {
+                key: after.get(key)
+                for key in (
+                    "approval_status", "quote_text", "editorial_context",
+                    "context_review_status", "speaker_name", "guest_id",
+                    "category", "category_id", "directory_resolution",
+                    "speaker_title", "speaker_company", "speaker_linkedin",
+                    "youtube_id", "podcast_name", "episode_name",
+                    "timestamp_start", "timestamp_end", "youtube_offset",
+                    "rss_timestamp_start", "rss_timestamp_end",
+                    "youtube_timestamp_start", "youtube_timestamp_end",
+                    "timestamp_source", "youtube_alignment_status",
+                    "youtube_alignment_method", "youtube_alignment_version",
+                    "youtube_alignment_details", "youtube_aligned_at",
+                    "rejection_reason", "editorial_notes", "proposed_theme_name",
+                    "proposed_theme_summary", "proposed_question_text",
+                    "proposed_question_summary", "proposed_people",
+                    "proposed_companies", "connection_context",
+                    "theme_match_action", "mapping_review_status",
+                    "mapping_reviewed_by", "mapping_reviewed_at",
+                )
+            },
             "target_decision_id": req.target_decision_id,
         }
         decision = supabase.table("curation_decisions").insert({
