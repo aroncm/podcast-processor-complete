@@ -14,6 +14,7 @@ from modal_app.full_processor import (
     call_openai_structured,
     calculate_bakeoff_metrics,
     candidate_has_publishable_length,
+    connection_context_is_substantive,
     conversation_mapping_is_reviewable,
     context_evidence_is_source_bounded,
     deduplicate_candidates,
@@ -137,6 +138,32 @@ class PipelineQualityTests(unittest.TestCase):
         locked_plan = staged_analysis_write_plan(locked, mode="regenerate_unreviewed")
         self.assertFalse(locked_plan["context"])
         self.assertFalse(locked_plan["mapping"])
+
+    def test_staged_analysis_can_regenerate_only_the_rejected_context_layer(self):
+        record = {
+            "editorial_context": "A rejected context draft.",
+            "context_review_status": "rejected",
+            "proposed_theme_name": "Performance TV",
+            "proposed_question_text": "How should television outcomes be measured?",
+            "mapping_review_status": "unreviewed",
+        }
+        context_only = staged_analysis_write_plan(
+            record,
+            mode="regenerate_unreviewed",
+            layers=["context"],
+        )
+        self.assertTrue(context_only["context"])
+        self.assertFalse(context_only["mapping"])
+
+    def test_staged_analysis_rejects_unknown_layer_names(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported staged analysis layer"):
+            staged_analysis_write_plan({}, layers=["context", "take"])
+
+    def test_concise_specific_connection_context_is_reviewable(self):
+        self.assertTrue(connection_context_is_substantive(
+            "The Instagram analogy places ChatGPT within the familiar progression from curated launch inventory to automated marketplace mechanics."
+        ))
+        self.assertFalse(connection_context_is_substantive("This Take connects to the broader industry conversation."))
 
     def test_take_approval_requires_complete_human_verified_identity(self):
         record = {

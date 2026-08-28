@@ -2630,6 +2630,12 @@ def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
     return True
 
 
+def connection_context_is_substantive(value, minimum_words=12):
+    """Accept a concise, complete connective sentence without rewarding padding."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’.-]*", str(value or ""))
+    return len(words) >= minimum_words
+
+
 def merge_verified_speaker_connections(selection, candidate):
     """Seed editable entity suggestions from the canonical staged-take identity."""
     merged = dict(selection or {})
@@ -2792,10 +2798,13 @@ def editorial_gate_invalidations(before, updates):
     return invalidations
 
 
-def staged_analysis_write_plan(record, mode="fill_missing"):
+def staged_analysis_write_plan(record, mode="fill_missing", layers=None):
     """Choose draft layers without overwriting human work or approved analysis."""
     if mode not in {"fill_missing", "regenerate_unreviewed"}:
         raise ValueError("Unsupported staged analysis mode")
+    selected_layers = set(layers or ["context", "mapping"])
+    if not selected_layers or not selected_layers.issubset({"context", "mapping"}):
+        raise ValueError("Unsupported staged analysis layer")
     record = record or {}
     context_locked = record.get("context_review_status") == "approved"
     mapping_locked = record.get("mapping_review_status") == "approved"
@@ -2811,8 +2820,8 @@ def staged_analysis_write_plan(record, mode="fill_missing"):
     )
     regenerate = mode == "regenerate_unreviewed"
     return {
-        "context": not context_locked and (regenerate or not has_context_work),
-        "mapping": not mapping_locked and (regenerate or not has_mapping_work),
+        "context": "context" in selected_layers and not context_locked and (regenerate or not has_context_work),
+        "mapping": "mapping" in selected_layers and not mapping_locked and (regenerate or not has_mapping_work),
         "context_locked": context_locked,
         "mapping_locked": mapping_locked,
         "protected_existing_work": (
@@ -5300,6 +5309,7 @@ def backfill_staged_take_analysis(
     quote_ids: list = None,
     approval_status: str = "approved",
     mode: str = "fill_missing",
+    layers: list = None,
     job_id: str = None,
 ):
     """Draft source-bounded context for staged takes without approving any layer."""
@@ -5310,6 +5320,9 @@ def backfill_staged_take_analysis(
         raise ValueError("Unsupported staged analysis mode")
     if mode == "regenerate_unreviewed" and not quote_ids:
         raise ValueError("Regeneration must target explicit take IDs")
+    selected_layers = list(dict.fromkeys(layers or ["context", "mapping"]))
+    if not selected_layers or not set(selected_layers).issubset({"context", "mapping"}):
+        raise ValueError("Unsupported staged analysis layer")
     allowed_statuses = {"pending", "approved"}
     statuses = (
         [approval_status]
@@ -5375,7 +5388,7 @@ def backfill_staged_take_analysis(
             ):
                 counts["previous_source_unavailable_skipped"] += 1
                 continue
-            plan = staged_analysis_write_plan(row, mode=mode)
+            plan = staged_analysis_write_plan(row, mode=mode, layers=selected_layers)
             if not plan["context"] and not plan["mapping"]:
                 counts["protected_existing_work"] += 1
                 continue
@@ -5565,6 +5578,7 @@ def backfill_staged_take_analysis(
                     "ai_draft_source_url": source_url,
                     "ai_draft_alignment_confidence": aligned.get("confidence"),
                     "ai_draft_mode": mode,
+                    "ai_draft_layers": selected_layers,
                 })
                 updates["analysis_review_flags"] = flags
 
@@ -5631,6 +5645,7 @@ def backfill_staged_take_analysis(
             "limit": bounded_limit,
             "approval_status": approval_status,
             "mode": mode,
+            "layers": selected_layers,
             **counts,
             "errors": errors[:20],
         }
@@ -6437,6 +6452,7 @@ def fastapi_app():
         quote_ids: list[str] | None = None
         approval_status: str = "approved"
         mode: str = "fill_missing"
+        layers: list[str] | None = None
 
     class HistoricalMappingReviewRequest(BaseModel):
         mapping_review_id: str
@@ -7015,8 +7031,6 @@ def fastapi_app():
         allowed_actions = {"create", "create_and_activate", "edit", "activate", "retire", "restore", "feature"}
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported theme registry action")
-        if not req.reviewer_expertise:
-            raise HTTPException(status_code=422, detail="Reviewer expertise is required")
         if not req.reason.strip():
             raise HTTPException(status_code=422, detail="An audit reason is required")
         supabase = service_client()
@@ -7208,6 +7222,9 @@ def fastapi_app():
                 status_code=422,
                 detail="Regeneration must target explicit take IDs",
             )
+        selected_layers = list(dict.fromkeys(req.layers or ["context", "mapping"]))
+        if not selected_layers or not set(selected_layers).issubset({"context", "mapping"}):
+            raise HTTPException(status_code=422, detail="Unsupported staged analysis layer")
         supabase = service_client()
         active_states = [
             "queued", "claimed", "downloading", "transcribing",
@@ -7242,6 +7259,7 @@ def fastapi_app():
                 "quote_ids": req.quote_ids,
                 "approval_status": req.approval_status,
                 "mode": req.mode,
+                "layers": selected_layers,
             },
         }).execute()
         job_id = inserted.data[0]["id"]
@@ -7250,6 +7268,7 @@ def fastapi_app():
             quote_ids=req.quote_ids,
             approval_status=req.approval_status,
             mode=req.mode,
+            layers=selected_layers,
             job_id=job_id,
         )
         supabase.table("processing_jobs").update({
@@ -7308,8 +7327,6 @@ def fastapi_app():
         allowed_actions = {"edit", "approve", "reject", "needs_revision", "undo"}
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported historical mapping action")
-        if req.action in {"approve", "reject", "needs_revision"} and not req.reviewer_expertise:
-            raise HTTPException(status_code=422, detail="Reviewer expertise is required")
         if req.action in {"reject", "needs_revision"} and not (
             req.reason_code or (req.reason_detail or "").strip()
         ):
@@ -7538,13 +7555,6 @@ def fastapi_app():
         }
         if req.action not in allowed_actions:
             raise HTTPException(status_code=422, detail="Unsupported review action")
-        if req.action in {
-            "approve", "reject", "approve_context", "reject_context",
-            "approve_mapping", "reject_mapping", "create_speaker", "create_category",
-            "verify_alignment",
-        } and not req.reviewer_expertise:
-            raise HTTPException(status_code=422, detail="Reviewer expertise is required for an editorial decision")
-
         supabase = service_client()
         staged_result = (
             supabase.table("test_quotes").select("*").eq("id", req.quote_id).single().execute()
@@ -8007,8 +8017,11 @@ def fastapi_app():
                         status_code=422,
                         detail="Theme, question, question summary, and connection context are required",
                     )
-                if len(str(mapping_values["connection_context"]).split()) < 20:
-                    raise HTTPException(status_code=422, detail="Connection context is too thin for SME approval")
+                if not connection_context_is_substantive(mapping_values["connection_context"]):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Connection context needs one substantive connective sentence",
+                    )
                 reviewable_mapping = {
                     "theme_name": mapping_values["theme"],
                     "theme_summary": mapping_values["theme_summary"],
