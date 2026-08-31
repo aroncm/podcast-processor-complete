@@ -20,6 +20,7 @@ from modal_app.full_processor import (
     deduplicate_candidates,
     directory_selection_changed,
     editorial_gate_invalidations,
+    estimate_openai_text_cost,
     fetch_conversation_taxonomy,
     historical_mapping_is_reviewable,
     legacy_integer_timestamp,
@@ -31,13 +32,69 @@ from modal_app.full_processor import (
     prepare_category_directory_record,
     prepare_theme_registry_record,
     quote_word_count,
+    record_openai_response_usage,
+    start_openai_usage_tracking,
     staged_analysis_should_skip_source_retry,
     staged_analysis_write_plan,
+    summarize_openai_usage,
     theme_match_is_controlled,
 )
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_openai_cost_estimate_prices_cached_and_reasoning_tokens(self):
+        # Output usage already includes reasoning tokens, so it is billed once
+        # at the output rate rather than added a second time.
+        cost = estimate_openai_text_cost(
+            "gpt-5.6-sol-2026-08-21",
+            input_tokens=1_000_000,
+            cached_input_tokens=200_000,
+            cache_write_tokens=100_000,
+            output_tokens=100_000,
+        )
+        self.assertEqual(cost, 9.76)
+
+    def test_openai_usage_summary_retains_per_call_audit_details(self):
+        start_openai_usage_tracking()
+        response = SimpleNamespace(
+            model="gpt-5.6-terra",
+            _request_id="req-cost-audit",
+            usage=SimpleNamespace(
+                input_tokens=1_000,
+                input_tokens_details=SimpleNamespace(
+                    cached_tokens=100,
+                    cache_write_tokens=0,
+                ),
+                output_tokens=200,
+                output_tokens_details=SimpleNamespace(reasoning_tokens=80),
+                total_tokens=1_200,
+            ),
+        )
+        record_openai_response_usage(response, "podthreads_quote_ranking")
+        summary = summarize_openai_usage()
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["call_count"], 1)
+        self.assertEqual(summary["reasoning_tokens"], 80)
+        self.assertEqual(summary["calls"][0]["request_id"], "req-cost-audit")
+        self.assertAlmostEqual(summary["estimated_cost_usd"], 0.00422)
+
+    def test_unknown_model_makes_episode_cost_incomplete(self):
+        start_openai_usage_tracking()
+        response = SimpleNamespace(
+            model="future-unpriced-model",
+            usage=SimpleNamespace(
+                input_tokens=100,
+                input_tokens_details={},
+                output_tokens=20,
+                output_tokens_details={},
+                total_tokens=120,
+            ),
+        )
+        record_openai_response_usage(response, "future_operation")
+        summary = summarize_openai_usage()
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["unpriced_call_count"], 1)
+
     def test_category_creation_reuses_normalized_existing_record(self):
         existing = {"id": "measurement", "name": "Measurement", "description": None}
         resolved, should_create = prepare_category_directory_record(

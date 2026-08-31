@@ -6,6 +6,7 @@ import json
 import hashlib
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 app = modal.App("podcast-processor-full")
@@ -43,6 +44,131 @@ MIN_QUOTE_WORDS = 20
 IDEAL_QUOTE_WORDS_MIN = 30
 IDEAL_QUOTE_WORDS_MAX = 50
 MAX_QUOTE_WORDS = 80
+OPENAI_COST_TRACKING_VERSION = "openai-api-pricing-2026-08-21-v1"
+
+# Standard API rates in USD per million tokens. Keep the dated tracking version
+# beside every stored estimate so a future pricing change never rewrites history.
+# Cache writes on GPT-5.6 are billed at 1.25x uncached input; cache reads use the
+# explicit cached-input rate below. Requests above 272K input tokens receive the
+# published long-context multipliers.
+OPENAI_TEXT_RATES = {
+    "gpt-5.6-sol": {"input": 4.00, "cached_input": 0.40, "output": 20.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00},
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20},
+    "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
+}
+_OPENAI_USAGE_CALLS = ContextVar("podthreads_openai_usage_calls", default=None)
+
+
+def start_openai_usage_tracking() -> None:
+    """Start an isolated request ledger for one episode-processing unit."""
+    _OPENAI_USAGE_CALLS.set([])
+
+
+def _object_value(value, key, default=0):
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def estimate_openai_text_cost(
+    model: str,
+    input_tokens: int,
+    cached_input_tokens: int,
+    cache_write_tokens: int,
+    output_tokens: int,
+):
+    """Estimate one Responses API call from its returned usage counters."""
+    normalized_model = str(model or "").lower()
+    rate_key = next(
+        (name for name in OPENAI_TEXT_RATES if normalized_model.startswith(name)),
+        None,
+    )
+    if not rate_key:
+        return None
+
+    rates = OPENAI_TEXT_RATES[rate_key]
+    input_tokens = max(0, int(input_tokens or 0))
+    cached_input_tokens = max(0, min(input_tokens, int(cached_input_tokens or 0)))
+    cache_write_tokens = max(
+        0,
+        min(input_tokens - cached_input_tokens, int(cache_write_tokens or 0)),
+    )
+    uncached_input_tokens = max(
+        0,
+        input_tokens - cached_input_tokens - cache_write_tokens,
+    )
+    output_tokens = max(0, int(output_tokens or 0))
+
+    long_context = input_tokens > 272_000
+    input_multiplier = 2.0 if long_context else 1.0
+    output_multiplier = 1.5 if long_context else 1.0
+    cost = (
+        uncached_input_tokens * rates["input"] * input_multiplier
+        + cached_input_tokens * rates["cached_input"] * input_multiplier
+        + cache_write_tokens * rates["input"] * 1.25 * input_multiplier
+        + output_tokens * rates["output"] * output_multiplier
+    ) / 1_000_000
+    return round(cost, 8)
+
+
+def record_openai_response_usage(response, operation: str) -> None:
+    """Append metered usage from a completed or billable incomplete response."""
+    calls = _OPENAI_USAGE_CALLS.get()
+    if calls is None:
+        return
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return
+    input_details = _object_value(usage, "input_tokens_details", {}) or {}
+    output_details = _object_value(usage, "output_tokens_details", {}) or {}
+    input_tokens = int(_object_value(usage, "input_tokens", 0) or 0)
+    output_tokens = int(_object_value(usage, "output_tokens", 0) or 0)
+    cached_input_tokens = int(_object_value(input_details, "cached_tokens", 0) or 0)
+    cache_write_tokens = int(_object_value(input_details, "cache_write_tokens", 0) or 0)
+    reasoning_tokens = int(_object_value(output_details, "reasoning_tokens", 0) or 0)
+    model = str(getattr(response, "model", "") or "")
+    calls.append({
+        "operation": operation,
+        "request_id": getattr(response, "_request_id", None),
+        "model": model,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": int(_object_value(usage, "total_tokens", 0) or 0),
+        "estimated_cost_usd": estimate_openai_text_cost(
+            model,
+            input_tokens,
+            cached_input_tokens,
+            cache_write_tokens,
+            output_tokens,
+        ),
+    })
+
+
+def summarize_openai_usage() -> dict:
+    calls = list(_OPENAI_USAGE_CALLS.get() or [])
+    unpriced = sum(1 for call in calls if call["estimated_cost_usd"] is None)
+    return {
+        "tracking_version": OPENAI_COST_TRACKING_VERSION,
+        "complete": unpriced == 0,
+        "call_count": len(calls),
+        "unpriced_call_count": unpriced,
+        "input_tokens": sum(call["input_tokens"] for call in calls),
+        "cached_input_tokens": sum(call["cached_input_tokens"] for call in calls),
+        "cache_write_tokens": sum(call["cache_write_tokens"] for call in calls),
+        "output_tokens": sum(call["output_tokens"] for call in calls),
+        "reasoning_tokens": sum(call["reasoning_tokens"] for call in calls),
+        "total_tokens": sum(call["total_tokens"] for call in calls),
+        "estimated_cost_usd": round(sum(
+            call["estimated_cost_usd"] or 0 for call in calls
+        ), 8),
+        "calls": calls,
+    }
 
 
 def utcnow_iso() -> str:
@@ -3260,6 +3386,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
     import subprocess
     import tempfile
     import time
+
+    start_openai_usage_tracking()
     
     # Balanced preference context from SME approvals and rejections.
     curation_examples = fetch_curation_examples(supabase)
@@ -3733,6 +3861,43 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             for quote in all_quotes
         ]
 
+        api_usage = summarize_openai_usage()
+        analysis_cost = float(api_usage["estimated_cost_usd"])
+        total_api_cost = (
+            float(processing_cost) + analysis_cost
+            if api_usage["complete"]
+            else None
+        )
+        cost_payload = {
+            "api_usage": api_usage,
+            "analysis_cost_usd": round(analysis_cost, 6),
+            "total_api_cost_usd": (
+                round(total_api_cost, 6) if total_api_cost is not None else None
+            ),
+            "cost_tracking_version": OPENAI_COST_TRACKING_VERSION,
+            "updated_at": utcnow_iso(),
+        }
+        try:
+            (
+                supabase.table("episode_processing_artifacts")
+                .update(cost_payload)
+                .eq("episode_guid", episode_guid)
+                .eq("pipeline_version", PIPELINE_VERSION)
+                .execute()
+            )
+        except Exception as exc:
+            print(f"AUDIT_WARNING API usage persistence failed: {exc}")
+        if total_api_cost is not None:
+            print(
+                f"💰 Episode API cost: ${total_api_cost:.4f} "
+                f"(${processing_cost:.4f} transcription + ${analysis_cost:.4f} analysis)"
+            )
+        else:
+            print(
+                "AUDIT_WARNING Episode API cost is partial because "
+                f"{api_usage['unpriced_call_count']} model call(s) were unpriced"
+            )
+
         update_processing_job(
             supabase,
             job_id,
@@ -3754,11 +3919,15 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         except:
             date_published = datetime.now().isoformat()
             
-        # Save to database. The UI sums cost per quote, so allocate the episode
-        # cost across its quote rows instead of repeating the full cost.
+        # Preserve the legacy per-Take compatibility field, but allocate the
+        # complete episode API cost rather than transcription alone.
         saved = []
         youtube_alignment_results = []
-        per_quote_cost = processing_cost / max(len(all_quotes), 1)
+        per_quote_cost = (
+            total_api_cost / max(len(all_quotes), 1)
+            if total_api_cost is not None
+            else processing_cost / max(len(all_quotes), 1)
+        )
         candidate_set_id = str(uuid.uuid4())
         update_processing_job(
             supabase,
@@ -3939,6 +4108,12 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             "quotes": len(saved),
             "youtube_id": youtube_id,
             "status": "success" if failed_alignments == 0 else "source_alignment_warning",
+            "api_cost": {
+                "transcription_usd": round(float(processing_cost), 6),
+                "analysis_usd": round(analysis_cost, 6),
+                "total_usd": round(total_api_cost, 6) if total_api_cost is not None else None,
+                "tracking_complete": api_usage["complete"],
+            },
             "youtube_alignment": {
                 "verified": verified_alignments,
                 "failed": failed_alignments,
@@ -4012,6 +4187,7 @@ def call_openai_structured(
                     "schema_name": schema_name,
                 },
             )
+            record_openai_response_usage(response, schema_name)
             if getattr(response, "status", None) == "incomplete":
                 details = getattr(response, "incomplete_details", None)
                 raise RuntimeError(f"OpenAI response incomplete: {details}")
