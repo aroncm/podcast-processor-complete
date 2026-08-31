@@ -5303,7 +5303,7 @@ def backfill_historical_conversation_mappings(
         raise
 
 
-@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+@app.function(image=image, secrets=[my_secret], timeout=21600, cpu=2)
 def backfill_staged_take_analysis(
     limit: int = 20,
     quote_ids: list = None,
@@ -5329,7 +5329,10 @@ def backfill_staged_take_analysis(
         if approval_status in allowed_statuses
         else sorted(allowed_statuses)
     )
-    bounded_limit = max(1, min(int(limit or 20), 50))
+    # A single audited maintenance run can snapshot the complete approved
+    # legacy backlog. Per-take failures remain isolated and are recorded in the
+    # job result, so increasing this ceiling does not weaken editorial locks.
+    bounded_limit = max(1, min(int(limit or 20), 500))
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     job_parameters = {}
@@ -6448,7 +6451,7 @@ def fastapi_app():
         quote_ids: list[str] | None = None
 
     class StagedAnalysisBackfillRequest(BaseModel):
-        limit: int = Field(default=20, ge=1, le=50)
+        limit: int = Field(default=20, ge=1, le=500)
         quote_ids: list[str] | None = None
         approval_status: str = "approved"
         mode: str = "fill_missing"
@@ -8313,7 +8316,7 @@ def trigger_historical_backfill(backfill_limit: int = 12):
     return {"job_id": job_id, **result}
 
 
-@app.function(image=image, secrets=[my_secret], timeout=3700)
+@app.function(image=image, secrets=[my_secret], timeout=300)
 def trigger_staged_analysis_backfill(
     backfill_limit: int = 20,
     approval_status: str = "approved",
@@ -8322,7 +8325,7 @@ def trigger_staged_analysis_backfill(
     """Create an auditable operator job for a bounded staged-analysis pilot."""
     from supabase import create_client
 
-    bounded_limit = max(1, min(backfill_limit, 50))
+    bounded_limit = max(1, min(backfill_limit, 500))
     if approval_status not in {"pending", "approved", "both"}:
         raise ValueError("Unsupported approval status")
     if mode not in {"fill_missing", "regenerate_unreviewed"}:
@@ -8342,13 +8345,22 @@ def trigger_staged_analysis_backfill(
         },
     }).execute()
     job_id = job.data[0]["id"]
-    result = backfill_staged_take_analysis.remote(
+    function_call = backfill_staged_take_analysis.spawn(
         limit=bounded_limit,
         approval_status=approval_status,
         mode=mode,
         job_id=job_id,
     )
-    return {"job_id": job_id, **result}
+    supabase.table("processing_jobs").update({
+        "modal_call_id": function_call.object_id,
+        "updated_at": utcnow_iso(),
+    }).eq("id", job_id).execute()
+    return {
+        "success": True,
+        "job_id": job_id,
+        "state": "queued",
+        "modal_call_id": function_call.object_id,
+    }
 
 
 @app.function(image=image, secrets=[my_secret], timeout=3700)
