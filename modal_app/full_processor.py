@@ -269,6 +269,47 @@ def update_processing_job(supabase, job_id: str | None, state: str, **fields) ->
         print(f"AUDIT_WARNING job={job_id} state={state} update_failed={exc}")
 
 
+def claim_processing_job_item(supabase, job_id, item_type, item_id):
+    """Atomically claim paid work; fail closed if its audit claim cannot be made."""
+    if not job_id:
+        return True
+    result = supabase.rpc("claim_processing_job_item", {
+        "p_processing_job_id": job_id,
+        "p_item_type": item_type,
+        "p_item_id": str(item_id),
+    }).execute()
+    return result.data is True
+
+
+def complete_processing_job_item(
+    supabase,
+    job_id,
+    item_type,
+    item_id,
+    state,
+    *,
+    result=None,
+    last_error=None,
+):
+    """Best-effort terminal ledger update; an incomplete claim still blocks duplicates."""
+    if not job_id:
+        return
+    try:
+        supabase.rpc("complete_processing_job_item", {
+            "p_processing_job_id": job_id,
+            "p_item_type": item_type,
+            "p_item_id": str(item_id),
+            "p_state": state,
+            "p_result": result or {},
+            "p_last_error": str(last_error)[:4000] if last_error else None,
+        }).execute()
+    except Exception as exc:
+        print(
+            f"AUDIT_WARNING job={job_id} item={item_type}:{item_id} "
+            f"state={state} completion_failed={exc}"
+        )
+
+
 def update_processing_job_from_env(job_id: str | None, state: str, **fields) -> None:
     if not job_id:
         return
@@ -5514,6 +5555,20 @@ def backfill_historical_conversation_mappings(
     bounded_limit = max(1, min(int(limit or 12), 50))
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    job_parameters = {}
+    if job_id:
+        job_row = (
+            supabase.table("processing_jobs")
+            .select("parameters")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+        job_parameters = dict((job_row.data or {}).get("parameters") or {})
+        if not quote_ids:
+            snapshotted_ids = job_parameters.get("target_quote_ids") or []
+            if snapshotted_ids:
+                quote_ids = [str(value) for value in snapshotted_ids]
     update_processing_job(
         supabase,
         job_id,
@@ -5530,6 +5585,7 @@ def backfill_historical_conversation_mappings(
         "abstained": 0,
         "source_unavailable": 0,
         "skipped_existing": 0,
+        "duplicate_job_items_skipped": 0,
         "retried_source_unavailable": 0,
     }
     try:
@@ -5571,6 +5627,18 @@ def backfill_historical_conversation_mappings(
             if len(candidates) >= bounded_limit:
                 break
 
+        target_quote_ids = [str(row.get("id")) for row in candidates]
+        if job_id and not job_parameters.get("target_quote_ids"):
+            job_parameters.update({
+                "target_quote_ids": target_quote_ids,
+                "target_snapshot_count": len(target_quote_ids),
+                "target_snapshotted_at": utcnow_iso(),
+            })
+            supabase.table("processing_jobs").update({
+                "parameters": job_parameters,
+                "updated_at": utcnow_iso(),
+            }).eq("id", job_id).execute()
+
         episode_ids = sorted({row.get("episode_id") for row in candidates if row.get("episode_id")})
         guest_ids = sorted({row.get("guest_id") for row in candidates if row.get("guest_id")})
         episodes = {}
@@ -5609,8 +5677,16 @@ def backfill_historical_conversation_mappings(
             os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
         )
         for index, raw_quote in enumerate(candidates):
-            counts["considered"] += 1
             quote_id = str(raw_quote["id"])
+            if not claim_processing_job_item(
+                supabase,
+                job_id,
+                "published_take",
+                quote_id,
+            ):
+                counts["duplicate_job_items_skipped"] += 1
+                continue
+            counts["considered"] += 1
             episode = episodes.get(str(raw_quote.get("episode_id")), {})
             podcast = podcasts.get(str(episode.get("podcast_id")), {})
             guest = guests.get(str(raw_quote.get("guest_id")), {})
@@ -5777,6 +5853,14 @@ def backfill_historical_conversation_mappings(
                     "updated_at": utcnow_iso(),
                 }, on_conflict="quote_id").execute()
                 counts["source_unavailable"] += 1
+                complete_processing_job_item(
+                    supabase,
+                    job_id,
+                    "published_take",
+                    quote_id,
+                    "succeeded_with_warnings",
+                    result={"disposition": "source_unavailable"},
+                )
                 continue
 
             evidence_start = aligned.get("start") if aligned else (source_start or 0)
@@ -5798,6 +5882,14 @@ def backfill_historical_conversation_mappings(
                     "updated_at": utcnow_iso(),
                 }, on_conflict="quote_id").execute()
                 counts["abstained"] += 1
+                complete_processing_job_item(
+                    supabase,
+                    job_id,
+                    "published_take",
+                    quote_id,
+                    "succeeded_with_warnings",
+                    result={"disposition": "alignment_abstained"},
+                )
                 continue
 
             mapping = propose_historical_conversation_mapping(
@@ -5845,8 +5937,24 @@ def backfill_historical_conversation_mappings(
             ).execute()
             if reviewable:
                 counts["staged_unreviewed"] += 1
+                complete_processing_job_item(
+                    supabase,
+                    job_id,
+                    "published_take",
+                    quote_id,
+                    "succeeded",
+                    result={"disposition": "mapping_drafted"},
+                )
             else:
                 counts["abstained"] += 1
+                complete_processing_job_item(
+                    supabase,
+                    job_id,
+                    "published_take",
+                    quote_id,
+                    "succeeded_with_warnings",
+                    result={"disposition": "mapping_abstained"},
+                )
 
         warning_count = counts["abstained"] + counts["source_unavailable"]
         final_state = "succeeded" if warning_count == 0 else "succeeded_with_warnings"
@@ -5917,7 +6025,7 @@ def backfill_staged_take_analysis(
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     job_parameters = {}
-    if job_id and not quote_ids:
+    if job_id:
         job_row = (
             supabase.table("processing_jobs")
             .select("parameters")
@@ -5926,9 +6034,10 @@ def backfill_staged_take_analysis(
             .execute()
         )
         job_parameters = dict((job_row.data or {}).get("parameters") or {})
-        snapshotted_ids = job_parameters.get("target_quote_ids") or []
-        if snapshotted_ids:
-            quote_ids = [str(value) for value in snapshotted_ids]
+        if not quote_ids:
+            snapshotted_ids = job_parameters.get("target_quote_ids") or []
+            if snapshotted_ids:
+                quote_ids = [str(value) for value in snapshotted_ids]
     update_processing_job(
         supabase,
         job_id,
@@ -5948,6 +6057,7 @@ def backfill_staged_take_analysis(
         "source_unavailable": 0,
         "semantic_source_candidates": 0,
         "previous_source_unavailable_skipped": 0,
+        "duplicate_job_items_skipped": 0,
         "protected_existing_work": 0,
         "failed": 0,
     }
@@ -6003,6 +6113,14 @@ def backfill_staged_take_analysis(
 
         for index, (row, plan) in enumerate(candidates):
             quote_id = str(row.get("id"))
+            if not claim_processing_job_item(
+                supabase,
+                job_id,
+                "staged_take",
+                quote_id,
+            ):
+                counts["duplicate_job_items_skipped"] += 1
+                continue
             counts["considered"] += 1
             update_processing_job(
                 supabase,
@@ -6191,6 +6309,17 @@ def backfill_staged_take_analysis(
                         "analysis_review_flags": flags,
                         "updated_at": utcnow_iso(),
                     }).eq("id", quote_id).execute()
+                    complete_processing_job_item(
+                        supabase,
+                        job_id,
+                        "staged_take",
+                        quote_id,
+                        "succeeded_with_warnings",
+                        result={
+                            "disposition": "source_unavailable",
+                            "source_issue": source_issue,
+                        },
+                    )
                     continue
 
                 candidate = {
@@ -6286,9 +6415,32 @@ def backfill_staged_take_analysis(
 
                 supabase.table("test_quotes").update(updates).eq("id", quote_id).execute()
                 counts["analyzed"] += 1
+                complete_processing_job_item(
+                    supabase,
+                    job_id,
+                    "staged_take",
+                    quote_id,
+                    "succeeded",
+                    result={
+                        "disposition": "analysis_drafted",
+                        "alignment_mode": alignment_mode,
+                        "requires_sme_source_verification": bool(
+                            aligned.get("verification_required")
+                        ),
+                    },
+                )
             except Exception as item_exc:
                 counts["failed"] += 1
                 errors.append({"quote_id": quote_id, "error": str(item_exc)[:500]})
+                complete_processing_job_item(
+                    supabase,
+                    job_id,
+                    "staged_take",
+                    quote_id,
+                    "failed",
+                    result={"disposition": "execution_failed"},
+                    last_error=item_exc,
+                )
                 print(f"⚠️ Staged analysis failed quote={quote_id}: {item_exc}")
 
         warning_count = (
@@ -9025,7 +9177,10 @@ def trigger_staged_analysis_backfill(
 
 
 @app.function(image=image, secrets=[my_secret], timeout=300)
-def trigger_staged_source_repair(backfill_limit: int = 500):
+def trigger_staged_source_repair(
+    backfill_limit: int = 500,
+    exclude_job_id: str = None,
+):
     """Retry only approved staged Takes with a recorded source-alignment issue."""
     from supabase import create_client
 
@@ -9033,18 +9188,25 @@ def trigger_staged_source_repair(backfill_limit: int = 500):
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     result = (
         supabase.table("test_quotes")
-        .select("id,approval_status,analysis_review_flags,created_at")
+        .select("*")
         .eq("approval_status", "approved")
         .order("created_at", desc=True)
         .limit(500)
         .execute()
     )
-    source_repair_ids = [
-        str(row["id"])
-        for row in (result.data or [])
-        if (row.get("analysis_review_flags") or {}).get("ai_draft_status")
-        == "source_unavailable"
-    ][:bounded_limit]
+    source_repair_ids = []
+    for row in result.data or []:
+        flags = row.get("analysis_review_flags") or {}
+        if flags.get("ai_draft_status") != "source_unavailable":
+            continue
+        if exclude_job_id and str(flags.get("ai_draft_job_id") or "") == exclude_job_id:
+            continue
+        plan = staged_analysis_write_plan(row, mode="fill_missing")
+        if not plan["context"] and not plan["mapping"]:
+            continue
+        source_repair_ids.append(str(row["id"]))
+        if len(source_repair_ids) >= bounded_limit:
+            break
     if not source_repair_ids:
         return {
             "success": True,
@@ -9066,6 +9228,7 @@ def trigger_staged_source_repair(backfill_limit: int = 500):
             "mode": "fill_missing",
             "layers": ["context", "mapping"],
             "repair_type": "source_alignment_and_analysis",
+            "excluded_prior_job_id": exclude_job_id,
             "operator_surface": "modal_cli",
         },
     }).execute()
