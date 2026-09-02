@@ -7,6 +7,7 @@ from modal_app.full_processor import (
     _parse_timedtext_captions,
     apply_transcript_corrections,
     align_timestamps_to_youtube_captions_detailed,
+    align_quote_to_segments_semantically,
     build_extraction_chunks,
     build_caption_evidence,
     align_quote_to_segments,
@@ -22,6 +23,7 @@ from modal_app.full_processor import (
     editorial_gate_invalidations,
     estimate_openai_text_cost,
     fetch_conversation_taxonomy,
+    first_numeric_value,
     historical_mapping_is_reviewable,
     legacy_integer_timestamp,
     missing_take_verification_fields,
@@ -32,6 +34,7 @@ from modal_app.full_processor import (
     prepare_category_directory_record,
     prepare_theme_registry_record,
     quote_word_count,
+    rank_source_alignment_candidates,
     record_openai_response_usage,
     start_openai_usage_tracking,
     staged_analysis_should_skip_source_retry,
@@ -603,6 +606,50 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(aligned['start'], 10)
         self.assertEqual(aligned['end'], 18)
         self.assertGreaterEqual(aligned['confidence'], 0.75)
+
+    def test_semantic_alignment_stages_a_bounded_candidate_without_verifying_it(self):
+        segments = [
+            {'start': 0, 'end': 4, 'raw_text': 'A generic introduction to the episode.'},
+            {'start': 20, 'end': 25, 'raw_text': 'The real risk is measurement becoming a procurement checklist'},
+            {'start': 25, 'end': 31, 'raw_text': 'instead of a tool for understanding whether advertising changed behavior.'},
+            {'start': 80, 'end': 85, 'raw_text': 'A separate discussion about creative teams.'},
+        ]
+
+        class Responses:
+            def create(self, **_kwargs):
+                return SimpleNamespace(
+                    status='completed',
+                    output_text=json.dumps({
+                        'supported': True,
+                        'candidate_id': 0,
+                        'match_type': 'faithful_paraphrase',
+                        'confidence': 0.91,
+                        'supporting_segment_ids': [1, 2],
+                        'reason': 'The source expresses the same measurement and behavior distinction.',
+                    }),
+                )
+
+        candidates = rank_source_alignment_candidates(
+            'The risk is turning measurement into procurement instead of learning whether advertising changes behavior.',
+            segments,
+            expected_start=18,
+            expected_end=34,
+        )
+        self.assertGreaterEqual(len(candidates), 1)
+        aligned = align_quote_to_segments_semantically(
+            'The risk is turning measurement into procurement instead of learning whether advertising changes behavior.',
+            segments,
+            expected_start=18,
+            expected_end=34,
+            client=SimpleNamespace(responses=Responses()),
+        )
+        self.assertIsNotNone(aligned)
+        self.assertTrue(aligned['verification_required'])
+        self.assertEqual(aligned['start'], 20)
+        self.assertEqual(aligned['end'], 31)
+
+    def test_first_numeric_value_preserves_zero_and_skips_invalid_values(self):
+        self.assertEqual(first_numeric_value(None, '', 'bad', 0, 12), 0)
 
     def test_youtube_alignment_uses_full_track_when_rss_edit_drift_is_large(self):
         youtube_id = "fixture-large-edit-drift"
