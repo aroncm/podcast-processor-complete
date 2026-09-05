@@ -5970,20 +5970,20 @@ def backfill_historical_conversation_mappings(
                     "source_url": source_url,
                     "source_transcript_excerpt": fallback.get("excerpt"),
                     "source_segments": fallback.get("segments", []),
-                    "workflow_status": "abstained",
+                    "workflow_status": "source_unavailable",
                     "abstention_reason": "Published quote could not be aligned to captions with sufficient confidence",
                     "mapping_model": model,
                     "mapping_prompt_version": HISTORICAL_MAPPING_PROMPT_VERSION,
                     "updated_at": utcnow_iso(),
                 }, on_conflict="quote_id").execute()
-                counts["abstained"] += 1
+                counts["source_unavailable"] += 1
                 complete_processing_job_item(
                     supabase,
                     job_id,
                     "published_take",
                     quote_id,
                     "succeeded_with_warnings",
-                    result={"disposition": "alignment_abstained"},
+                    result={"disposition": "source_unavailable"},
                 )
                 continue
 
