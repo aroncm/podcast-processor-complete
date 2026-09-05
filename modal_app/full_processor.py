@@ -39,7 +39,7 @@ EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
 MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v4"
-HISTORICAL_MAPPING_PROMPT_VERSION = "adtech-historical-conversation-mapping-v1"
+HISTORICAL_MAPPING_PROMPT_VERSION = "adtech-historical-conversation-mapping-v2"
 EDITORIAL_RUBRIC_VERSION = "podthreads-operator-take-rubric-v2"
 MIN_QUOTE_WORDS = 20
 IDEAL_QUOTE_WORDS_MIN = 30
@@ -2083,6 +2083,22 @@ def fetch_conversation_taxonomy(supabase) -> str:
             staged_rows = staged_result.data or []
         except Exception as staged_exc:
             print(f"⚠️ Approved staged Questions unavailable: {staged_exc}")
+        historical_candidates = []
+        try:
+            historical_result = (
+                supabase.table("conversation_mapping_reviews")
+                .select(
+                    "proposed_theme_name,proposed_theme_summary,"
+                    "proposed_question_text,proposed_question_summary"
+                )
+                .eq("workflow_status", "unreviewed")
+                .order("created_at", desc=True)
+                .limit(80)
+                .execute()
+            )
+            historical_candidates = historical_result.data or []
+        except Exception as historical_exc:
+            print(f"⚠️ Historical mapping candidates unavailable: {historical_exc}")
         entities_result = (
             supabase.table("conversation_entities")
             .select("entity_type,name,description")
@@ -2095,7 +2111,10 @@ def fetch_conversation_taxonomy(supabase) -> str:
         themes = themes_result.data or []
         questions = questions_result.data or []
         entities = entities_result.data or []
-        if not registry and not themes and not questions and not staged_rows and not entities:
+        if (
+            not registry and not themes and not questions and not staged_rows
+            and not historical_candidates and not entities
+        ):
             return ""
 
         reviewed_graph = {
@@ -2118,7 +2137,10 @@ def fetch_conversation_taxonomy(supabase) -> str:
                 for row in entities
             ],
         }
-        return json.dumps(reviewed_graph, ensure_ascii=False)
+        return merge_tentative_conversation_candidates(
+            json.dumps(reviewed_graph, ensure_ascii=False),
+            list(reversed(historical_candidates)),
+        )
     except Exception as exc:
         # The v2 migration may not yet be applied during a controlled rollout.
         print(f"⚠️ Conversation vocabulary unavailable: {exc}")
@@ -3604,6 +3626,58 @@ def historical_mapping_is_reviewable(mapping, start_segment, end_segment):
     return confidence >= float(os.environ.get("MIN_HISTORICAL_MAPPING_CONFIDENCE", "0.72"))
 
 
+def merge_tentative_conversation_candidates(conversation_taxonomy, candidates, limit=80):
+    """Add private mapping candidates without presenting them as approved taxonomy."""
+    try:
+        graph = json.loads(conversation_taxonomy) if conversation_taxonomy else {}
+    except (TypeError, json.JSONDecodeError):
+        graph = {}
+    if not isinstance(graph, dict):
+        graph = {}
+
+    merged = list(graph.get("tentative_historical_candidates") or [])
+    seen = {
+        (
+            str(item.get("theme") or "").strip().casefold(),
+            str(item.get("question") or "").strip().casefold(),
+        )
+        for item in merged
+    }
+    for candidate in candidates or []:
+        theme = str(
+            candidate.get("proposed_theme_name")
+            or candidate.get("theme_name")
+            or ""
+        ).strip()
+        question = str(
+            candidate.get("proposed_question_text")
+            or candidate.get("question_text")
+            or ""
+        ).strip()
+        if not theme or not question:
+            continue
+        key = (theme.casefold(), question.casefold())
+        if key in seen:
+            continue
+        merged.append({
+            "theme": theme,
+            "theme_summary": (
+                candidate.get("proposed_theme_summary")
+                or candidate.get("theme_summary")
+            ),
+            "question": question,
+            "question_summary": (
+                candidate.get("proposed_question_summary")
+                or candidate.get("question_summary")
+            ),
+            "review_state": "unreviewed_historical_candidate",
+        })
+        seen.add(key)
+
+    graph["tentative_historical_candidates"] = merged[-max(1, int(limit or 80)):]
+    return json.dumps(graph, ensure_ascii=False)
+
+
 def propose_historical_conversation_mapping(
     quote,
     source_evidence,
@@ -3697,9 +3771,13 @@ Editorial standard:
 7. Reuse an exact approved theme, question, or entity name below when the idea is
    substantively the same. Do not force a quote into Performance TV simply
    because it is the only current theme.
-8. Abstain when the source is too thin, the quote is too generic, or a defensible
+8. `tentative_historical_candidates` are private AI drafts, not approved facts.
+   Reuse the exact candidate theme and question when the underlying industry
+   conversation is substantively the same. Do not create a synonym or narrower
+   restatement of an existing candidate merely to make this take sound unique.
+9. Abstain when the source is too thin, the quote is too generic, or a defensible
    placement would require facts outside the supplied evidence.
-9. Avoid generic AI prose: no "underscores the importance", "rapidly evolving
+10. Avoid generic AI prose: no "underscores the importance", "rapidly evolving
    landscape", "game changer", "key takeaway", or "businesses must adapt".
 
 EXISTING SME-APPROVED CONVERSATION GRAPH:
@@ -5954,6 +6032,10 @@ def backfill_historical_conversation_mappings(
             ).execute()
             if reviewable:
                 counts["staged_unreviewed"] += 1
+                taxonomy = merge_tentative_conversation_candidates(
+                    taxonomy,
+                    [mapping],
+                )
                 complete_processing_job_item(
                     supabase,
                     job_id,

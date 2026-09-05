@@ -28,6 +28,7 @@ from modal_app.full_processor import (
     legacy_integer_timestamp,
     missing_take_verification_fields,
     merge_reviewed_question_taxonomy,
+    merge_tentative_conversation_candidates,
     merge_verified_speaker_connections,
     normalize_text,
     openai_error_is_account_blocking,
@@ -46,6 +47,28 @@ from modal_app.full_processor import (
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_tentative_historical_candidates_are_labeled_and_deduplicated(self):
+        taxonomy = json.dumps({"active_theme_registry": []})
+        candidate = {
+            "proposed_theme_name": "Data Control and Vertical Market Power",
+            "proposed_theme_summary": "Vertical data and workflow advantages.",
+            "proposed_question_text": "When does vertical specialization create a durable moat?",
+            "proposed_question_summary": "Scale versus specialist depth.",
+        }
+        first = merge_tentative_conversation_candidates(taxonomy, [candidate])
+        second = merge_tentative_conversation_candidates(first, [{
+            "theme_name": candidate["proposed_theme_name"],
+            "theme_summary": candidate["proposed_theme_summary"],
+            "question_text": candidate["proposed_question_text"],
+            "question_summary": candidate["proposed_question_summary"],
+        }])
+        parsed = json.loads(second)
+        self.assertEqual(len(parsed["tentative_historical_candidates"]), 1)
+        self.assertEqual(
+            parsed["tentative_historical_candidates"][0]["review_state"],
+            "unreviewed_historical_candidate",
+        )
+
     def test_openai_cost_estimate_prices_cached_and_reasoning_tokens(self):
         # Output usage already includes reasoning tokens, so it is billed once
         # at the output rate rather than added a second time.
