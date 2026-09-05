@@ -41,12 +41,36 @@ from modal_app.full_processor import (
     start_openai_usage_tracking,
     staged_analysis_should_skip_source_retry,
     staged_analysis_write_plan,
+    summarize_processing_job_item_rows,
     summarize_openai_usage,
     theme_match_is_controlled,
 )
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_processing_job_item_summary_is_retry_stable(self):
+        rows = [
+            {"state": "succeeded", "result": {"disposition": "mapping_drafted"}},
+            {"state": "succeeded", "result": {"disposition": "mapping_drafted"}},
+            {
+                "state": "succeeded_with_warnings",
+                "result": {"disposition": "source_unavailable"},
+            },
+            {
+                "state": "succeeded_with_warnings",
+                "result": {"disposition": "mapping_abstained"},
+            },
+            {"state": "claimed", "result": {}},
+        ]
+        self.assertEqual(summarize_processing_job_item_rows(rows), {
+            "total": 5,
+            "mapping_drafted": 2,
+            "mapping_abstained": 1,
+            "source_unavailable": 1,
+            "failed": 0,
+            "claimed_incomplete": 1,
+        })
+
     def test_tentative_historical_candidates_are_labeled_and_deduplicated(self):
         taxonomy = json.dumps({"active_theme_registry": []})
         candidate = {

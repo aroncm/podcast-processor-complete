@@ -310,6 +310,47 @@ def complete_processing_job_item(
         )
 
 
+def summarize_processing_job_item_rows(rows):
+    """Build retry-stable job totals from the atomic per-item ledger."""
+    summary = {
+        "total": 0,
+        "mapping_drafted": 0,
+        "mapping_abstained": 0,
+        "source_unavailable": 0,
+        "failed": 0,
+        "claimed_incomplete": 0,
+    }
+    for row in rows or []:
+        summary["total"] += 1
+        state = str(row.get("state") or "")
+        disposition = str((row.get("result") or {}).get("disposition") or "")
+        if disposition == "mapping_drafted":
+            summary["mapping_drafted"] += 1
+        elif disposition == "mapping_abstained":
+            summary["mapping_abstained"] += 1
+        elif disposition == "source_unavailable":
+            summary["source_unavailable"] += 1
+        if state == "failed":
+            summary["failed"] += 1
+        elif state == "claimed":
+            summary["claimed_incomplete"] += 1
+    return summary
+
+
+def summarize_processing_job_items(supabase, job_id, item_type):
+    if not job_id:
+        return summarize_processing_job_item_rows([])
+    result = (
+        supabase.table("processing_job_items")
+        .select("state,result")
+        .eq("processing_job_id", job_id)
+        .eq("item_type", item_type)
+        .limit(5000)
+        .execute()
+    )
+    return summarize_processing_job_item_rows(result.data or [])
+
+
 def update_processing_job_from_env(job_id: str | None, state: str, **fields) -> None:
     if not job_id:
         return
@@ -5671,6 +5712,8 @@ def backfill_historical_conversation_mappings(
         "skipped_existing": 0,
         "duplicate_job_items_skipped": 0,
         "retried_source_unavailable": 0,
+        "failed": 0,
+        "claimed_incomplete": 0,
     }
     try:
         existing_result = (
@@ -5700,9 +5743,7 @@ def backfill_historical_conversation_mappings(
         for row in rows_result.data or []:
             prior = existing.get(str(row.get("id")))
             prior_status = (prior or {}).get("workflow_status")
-            if prior_status and not (
-                prior_status == "source_unavailable" and quote_ids
-            ):
+            if prior_status and not quote_ids:
                 counts["skipped_existing"] += 1
                 continue
             if prior_status == "source_unavailable":
@@ -6055,7 +6096,26 @@ def backfill_historical_conversation_mappings(
                     result={"disposition": "mapping_abstained"},
                 )
 
-        warning_count = counts["abstained"] + counts["source_unavailable"]
+        if job_id:
+            ledger = summarize_processing_job_items(
+                supabase,
+                job_id,
+                "published_take",
+            )
+            counts.update({
+                "considered": ledger["total"],
+                "staged_unreviewed": ledger["mapping_drafted"],
+                "abstained": ledger["mapping_abstained"],
+                "source_unavailable": ledger["source_unavailable"],
+                "failed": ledger["failed"],
+                "claimed_incomplete": ledger["claimed_incomplete"],
+            })
+        warning_count = (
+            counts["abstained"]
+            + counts["source_unavailable"]
+            + counts["failed"]
+            + counts["claimed_incomplete"]
+        )
         final_state = "succeeded" if warning_count == 0 else "succeeded_with_warnings"
         result = {
             "success": warning_count == 0,
@@ -6072,7 +6132,9 @@ def backfill_historical_conversation_mappings(
             error_code="historical_mapping_incomplete" if warning_count else None,
             error_message=(
                 f"{counts['source_unavailable']} need source repair and "
-                f"{counts['abstained']} mapping drafts abstained"
+                f"{counts['abstained']} mapping drafts abstained; "
+                f"{counts['failed']} failed and "
+                f"{counts['claimed_incomplete']} ledger claims remain incomplete"
                 if warning_count else None
             ),
             completed_at=utcnow_iso(),
