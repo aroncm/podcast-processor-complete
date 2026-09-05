@@ -30,6 +30,7 @@ from modal_app.full_processor import (
     merge_reviewed_question_taxonomy,
     merge_verified_speaker_connections,
     normalize_text,
+    openai_error_is_account_blocking,
     openai_error_is_retryable,
     prepare_category_directory_record,
     prepare_theme_registry_record,
@@ -829,6 +830,8 @@ class PipelineQualityTests(unittest.TestCase):
     def test_openai_quota_errors_fail_without_retrying(self):
         quota = RuntimeError("429 insufficient_quota credit_balance_exhausted")
         transient = RuntimeError("429 rate_limit temporarily unavailable")
+        self.assertTrue(openai_error_is_account_blocking(quota))
+        self.assertFalse(openai_error_is_account_blocking(transient))
         self.assertFalse(openai_error_is_retryable(quota))
         self.assertTrue(openai_error_is_retryable(transient))
 

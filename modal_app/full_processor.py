@@ -4471,12 +4471,18 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             os.remove(temp_path)
         return {"episode": episode.title, "error": str(e)}
 
-def openai_error_is_retryable(exc: Exception) -> bool:
+def openai_error_is_account_blocking(exc: Exception) -> bool:
+    """Return true when retrying cannot succeed without an account/config change."""
     message = str(exc).lower()
-    if any(marker in message for marker in (
+    return any(marker in message for marker in (
         "insufficient_quota", "credit_balance_exhausted", "no credits remaining",
         "invalid_api_key", "authentication_error",
-    )):
+    ))
+
+
+def openai_error_is_retryable(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if openai_error_is_account_blocking(exc):
         return False
     return any(
         marker in message
@@ -5838,6 +5844,17 @@ def backfill_historical_conversation_mappings(
                     else:
                         source_failure = "No matching RSS audio enclosure"
                 except Exception as exc:
+                    if openai_error_is_account_blocking(exc):
+                        complete_processing_job_item(
+                            supabase,
+                            job_id,
+                            "published_take",
+                            quote_id,
+                            "failed",
+                            result={"disposition": "provider_account_blocked"},
+                            last_error=exc,
+                        )
+                        raise
                     source_failure = f"RSS audio fallback failed: {exc}"
                     print(f"  ⚠️  {source_failure}")
             if not captions:
