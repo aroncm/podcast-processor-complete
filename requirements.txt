@@ -1,6 +1,11 @@
-modal==0.56.0
-supabase==2.0.3
-openai>=1.0.0
-feedparser==6.0.10
+modal==1.5.3
+supabase==2.31.0
+openai==3.3.1
+feedparser==6.0.14
 pydub==0.25.1
 python-dotenv==1.0.0
+fastapi==0.141.1
+youtube-transcript-api==1.2.4
+thefuzz==0.22.1
+yt-dlp==2026.8.19
+requests==2.34.2
