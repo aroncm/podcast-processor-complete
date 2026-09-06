@@ -1404,6 +1404,7 @@ def select_youtube_alignment_rows(
     scope: str,
     limit: int,
     quote_ids: list = None,
+    include_failed: bool = True,
 ):
     """Return one bounded, deterministic set of unverified alignment targets."""
     quote_table = "quotes" if scope == "production" else "test_quotes"
@@ -1421,7 +1422,11 @@ def select_youtube_alignment_rows(
         .not_.is_("youtube_id", "null")
         .in_(
             "youtube_alignment_status",
-            ["pending", "failed", "legacy_unverified", "manual_review_required"],
+            (
+                ["pending", "failed", "legacy_unverified", "manual_review_required"]
+                if include_failed else
+                ["pending", "legacy_unverified", "manual_review_required"]
+            ),
         )
     )
     if scope == "recent_test":
@@ -1565,6 +1570,7 @@ def list_youtube_alignment_relay_targets(
         scope,
         limit,
         quote_ids=source_hold_ids,
+        include_failed=not source_hold_only,
     )
     return {
         "scope": scope,
