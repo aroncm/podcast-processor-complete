@@ -40,6 +40,9 @@ RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
 MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v4"
 HISTORICAL_MAPPING_PROMPT_VERSION = "adtech-historical-conversation-mapping-v2"
+HISTORICAL_SOURCE_REPAIR_PENDING = (
+    "Source alignment repaired; mapping retry pending"
+)
 EDITORIAL_RUBRIC_VERSION = "podthreads-operator-take-rubric-v2"
 MIN_QUOTE_WORDS = 20
 IDEAL_QUOTE_WORDS_MIN = 30
@@ -1396,7 +1399,12 @@ def align_stored_quote(supabase, row, quote_table, *, dry_run=False, processing_
     return result
 
 
-def select_youtube_alignment_rows(supabase, scope: str, limit: int):
+def select_youtube_alignment_rows(
+    supabase,
+    scope: str,
+    limit: int,
+    quote_ids: list = None,
+):
     """Return one bounded, deterministic set of unverified alignment targets."""
     quote_table = "quotes" if scope == "production" else "test_quotes"
     select_fields = (
@@ -1418,6 +1426,8 @@ def select_youtube_alignment_rows(supabase, scope: str, limit: int):
     )
     if scope == "recent_test":
         query = query.not_.is_("processing_job_id", "null")
+    if quote_ids:
+        query = query.in_("id", [str(value) for value in quote_ids])
     rows = (
         query.order("created_at", desc=True)
         .limit(max(1, min(int(limit), 250)))
@@ -1518,19 +1528,54 @@ def backfill_youtube_alignments(
 
 
 @app.function(image=image, secrets=[my_secret], timeout=300)
-def list_youtube_alignment_relay_targets(scope: str = "recent_test", limit: int = 25):
+def list_youtube_alignment_relay_targets(
+    scope: str = "recent_test",
+    limit: int = 25,
+    source_hold_only: bool = False,
+):
     """Return only IDs needed by the operator caption relay; no secrets leave Modal."""
     from supabase import create_client
 
     if scope not in {"recent_test", "all_test", "production"}:
         raise ValueError("unsupported alignment scope")
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-    quote_table, rows = select_youtube_alignment_rows(supabase, scope, limit)
+    source_hold_ids = None
+    if source_hold_only:
+        if scope != "production":
+            raise ValueError("source-hold relay targets require production scope")
+        reviews = (
+            supabase.table("conversation_mapping_reviews")
+            .select("quote_id")
+            .eq("workflow_status", "source_unavailable")
+            .limit(5000)
+            .execute()
+        ).data or []
+        source_hold_ids = [str(row["quote_id"]) for row in reviews]
+        if not source_hold_ids:
+            return {
+                "scope": scope,
+                "quote_table": "quotes",
+                "quote_ids": [],
+                "youtube_ids": [],
+                "targets": [],
+                "source_hold_only": True,
+            }
+    quote_table, rows = select_youtube_alignment_rows(
+        supabase,
+        scope,
+        limit,
+        quote_ids=source_hold_ids,
+    )
     return {
         "scope": scope,
         "quote_table": quote_table,
         "quote_ids": [str(row["id"]) for row in rows],
         "youtube_ids": sorted({str(row["youtube_id"]) for row in rows}),
+        "targets": [
+            {"quote_id": str(row["id"]), "youtube_id": str(row["youtube_id"])}
+            for row in rows
+        ],
+        "source_hold_only": source_hold_only,
     }
 
 
@@ -1568,9 +1613,13 @@ def apply_relayed_youtube_alignments(
         raise ValueError("caption bundle must contain keyed YouTube tracks")
 
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-    quote_table, candidate_rows = select_youtube_alignment_rows(supabase, scope, 250)
     requested = {str(value) for value in quote_ids}
-    rows = [row for row in candidate_rows if str(row.get("id")) in requested]
+    quote_table, rows = select_youtube_alignment_rows(
+        supabase,
+        scope,
+        max(1, len(requested)),
+        quote_ids=sorted(requested),
+    )
     if {str(row.get("id")) for row in rows} != requested:
         raise ValueError("one or more relay targets are no longer eligible")
 
@@ -1635,6 +1684,34 @@ def apply_relayed_youtube_alignments(
             dry_run=dry_run,
             processing_job_id=job_id,
         )
+        if scope == "production" and not dry_run and result.get("status") == "verified":
+            youtube_id = str(row.get("youtube_id") or "")
+            evidence = build_caption_evidence(
+                _caption_cache.get(youtube_id) or [],
+                result.get("youtube_start"),
+                result.get("youtube_end"),
+            )
+            if not evidence:
+                raise RuntimeError(
+                    f"Verified relay produced no bounded evidence for {row.get('id')}"
+                )
+            supabase.table("conversation_mapping_reviews").update({
+                "processing_job_id": job_id,
+                "source_kind": "youtube_captions",
+                "source_url": (
+                    f"https://www.youtube.com/watch?v={youtube_id}"
+                    f"&t={max(0, int(float(result['youtube_start'])))}s"
+                ),
+                "source_transcript_excerpt": evidence["excerpt"],
+                "source_start_segment": evidence["start_segment"],
+                "source_end_segment": evidence["end_segment"],
+                "source_segments": evidence["segments"],
+                "source_alignment_confidence": result.get("confidence"),
+                "abstention_reason": HISTORICAL_SOURCE_REPAIR_PENDING,
+                "updated_at": utcnow_iso(),
+            }).eq("quote_id", str(row["id"])).eq(
+                "workflow_status", "source_unavailable"
+            ).execute()
         results.append(result)
         update_processing_job(
             supabase,
@@ -3165,6 +3242,59 @@ def build_caption_evidence(captions, start_time, end_time, padding_seconds=45, m
         "start_segment": selected[0]["id"],
         "end_segment": selected[-1]["id"],
         "excerpt": "\n".join(f"[{row['id']}] {row['text']}" for row in selected),
+    }
+
+
+def repaired_historical_caption_source(review, quote):
+    """Rehydrate only operator-verified relay evidence for a mapping retry."""
+    if not review or not quote:
+        return None
+    if review.get("workflow_status") != "source_unavailable":
+        return None
+    if review.get("abstention_reason") != HISTORICAL_SOURCE_REPAIR_PENDING:
+        return None
+    if quote.get("youtube_alignment_status") not in {"verified", "manual_verified"}:
+        return None
+    raw_segments = review.get("source_segments") or []
+    if not isinstance(raw_segments, list) or not raw_segments:
+        return None
+    captions = []
+    for segment in raw_segments:
+        text = str(segment.get("text") or segment.get("raw_text") or "").strip()
+        try:
+            start = float(segment.get("start"))
+            end = float(segment.get("end"))
+        except (TypeError, ValueError):
+            return None
+        if not text or end <= start:
+            return None
+        captions.append({
+            "start": start,
+            "end": end,
+            "raw_text": text,
+            "caption_source": "verified_operator_relay",
+        })
+    start = first_numeric_value(
+        quote.get("youtube_timestamp_start"),
+        captions[0]["start"],
+    )
+    end = first_numeric_value(
+        quote.get("youtube_timestamp_end"),
+        captions[-1]["end"],
+    )
+    if start is None or end is None or end <= start:
+        return None
+    return {
+        "captions": captions,
+        "aligned": {
+            "start": float(start),
+            "end": float(end),
+            "confidence": review.get("source_alignment_confidence"),
+            "verification_required": False,
+            "search_scope": "persisted_operator_relay",
+        },
+        "source_kind": review.get("source_kind") or "youtube_captions",
+        "source_url": review.get("source_url"),
     }
 
 
@@ -5718,7 +5848,11 @@ def backfill_historical_conversation_mappings(
     try:
         existing_result = (
             supabase.table("conversation_mapping_reviews")
-            .select("quote_id,workflow_status")
+            .select(
+                "quote_id,workflow_status,abstention_reason,source_kind,source_url,"
+                "source_transcript_excerpt,source_start_segment,source_end_segment,"
+                "source_segments,source_alignment_confidence"
+            )
             .limit(5000)
             .execute()
         )
@@ -5823,6 +5957,7 @@ def backfill_historical_conversation_mappings(
                 "episode_name": episode.get("title"),
                 "podcast_name": podcast.get("name"),
             }
+            prior = existing.get(quote_id) or {}
             update_processing_job(
                 supabase,
                 job_id,
@@ -5851,16 +5986,23 @@ def backfill_historical_conversation_mappings(
             )
             if source_start is not None and (source_end is None or source_end <= source_start):
                 source_end = source_start + 30.0
-            captions = get_yt_captions(youtube_id) if youtube_id else None
+            repaired_source = repaired_historical_caption_source(prior, quote)
+            captions = (
+                repaired_source["captions"]
+                if repaired_source else (get_yt_captions(youtube_id) if youtube_id else None)
+            )
             source_url = (
                 f"https://www.youtube.com/watch?v={youtube_id}"
                 f"&t={max(0, int(source_start or 0))}s"
                 if youtube_id else None
             )
             source_kind = "youtube_captions" if youtube_id else "rss_audio_transcript"
-            aligned = None
+            aligned = repaired_source["aligned"] if repaired_source else None
             source_failure = None
-            if captions:
+            if repaired_source:
+                source_url = repaired_source.get("source_url") or source_url
+                source_kind = repaired_source.get("source_kind") or source_kind
+            elif captions:
                 aligned = align_quote_to_segments(
                     str(quote.get("text") or ""),
                     captions,
@@ -9329,6 +9471,52 @@ def trigger_historical_backfill(backfill_limit: int = 12):
     return {"job_id": job_id, **result}
 
 
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+def trigger_historical_source_mapping_retry(backfill_limit: int = 12):
+    """Retry only source holds repaired by the verified operator-caption relay."""
+    from supabase import create_client
+
+    bounded_limit = max(1, min(backfill_limit, 50))
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    repaired = (
+        supabase.table("conversation_mapping_reviews")
+        .select("quote_id")
+        .eq("workflow_status", "source_unavailable")
+        .eq("abstention_reason", HISTORICAL_SOURCE_REPAIR_PENDING)
+        .order("updated_at")
+        .limit(bounded_limit)
+        .execute()
+    ).data or []
+    quote_ids = [str(row["quote_id"]) for row in repaired]
+    if not quote_ids:
+        return {
+            "success": True,
+            "no_op": True,
+            "considered": 0,
+            "message": "No repaired historical source holds are awaiting mapping retry",
+        }
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-historical-source-remap:{uuid.uuid4()}",
+        "job_type": "historical_mapping",
+        "source": "repair",
+        "parameters": {
+            "limit": len(quote_ids),
+            "quote_ids": quote_ids,
+            "target_quote_ids": quote_ids,
+            "target_snapshot_count": len(quote_ids),
+            "target_snapshotted_at": utcnow_iso(),
+            "operator_surface": "modal_cli_historical_source_repair",
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    result = backfill_historical_conversation_mappings.remote(
+        limit=len(quote_ids),
+        quote_ids=quote_ids,
+        job_id=job_id,
+    )
+    return {"job_id": job_id, **result}
+
+
 @app.function(image=image, secrets=[my_secret], timeout=300)
 def trigger_staged_analysis_backfill(
     backfill_limit: int = 20,
@@ -9563,6 +9751,10 @@ def main(
         result = scheduled_processor.remote()
     elif action == "historical-backfill":
         result = trigger_historical_backfill.remote(backfill_limit=backfill_limit)
+    elif action == "historical-source-remap":
+        result = trigger_historical_source_mapping_retry.remote(
+            backfill_limit=backfill_limit,
+        )
     elif action == "staged-source-repair":
         result = trigger_staged_source_repair.remote(backfill_limit=backfill_limit)
     elif action == "staged-analysis-quote":
@@ -9577,13 +9769,25 @@ def main(
             backfill_limit=backfill_limit,
             dry_run=dry_run,
         )
-    elif action == "youtube-alignment-relay":
+    elif action in {"youtube-alignment-relay", "historical-source-relay"}:
         import gzip
 
+        source_hold_only = action == "historical-source-relay"
+        relay_scope = "production" if source_hold_only else alignment_scope
         targets = list_youtube_alignment_relay_targets.remote(
-            scope=alignment_scope,
+            scope=relay_scope,
             limit=backfill_limit,
+            source_hold_only=source_hold_only,
         )
+        if not targets["quote_ids"]:
+            result = {
+                "success": True,
+                "no_op": True,
+                "attempted": 0,
+                "message": "No eligible caption-relay targets remain",
+            }
+            print(json.dumps(result, indent=2, default=str))
+            return
         caption_payload = {}
         for target_youtube_id in targets["youtube_ids"]:
             captions = get_yt_captions(target_youtube_id)
@@ -9609,7 +9813,7 @@ def main(
         compressed = gzip.compress(serialized, mtime=0)
         bundle_sha256 = hashlib.sha256(compressed).hexdigest()
         result = apply_relayed_youtube_alignments.remote(
-            scope=alignment_scope,
+            scope=relay_scope,
             quote_ids=targets["quote_ids"],
             compressed_caption_bundle=compressed,
             bundle_sha256=bundle_sha256,
@@ -9618,7 +9822,8 @@ def main(
     else:
         raise ValueError(
             "action must be health, openai-check, process, scheduled-check, "
-            "historical-backfill, staged-source-repair, staged-analysis-quote, caption-check, "
+            "historical-backfill, historical-source-relay, historical-source-remap, "
+            "staged-source-repair, staged-analysis-quote, caption-check, "
             "youtube-alignment-backfill, or youtube-alignment-relay"
         )
 

@@ -25,6 +25,7 @@ from modal_app.full_processor import (
     fetch_conversation_taxonomy,
     first_numeric_value,
     historical_mapping_is_reviewable,
+    HISTORICAL_SOURCE_REPAIR_PENDING,
     legacy_integer_timestamp,
     missing_take_verification_fields,
     merge_reviewed_question_taxonomy,
@@ -36,6 +37,7 @@ from modal_app.full_processor import (
     prepare_category_directory_record,
     prepare_theme_registry_record,
     quote_word_count,
+    repaired_historical_caption_source,
     rank_source_alignment_candidates,
     record_openai_response_usage,
     start_openai_usage_tracking,
@@ -48,6 +50,36 @@ from modal_app.full_processor import (
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_repaired_historical_source_requires_verified_relay_evidence(self):
+        review = {
+            "workflow_status": "source_unavailable",
+            "abstention_reason": HISTORICAL_SOURCE_REPAIR_PENDING,
+            "source_kind": "youtube_captions",
+            "source_url": "https://www.youtube.com/watch?v=example12345&t=10s",
+            "source_alignment_confidence": 0.93,
+            "source_segments": [
+                {"start": 8.0, "end": 12.0, "text": "Source-backed words."},
+                {"start": 12.0, "end": 16.0, "text": "More source evidence."},
+            ],
+        }
+        quote = {
+            "youtube_alignment_status": "verified",
+            "youtube_timestamp_start": 9.5,
+            "youtube_timestamp_end": 15.5,
+        }
+        repaired = repaired_historical_caption_source(review, quote)
+        self.assertEqual(repaired["aligned"]["search_scope"], "persisted_operator_relay")
+        self.assertEqual(len(repaired["captions"]), 2)
+
+        self.assertIsNone(repaired_historical_caption_source(
+            {**review, "abstention_reason": "Unverified source window"},
+            quote,
+        ))
+        self.assertIsNone(repaired_historical_caption_source(
+            review,
+            {**quote, "youtube_alignment_status": "legacy_unverified"},
+        ))
+
     def test_processing_job_item_summary_is_retry_stable(self):
         rows = [
             {"state": "succeeded", "result": {"disposition": "mapping_drafted"}},
