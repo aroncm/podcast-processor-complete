@@ -9795,13 +9795,12 @@ def main(
             print(json.dumps(result, indent=2, default=str))
             return
         caption_payload = {}
+        unavailable_youtube_ids = []
         for target_youtube_id in targets["youtube_ids"]:
             captions = get_yt_captions(target_youtube_id)
             if not captions:
-                raise RuntimeError(
-                    f"Local caption acquisition failed for {target_youtube_id}; "
-                    "no database changes were made"
-                )
+                unavailable_youtube_ids.append(target_youtube_id)
+                continue
             caption_payload[target_youtube_id] = [
                 {
                     "start": row["start"],
@@ -9811,6 +9810,27 @@ def main(
                 }
                 for row in captions
             ]
+        relayed_quote_ids = [
+            target["quote_id"]
+            for target in targets["targets"]
+            if target["youtube_id"] in caption_payload
+        ]
+        skipped_quote_ids = [
+            target["quote_id"]
+            for target in targets["targets"]
+            if target["youtube_id"] in unavailable_youtube_ids
+        ]
+        if not relayed_quote_ids:
+            result = {
+                "success": False,
+                "partial_success": False,
+                "attempted": 0,
+                "local_caption_unavailable_youtube_ids": unavailable_youtube_ids,
+                "local_caption_unavailable_quote_ids": skipped_quote_ids,
+                "message": "No caption-complete relay targets were available",
+            }
+            print(json.dumps(result, indent=2, default=str))
+            return
         serialized = json.dumps(
             caption_payload,
             sort_keys=True,
@@ -9820,11 +9840,13 @@ def main(
         bundle_sha256 = hashlib.sha256(compressed).hexdigest()
         result = apply_relayed_youtube_alignments.remote(
             scope=relay_scope,
-            quote_ids=targets["quote_ids"],
+            quote_ids=relayed_quote_ids,
             compressed_caption_bundle=compressed,
             bundle_sha256=bundle_sha256,
             dry_run=dry_run,
         )
+        result["local_caption_unavailable_youtube_ids"] = unavailable_youtube_ids
+        result["local_caption_unavailable_quote_ids"] = skipped_quote_ids
     else:
         raise ValueError(
             "action must be health, openai-check, process, scheduled-check, "
