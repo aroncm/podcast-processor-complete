@@ -6028,12 +6028,30 @@ def backfill_historical_conversation_mappings(
                 )
                 continue
 
-            mapping = propose_historical_conversation_mapping(
-                quote,
-                source_evidence,
-                client,
-                conversation_taxonomy=taxonomy,
-            )
+            try:
+                mapping = propose_historical_conversation_mapping(
+                    quote,
+                    source_evidence,
+                    client,
+                    conversation_taxonomy=taxonomy,
+                )
+            except Exception as item_exc:
+                complete_processing_job_item(
+                    supabase,
+                    job_id,
+                    "published_take",
+                    quote_id,
+                    "failed",
+                    result={
+                        "disposition": (
+                            "provider_account_blocked"
+                            if openai_error_is_account_blocking(item_exc)
+                            else "execution_failed"
+                        ),
+                    },
+                    last_error=item_exc,
+                )
+                raise
             reviewable = historical_mapping_is_reviewable(
                 mapping,
                 source_evidence["start_segment"],
@@ -6141,13 +6159,34 @@ def backfill_historical_conversation_mappings(
         )
         return result
     except Exception as exc:
+        if job_id:
+            ledger = summarize_processing_job_items(
+                supabase,
+                job_id,
+                "published_take",
+            )
+            counts.update({
+                "considered": ledger["total"],
+                "staged_unreviewed": ledger["mapping_drafted"],
+                "abstained": ledger["mapping_abstained"],
+                "source_unavailable": ledger["source_unavailable"],
+                "failed": ledger["failed"],
+                "claimed_incomplete": ledger["claimed_incomplete"],
+            })
+        account_blocked = openai_error_is_account_blocking(exc)
         update_processing_job(
             supabase,
             job_id,
             "failed",
             result={"success": False, **counts},
-            error_code="historical_mapping_failed",
-            error_message=str(exc),
+            error_code=(
+                "provider_account_blocked"
+                if account_blocked else "historical_mapping_failed"
+            ),
+            error_message=(
+                "OpenAI account credits or credentials blocked this backfill."
+                if account_blocked else str(exc)[:4000]
+            ),
             completed_at=utcnow_iso(),
         )
         raise
