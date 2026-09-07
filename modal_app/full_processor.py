@@ -10063,24 +10063,11 @@ def trigger_youtube_alignment_backfill(
     return {"job_id": job_id, **result}
 
 
-def download_bounded_youtube_audio(target, padding_seconds=300):
-    """Download one bounded audio window locally after verifying video identity."""
-    import pathlib
-    import subprocess
-    import sys
-    import tempfile
+def inspect_youtube_source_identity(target):
+    """Read the live YouTube title and compare it with the stored episode."""
     import yt_dlp
 
     youtube_id = str(target.get("youtube_id") or "")
-    expected_start = target.get("expected_start")
-    expected_end = target.get("expected_end")
-    if expected_start is None or expected_end is None:
-        raise ValueError("no bounded source timestamp is available")
-    expected_start = float(expected_start)
-    expected_end = float(expected_end)
-    if expected_start < 0 or expected_end <= expected_start:
-        raise ValueError("stored source timestamps are invalid")
-
     url = f"https://www.youtube.com/watch?v={youtube_id}"
     with yt_dlp.YoutubeDL({
         "quiet": True,
@@ -10092,6 +10079,41 @@ def download_bounded_youtube_audio(target, padding_seconds=300):
     video_title = str((info or {}).get("title") or "")
     episode_title = str(target.get("episode_name") or "")
     title_check = youtube_title_matches_episode(video_title, episode_title)
+    return {
+        "quote_id": str(target.get("quote_id") or ""),
+        "youtube_id": youtube_id,
+        "episode_title": episode_title,
+        "video_title": video_title,
+        "title_match": title_check,
+        "duration": first_numeric_value((info or {}).get("duration")),
+        "has_bounded_timestamp": bool(
+            target.get("expected_start") is not None
+            and target.get("expected_end") is not None
+        ),
+    }
+
+
+def download_bounded_youtube_audio(target, padding_seconds=300):
+    """Download one bounded audio window locally after verifying video identity."""
+    import pathlib
+    import subprocess
+    import sys
+    import tempfile
+
+    youtube_id = str(target.get("youtube_id") or "")
+    expected_start = target.get("expected_start")
+    expected_end = target.get("expected_end")
+    if expected_start is None or expected_end is None:
+        raise ValueError("no bounded source timestamp is available")
+    expected_start = float(expected_start)
+    expected_end = float(expected_end)
+    if expected_start < 0 or expected_end <= expected_start:
+        raise ValueError("stored source timestamps are invalid")
+
+    identity = inspect_youtube_source_identity(target)
+    video_title = identity["video_title"]
+    episode_title = identity["episode_title"]
+    title_check = identity["title_match"]
     if not title_check["matches"]:
         raise ValueError(
             "video_title_mismatch: "
@@ -10099,7 +10121,8 @@ def download_bounded_youtube_audio(target, padding_seconds=300):
             f"score={title_check['score']}; overlap={title_check['token_overlap']}"
         )
 
-    duration = first_numeric_value((info or {}).get("duration"))
+    duration = identity["duration"]
+    url = f"https://www.youtube.com/watch?v={youtube_id}"
     clip_start = max(0.0, expected_start - float(padding_seconds))
     clip_end = expected_end + float(padding_seconds)
     if duration is not None:
@@ -10207,6 +10230,62 @@ def main(
             backfill_limit=backfill_limit,
             dry_run=dry_run,
         )
+    elif action == "historical-source-title-audit":
+        deployed_target_list = modal.Function.from_name(
+            "podcast-processor-full", "list_youtube_alignment_relay_targets"
+        )
+        targets = deployed_target_list.remote(
+            scope="production",
+            limit=max(1, min(backfill_limit, 250)),
+            source_hold_only=True,
+            quote_ids=[quote_id] if quote_id else None,
+        )
+        identity_cache = {}
+        audited = []
+        unavailable = []
+        for index, target in enumerate(targets["targets"], start=1):
+            print(
+                f"  🔎 Auditing YouTube identity {index}/{len(targets['targets'])}: "
+                f"{target['quote_id']} ({target['youtube_id']})"
+            )
+            try:
+                cached = identity_cache.get(target["youtube_id"])
+                if cached is None:
+                    cached = inspect_youtube_source_identity(target)
+                    identity_cache[target["youtube_id"]] = cached
+                identity = {
+                    **cached,
+                    "quote_id": target["quote_id"],
+                    "episode_title": target.get("episode_name") or "",
+                    "title_match": youtube_title_matches_episode(
+                        cached["video_title"], target.get("episode_name") or ""
+                    ),
+                    "has_bounded_timestamp": bool(
+                        target.get("expected_start") is not None
+                        and target.get("expected_end") is not None
+                    ),
+                }
+                audited.append(identity)
+            except Exception as exc:
+                unavailable.append({
+                    "quote_id": target["quote_id"],
+                    "youtube_id": target["youtube_id"],
+                    "reason": str(exc)[:1000],
+                })
+        matching = sum(item["title_match"]["matches"] for item in audited)
+        mismatched = sum(not item["title_match"]["matches"] for item in audited)
+        unbounded = sum(not item["has_bounded_timestamp"] for item in audited)
+        result = {
+            "success": not unavailable,
+            "selected": len(targets["targets"]),
+            "unique_youtube_ids": len(identity_cache),
+            "title_matching": matching,
+            "title_mismatched": mismatched,
+            "unbounded_timestamp": unbounded,
+            "unavailable": len(unavailable),
+            "items": audited,
+            "unavailable_items": unavailable,
+        }
     elif action == "historical-source-audio-relay":
         deployed_target_list = modal.Function.from_name(
             "podcast-processor-full", "list_youtube_alignment_relay_targets"
@@ -10341,7 +10420,8 @@ def main(
     else:
         raise ValueError(
             "action must be health, openai-check, process, scheduled-check, "
-            "historical-backfill, historical-source-relay, historical-source-audio-relay, "
+            "historical-backfill, historical-source-relay, historical-source-title-audit, "
+            "historical-source-audio-relay, "
             "historical-source-remap, "
             "staged-source-repair, staged-analysis-quote, caption-check, "
             "youtube-alignment-backfill, or youtube-alignment-relay"
