@@ -2000,6 +2000,19 @@ def apply_relayed_youtube_audio_alignment(
             dry_run=dry_run,
             processing_job_id=job_id,
         )
+        diagnostic_candidates = []
+        if result.get("status") != "verified":
+            diagnostic_candidates = rank_source_alignment_candidates(
+                str(quote.get("text") or ""),
+                processed,
+                first_numeric_value(
+                    quote.get("rss_timestamp_start"), quote.get("timestamp_start"), 0
+                ),
+                first_numeric_value(
+                    quote.get("rss_timestamp_end"), quote.get("timestamp_end"), 30
+                ),
+                max_candidates=3,
+            )
         evidence = None
         if result.get("status") == "verified":
             evidence = build_caption_evidence(
@@ -2041,6 +2054,7 @@ def apply_relayed_youtube_audio_alignment(
             "transcription_model": transcription_model,
             "transcript_events": len(processed),
             "matched_excerpt": evidence.get("excerpt") if evidence else None,
+            "diagnostic_candidates": diagnostic_candidates,
             **result,
         }
         verified = result.get("status") == "verified"
@@ -10049,7 +10063,7 @@ def trigger_youtube_alignment_backfill(
     return {"job_id": job_id, **result}
 
 
-def download_bounded_youtube_audio(target, padding_seconds=180):
+def download_bounded_youtube_audio(target, padding_seconds=300):
     """Download one bounded audio window locally after verifying video identity."""
     import pathlib
     import subprocess
