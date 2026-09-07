@@ -10208,7 +10208,13 @@ def main(
             dry_run=dry_run,
         )
     elif action == "historical-source-audio-relay":
-        targets = list_youtube_alignment_relay_targets.remote(
+        deployed_target_list = modal.Function.from_name(
+            "podcast-processor-full", "list_youtube_alignment_relay_targets"
+        )
+        deployed_audio_relay = modal.Function.from_name(
+            "podcast-processor-full", "apply_relayed_youtube_audio_alignment"
+        )
+        targets = deployed_target_list.remote(
             scope="production",
             limit=max(1, min(backfill_limit, 25)),
             source_hold_only=True,
@@ -10227,7 +10233,7 @@ def main(
                     f"  ✅ Video identity passed; relaying {clip['clip_start']:.1f}s–"
                     f"{clip['clip_end']:.1f}s ({clip['audio_size_bytes']} bytes)"
                 )
-                relay_result = apply_relayed_youtube_audio_alignment.remote(
+                relay_result = deployed_audio_relay.remote(
                     quote_id=target["quote_id"],
                     youtube_id=target["youtube_id"],
                     episode_title=clip["episode_title"],
