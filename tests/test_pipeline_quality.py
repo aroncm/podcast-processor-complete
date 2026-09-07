@@ -46,10 +46,24 @@ from modal_app.full_processor import (
     summarize_processing_job_item_rows,
     summarize_openai_usage,
     theme_match_is_controlled,
+    youtube_title_matches_episode,
 )
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_youtube_audio_relay_requires_episode_title_identity(self):
+        matching = youtube_title_matches_episode(
+            "Ep. 100 The Future of Ad Tech & Agencies: AI, Giving Back, Walled Gardens",
+            "Ep. 100 The Future of Ad Tech & Agencies: AI, Giving Back, Walled Gardens & People-First Innovation",
+        )
+        self.assertTrue(matching["matches"])
+
+        mismatched = youtube_title_matches_episode(
+            "The Dumbest Business Idea in History",
+            "Creating Shareholder Value with Marpipe CEO Dan Pantelo",
+        )
+        self.assertFalse(mismatched["matches"])
+
     def test_repaired_historical_source_requires_verified_relay_evidence(self):
         review = {
             "workflow_status": "source_unavailable",

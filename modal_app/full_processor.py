@@ -1229,12 +1229,17 @@ def align_timestamps_to_youtube_captions_detailed(
         f"{final_start}s–{final_end}s (conf={confidence:.3f}, "
         f"source={caption_source}, drift={details['start_drift_seconds']:+.1f}s)"
     )
+    method = (
+        "youtube_audio_transcript_match"
+        if str(caption_source).startswith("youtube_audio_")
+        else "youtube_caption_text_match"
+    )
     return {
         "status": "verified",
         "start": final_start,
         "end": final_end,
         "confidence": confidence,
-        "method": "youtube_caption_text_match",
+        "method": method,
         "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
         "details": details,
     }
@@ -1409,7 +1414,7 @@ def select_youtube_alignment_rows(
     """Return one bounded, deterministic set of unverified alignment targets."""
     quote_table = "quotes" if scope == "production" else "test_quotes"
     select_fields = (
-        "id,text,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
+        "id,text,episode_id,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
         "rss_timestamp_end,youtube_alignment_status,created_at"
         if quote_table == "quotes" else
         "id,quote_text,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
@@ -1537,6 +1542,7 @@ def list_youtube_alignment_relay_targets(
     scope: str = "recent_test",
     limit: int = 25,
     source_hold_only: bool = False,
+    quote_ids: list = None,
 ):
     """Return only IDs needed by the operator caption relay; no secrets leave Modal."""
     from supabase import create_client
@@ -1565,23 +1571,91 @@ def list_youtube_alignment_relay_targets(
                 "targets": [],
                 "source_hold_only": True,
             }
+    quote_filter_supplied = quote_ids is not None
+    selected_ids = [str(value) for value in (quote_ids or []) if str(value).strip()]
+    if selected_ids and source_hold_ids is not None:
+        source_hold_set = set(source_hold_ids)
+        selected_ids = [value for value in selected_ids if value in source_hold_set]
+    if quote_filter_supplied and not selected_ids:
+        return {
+            "scope": scope,
+            "quote_table": "quotes" if scope == "production" else "test_quotes",
+            "quote_ids": [],
+            "youtube_ids": [],
+            "targets": [],
+            "source_hold_only": source_hold_only,
+        }
     quote_table, rows = select_youtube_alignment_rows(
         supabase,
         scope,
         limit,
-        quote_ids=source_hold_ids,
+        quote_ids=(selected_ids if quote_filter_supplied else source_hold_ids),
         include_failed=not source_hold_only,
     )
+    episode_titles = {}
+    if quote_table == "quotes":
+        episode_ids = sorted({
+            str(row.get("episode_id"))
+            for row in rows
+            if row.get("episode_id") is not None
+        })
+        if episode_ids:
+            episode_rows = (
+                supabase.table("episodes")
+                .select("id,title")
+                .in_("id", episode_ids)
+                .execute()
+            ).data or []
+            episode_titles = {
+                str(row["id"]): str(row.get("title") or "")
+                for row in episode_rows
+            }
     return {
         "scope": scope,
         "quote_table": quote_table,
         "quote_ids": [str(row["id"]) for row in rows],
         "youtube_ids": sorted({str(row["youtube_id"]) for row in rows}),
         "targets": [
-            {"quote_id": str(row["id"]), "youtube_id": str(row["youtube_id"])}
+            {
+                "quote_id": str(row["id"]),
+                "youtube_id": str(row["youtube_id"]),
+                "episode_id": str(row.get("episode_id") or ""),
+                "episode_name": episode_titles.get(str(row.get("episode_id") or ""), ""),
+                "expected_start": first_numeric_value(
+                    row.get("rss_timestamp_start"), row.get("timestamp_start")
+                ),
+                "expected_end": first_numeric_value(
+                    row.get("rss_timestamp_end"), row.get("timestamp_end")
+                ),
+            }
             for row in rows
         ],
         "source_hold_only": source_hold_only,
+    }
+
+
+def youtube_title_matches_episode(video_title, episode_title):
+    """Require a strong title identity before trusting relayed YouTube audio."""
+    from difflib import SequenceMatcher
+
+    normalized_video = normalize_text(video_title or "")
+    normalized_episode = normalize_text(episode_title or "")
+    if not normalized_video or not normalized_episode:
+        return {"matches": False, "score": 0.0, "token_overlap": 0.0}
+    score = SequenceMatcher(None, normalized_video, normalized_episode).ratio()
+    ignored = {
+        "a", "an", "and", "episode", "ep", "in", "of", "on", "the", "to", "with",
+    }
+    video_tokens = {token for token in normalized_video.split() if token not in ignored}
+    episode_tokens = {token for token in normalized_episode.split() if token not in ignored}
+    token_overlap = (
+        len(video_tokens & episode_tokens) / max(1, len(episode_tokens))
+    )
+    matches = bool(score >= 0.72 or (score >= 0.60 and token_overlap >= 0.72))
+    return {
+        "matches": matches,
+        "score": round(score, 4),
+        "token_overlap": round(token_overlap, 4),
     }
 
 
@@ -1692,6 +1766,11 @@ def apply_relayed_youtube_alignments(
         )
         if scope == "production" and not dry_run and result.get("status") == "verified":
             youtube_id = str(row.get("youtube_id") or "")
+            relay_source = str(
+                ((_caption_cache.get(youtube_id) or [{}])[0]).get(
+                    "caption_source", "youtube_unknown"
+                )
+            )
             evidence = build_caption_evidence(
                 _caption_cache.get(youtube_id) or [],
                 result.get("youtube_start"),
@@ -1703,7 +1782,11 @@ def apply_relayed_youtube_alignments(
                 )
             supabase.table("conversation_mapping_reviews").update({
                 "processing_job_id": job_id,
-                "source_kind": "youtube_captions",
+                "source_kind": (
+                    "youtube_audio_transcript"
+                    if relay_source.startswith("youtube_audio_")
+                    else "youtube_captions"
+                ),
                 "source_url": (
                     f"https://www.youtube.com/watch?v={youtube_id}"
                     f"&t={max(0, int(float(result['youtube_start'])))}s"
@@ -1764,6 +1847,242 @@ def apply_relayed_youtube_alignments(
         completed_at=utcnow_iso(),
     )
     return {"job_id": job_id, **final}
+
+
+@app.function(image=image, secrets=[my_secret], timeout=900, cpu=2)
+def apply_relayed_youtube_audio_alignment(
+    quote_id: str,
+    youtube_id: str,
+    episode_title: str,
+    video_title: str,
+    clip_start: float,
+    clip_end: float,
+    audio_bytes: bytes,
+    audio_sha256: str,
+    dry_run: bool = True,
+):
+    """Transcribe one bounded operator-relayed YouTube clip and gate exact alignment."""
+    import tempfile
+    from openai import OpenAI
+    from supabase import create_client
+
+    quote_id = str(quote_id or "").strip()
+    youtube_id = str(youtube_id or "").strip()
+    if not quote_id or not re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_id):
+        raise ValueError("a valid quote ID and YouTube ID are required")
+    clip_start = float(clip_start)
+    clip_end = float(clip_end)
+    if clip_start < 0 or clip_end <= clip_start or clip_end - clip_start > 900:
+        raise ValueError("relayed audio window must be between 0 and 900 seconds")
+    if not audio_bytes or len(audio_bytes) > 15_000_000:
+        raise ValueError("relayed audio must be between 1 byte and 15 MB")
+    if hashlib.sha256(audio_bytes).hexdigest() != str(audio_sha256):
+        raise ValueError("relayed audio digest mismatch")
+
+    title_check = youtube_title_matches_episode(video_title, episode_title)
+    if not title_check["matches"]:
+        raise ValueError("YouTube video title does not match the stored episode")
+
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    quote_table, rows = select_youtube_alignment_rows(
+        supabase,
+        "production",
+        1,
+        quote_ids=[quote_id],
+        include_failed=True,
+    )
+    if len(rows) != 1 or str(rows[0].get("youtube_id") or "") != youtube_id:
+        raise ValueError("the relayed audio target is no longer eligible")
+    quote = rows[0]
+    stored_episode = (
+        supabase.table("episodes")
+        .select("id,title")
+        .eq("id", str(quote.get("episode_id") or ""))
+        .limit(1)
+        .execute()
+    ).data or []
+    authoritative_episode_title = str(
+        (stored_episode[0] if stored_episode else {}).get("title") or ""
+    )
+    authoritative_title_check = youtube_title_matches_episode(
+        video_title,
+        authoritative_episode_title,
+    )
+    if not authoritative_title_check["matches"]:
+        raise ValueError("YouTube video title failed the authoritative episode identity gate")
+    review = (
+        supabase.table("conversation_mapping_reviews")
+        .select("quote_id,workflow_status,abstention_reason")
+        .eq("quote_id", quote_id)
+        .eq("workflow_status", "source_unavailable")
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(review) != 1:
+        raise ValueError("the quote is not an active historical source hold")
+
+    transcription_model = os.environ.get(
+        "OPENAI_WINDOW_TRANSCRIPTION_MODEL", "whisper-1"
+    )
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": (
+            f"operator-youtube-audio-relay:{quote_id}:{audio_sha256}:"
+            f"{'dry' if dry_run else 'live'}:{uuid.uuid4()}"
+        ),
+        "job_type": "data_repair",
+        "source": "repair",
+        "parameters": {
+            "repair_type": "exact_youtube_audio_source_alignment",
+            "quote_id": quote_id,
+            "youtube_id": youtube_id,
+            "episode_title": authoritative_episode_title,
+            "video_title": video_title,
+            "title_match": authoritative_title_check,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
+            "audio_sha256": audio_sha256,
+            "audio_bytes": len(audio_bytes),
+            "dry_run": dry_run,
+            "operator_surface": "modal_local_youtube_audio_relay",
+            "transcription_model": transcription_model,
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        started_at=utcnow_iso(),
+        progress={"phase": "transcribing_youtube_audio", "current": 0, "total": 1},
+    )
+
+    audio_path = None
+    try:
+        temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        audio_path = temp_audio.name
+        temp_audio.write(audio_bytes)
+        temp_audio.close()
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        with open(audio_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model=transcription_model,
+                file=audio_file,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+        processed = []
+        for segment in getattr(transcript, "segments", None) or []:
+            if isinstance(segment, dict):
+                text = segment.get("text", "")
+                start = float(segment.get("start", 0))
+                end = float(segment.get("end", start))
+            else:
+                text = getattr(segment, "text", "")
+                start = float(getattr(segment, "start", 0))
+                end = float(getattr(segment, "end", start))
+            parsed = _caption_event(
+                text,
+                clip_start + start,
+                clip_start + end,
+                "youtube_audio_whisper_operator_relay",
+            )
+            if parsed:
+                parsed["audio_sha256"] = audio_sha256
+                processed.append(parsed)
+        if not processed:
+            raise RuntimeError("YouTube audio transcription returned no timed segments")
+        _caption_cache[youtube_id] = processed
+        result = align_stored_quote(
+            supabase,
+            quote,
+            quote_table,
+            dry_run=dry_run,
+            processing_job_id=job_id,
+        )
+        evidence = None
+        if result.get("status") == "verified":
+            evidence = build_caption_evidence(
+                processed,
+                result.get("youtube_start"),
+                result.get("youtube_end"),
+            )
+            if not evidence:
+                raise RuntimeError("verified audio relay produced no bounded evidence")
+            if not dry_run:
+                supabase.table("conversation_mapping_reviews").update({
+                    "processing_job_id": job_id,
+                    "source_kind": "youtube_audio_transcript",
+                    "source_url": (
+                        f"https://www.youtube.com/watch?v={youtube_id}"
+                        f"&t={max(0, int(float(result['youtube_start'])))}s"
+                    ),
+                    "source_transcript_excerpt": evidence["excerpt"],
+                    "source_start_segment": evidence["start_segment"],
+                    "source_end_segment": evidence["end_segment"],
+                    "source_segments": evidence["segments"],
+                    "source_alignment_confidence": result.get("confidence"),
+                    "abstention_reason": HISTORICAL_SOURCE_REPAIR_PENDING,
+                    "updated_at": utcnow_iso(),
+                }).eq("quote_id", quote_id).eq(
+                    "workflow_status", "source_unavailable"
+                ).execute()
+        final = {
+            "success": result.get("status") == "verified",
+            "partial_success": False,
+            "dry_run": dry_run,
+            "quote_id": quote_id,
+            "youtube_id": youtube_id,
+            "episode_title": authoritative_episode_title,
+            "video_title": video_title,
+            "title_match": authoritative_title_check,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
+            "transcription_model": transcription_model,
+            "transcript_events": len(processed),
+            "matched_excerpt": evidence.get("excerpt") if evidence else None,
+            **result,
+        }
+        verified = result.get("status") == "verified"
+        update_processing_job(
+            supabase,
+            job_id,
+            "succeeded" if verified else "succeeded_with_warnings",
+            result=final,
+            progress={
+                "phase": "youtube_audio_alignment_complete",
+                "current": 1,
+                "total": 1,
+                "verified": int(verified),
+                "failed": int(not verified),
+                "dry_run": dry_run,
+            },
+            error_code=None if verified else "youtube_audio_alignment_incomplete",
+            error_message=None if verified else "strict quote-to-audio alignment did not pass",
+            completed_at=utcnow_iso(),
+        )
+        return {"job_id": job_id, **final}
+    except Exception as exc:
+        update_processing_job(
+            supabase,
+            job_id,
+            "failed",
+            result={"success": False, "quote_id": quote_id, "youtube_id": youtube_id},
+            error_code=(
+                "provider_account_blocked"
+                if openai_error_is_account_blocking(exc)
+                else "youtube_audio_relay_failed"
+            ),
+            error_message=str(exc)[:1000],
+            completed_at=utcnow_iso(),
+        )
+        raise
+    finally:
+        if audio_path:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
 
 @app.function(image=image, secrets=[my_secret], timeout=300)
@@ -9730,6 +10049,105 @@ def trigger_youtube_alignment_backfill(
     return {"job_id": job_id, **result}
 
 
+def download_bounded_youtube_audio(target, padding_seconds=180):
+    """Download one bounded audio window locally after verifying video identity."""
+    import pathlib
+    import subprocess
+    import sys
+    import tempfile
+    import yt_dlp
+
+    youtube_id = str(target.get("youtube_id") or "")
+    expected_start = target.get("expected_start")
+    expected_end = target.get("expected_end")
+    if expected_start is None or expected_end is None:
+        raise ValueError("no bounded source timestamp is available")
+    expected_start = float(expected_start)
+    expected_end = float(expected_end)
+    if expected_start < 0 or expected_end <= expected_start:
+        raise ValueError("stored source timestamps are invalid")
+
+    url = f"https://www.youtube.com/watch?v={youtube_id}"
+    with yt_dlp.YoutubeDL({
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }) as ydl:
+        info = ydl.extract_info(url, download=False)
+    video_title = str((info or {}).get("title") or "")
+    episode_title = str(target.get("episode_name") or "")
+    title_check = youtube_title_matches_episode(video_title, episode_title)
+    if not title_check["matches"]:
+        raise ValueError(
+            "video_title_mismatch: "
+            f"stored={episode_title[:180]!r}; youtube={video_title[:180]!r}; "
+            f"score={title_check['score']}; overlap={title_check['token_overlap']}"
+        )
+
+    duration = first_numeric_value((info or {}).get("duration"))
+    clip_start = max(0.0, expected_start - float(padding_seconds))
+    clip_end = expected_end + float(padding_seconds)
+    if duration is not None:
+        clip_end = min(float(duration), clip_end)
+    if clip_end <= clip_start:
+        raise ValueError("bounded YouTube audio window is empty")
+    if clip_end - clip_start > 600:
+        midpoint = (expected_start + expected_end) / 2
+        clip_start = max(0.0, midpoint - 300)
+        clip_end = midpoint + 300
+        if duration is not None:
+            clip_end = min(float(duration), clip_end)
+
+    yt_dlp_executable = pathlib.Path(sys.executable).with_name("yt-dlp")
+    if not yt_dlp_executable.exists():
+        raise RuntimeError("yt-dlp executable is unavailable beside the Modal CLI runtime")
+    with tempfile.TemporaryDirectory(prefix="podthreads-youtube-audio-") as temp_dir:
+        output_template = str(pathlib.Path(temp_dir) / "clip.%(ext)s")
+        command = [
+            str(yt_dlp_executable),
+            "--no-playlist",
+            "--no-warnings",
+            "-f", "ba",
+            "--download-sections", f"*{clip_start:.3f}-{clip_end:.3f}",
+            "--force-keyframes-at-cuts",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "--audio-quality", "7",
+            "-o", output_template,
+            url,
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"bounded YouTube audio download failed: {completed.stderr[-1200:]}"
+            )
+        candidates = [
+            path for path in pathlib.Path(temp_dir).iterdir()
+            if path.is_file() and not path.name.endswith(".part")
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError("bounded YouTube audio download produced an unexpected file set")
+        audio_bytes = candidates[0].read_bytes()
+    if not audio_bytes or len(audio_bytes) > 15_000_000:
+        raise RuntimeError("bounded YouTube audio is empty or exceeds the relay limit")
+    return {
+        "episode_title": episode_title,
+        "video_title": video_title,
+        "title_match": title_check,
+        "clip_start": round(clip_start, 3),
+        "clip_end": round(clip_end, 3),
+        "audio_bytes": audio_bytes,
+        "audio_sha256": hashlib.sha256(audio_bytes).hexdigest(),
+        "audio_size_bytes": len(audio_bytes),
+    }
+
+
 @app.local_entrypoint()
 def main(
     action: str = "health",
@@ -9775,6 +10193,59 @@ def main(
             backfill_limit=backfill_limit,
             dry_run=dry_run,
         )
+    elif action == "historical-source-audio-relay":
+        targets = list_youtube_alignment_relay_targets.remote(
+            scope="production",
+            limit=max(1, min(backfill_limit, 25)),
+            source_hold_only=True,
+            quote_ids=[quote_id] if quote_id else None,
+        )
+        relayed = []
+        skipped = []
+        for index, target in enumerate(targets["targets"], start=1):
+            print(
+                f"  🎧 Preparing bounded YouTube audio {index}/{len(targets['targets'])}: "
+                f"{target['quote_id']} ({target['youtube_id']})"
+            )
+            try:
+                clip = download_bounded_youtube_audio(target)
+                print(
+                    f"  ✅ Video identity passed; relaying {clip['clip_start']:.1f}s–"
+                    f"{clip['clip_end']:.1f}s ({clip['audio_size_bytes']} bytes)"
+                )
+                relay_result = apply_relayed_youtube_audio_alignment.remote(
+                    quote_id=target["quote_id"],
+                    youtube_id=target["youtube_id"],
+                    episode_title=clip["episode_title"],
+                    video_title=clip["video_title"],
+                    clip_start=clip["clip_start"],
+                    clip_end=clip["clip_end"],
+                    audio_bytes=clip["audio_bytes"],
+                    audio_sha256=clip["audio_sha256"],
+                    dry_run=dry_run,
+                )
+                relayed.append(relay_result)
+            except Exception as exc:
+                print(f"  ⚠️  Audio relay skipped {target['quote_id']}: {exc}")
+                skipped.append({
+                    "quote_id": target["quote_id"],
+                    "youtube_id": target["youtube_id"],
+                    "reason": str(exc)[:1000],
+                })
+        verified = sum(item.get("status") == "verified" for item in relayed)
+        failed = sum(item.get("status") != "verified" for item in relayed)
+        result = {
+            "success": bool(relayed) and failed == 0 and not skipped,
+            "partial_success": bool(verified and (failed or skipped)),
+            "dry_run": dry_run,
+            "selected": len(targets["targets"]),
+            "attempted": len(relayed),
+            "verified": verified,
+            "failed": failed,
+            "skipped": len(skipped),
+            "items": relayed,
+            "skipped_items": skipped,
+        }
     elif action in {"youtube-alignment-relay", "historical-source-relay"}:
         import gzip
 
@@ -9850,7 +10321,8 @@ def main(
     else:
         raise ValueError(
             "action must be health, openai-check, process, scheduled-check, "
-            "historical-backfill, historical-source-relay, historical-source-remap, "
+            "historical-backfill, historical-source-relay, historical-source-audio-relay, "
+            "historical-source-remap, "
             "staged-source-repair, staged-analysis-quote, caption-check, "
             "youtube-alignment-backfill, or youtube-alignment-relay"
         )
