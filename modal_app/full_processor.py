@@ -2054,6 +2054,7 @@ def apply_relayed_youtube_audio_alignment(
             "transcription_model": transcription_model,
             "transcript_events": len(processed),
             "matched_excerpt": evidence.get("excerpt") if evidence else None,
+            "matched_evidence": evidence,
             "diagnostic_candidates": diagnostic_candidates,
             **result,
         }
@@ -2097,6 +2098,220 @@ def apply_relayed_youtube_audio_alignment(
                 os.remove(audio_path)
             except OSError:
                 pass
+
+
+@app.function(image=image, secrets=[my_secret], timeout=300)
+def promote_verified_youtube_audio_relay(dry_job_id: str):
+    """Apply one reviewed, strict-match dry audio relay without retranscription."""
+    from supabase import create_client
+
+    dry_job_id = str(dry_job_id or "").strip()
+    if not dry_job_id:
+        raise ValueError("dry-run repair job ID is required")
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    dry_rows = (
+        supabase.table("processing_jobs")
+        .select("id,job_type,source,state,parameters,result")
+        .eq("id", dry_job_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(dry_rows) != 1:
+        raise ValueError("dry-run repair job was not found")
+    dry_job = dry_rows[0]
+    parameters = dry_job.get("parameters") or {}
+    dry_result = dry_job.get("result") or {}
+    if (
+        dry_job.get("job_type") != "data_repair"
+        or dry_job.get("source") != "repair"
+        or dry_job.get("state") != "succeeded"
+        or parameters.get("repair_type") != "exact_youtube_audio_source_alignment"
+        or parameters.get("dry_run") is not True
+        or dry_result.get("status") != "verified"
+        or dry_result.get("dry_run") is not True
+    ):
+        raise ValueError("job is not an eligible verified dry audio relay")
+
+    prior_promotions = (
+        supabase.table("processing_jobs")
+        .select("id,state,parameters,result")
+        .eq("job_type", "data_repair")
+        .eq("source", "repair")
+        .order("created_at", desc=True)
+        .limit(1000)
+        .execute()
+    ).data or []
+    existing = next((
+        row for row in prior_promotions
+        if (row.get("parameters") or {}).get("promoted_from_job_id") == dry_job_id
+        and row.get("state") == "succeeded"
+    ), None)
+    if existing:
+        return {
+            "success": True,
+            "no_op": True,
+            "job_id": existing["id"],
+            "promoted_from_job_id": dry_job_id,
+            **(existing.get("result") or {}),
+        }
+
+    quote_id = str(dry_result.get("quote_id") or parameters.get("quote_id") or "")
+    youtube_id = str(dry_result.get("youtube_id") or parameters.get("youtube_id") or "")
+    youtube_start = first_numeric_value(dry_result.get("youtube_start"))
+    youtube_end = first_numeric_value(dry_result.get("youtube_end"))
+    confidence = first_numeric_value(dry_result.get("confidence"))
+    evidence = dry_result.get("matched_evidence") or {}
+    segments = evidence.get("segments") or []
+    if (
+        not quote_id
+        or not re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_id)
+        or youtube_start is None
+        or youtube_end is None
+        or youtube_end <= youtube_start
+        or confidence is None
+        or confidence < 0.70
+        or not isinstance(segments, list)
+        or not segments
+        or not str(evidence.get("excerpt") or "").strip()
+    ):
+        raise ValueError("verified dry relay is missing bounded source evidence")
+    for segment in segments:
+        start = first_numeric_value(segment.get("start"))
+        end = first_numeric_value(segment.get("end"))
+        if (
+            start is None
+            or end is None
+            or end <= start
+            or not str(segment.get("text") or "").strip()
+        ):
+            raise ValueError("verified dry relay contains invalid source segments")
+
+    quote_table, rows = select_youtube_alignment_rows(
+        supabase,
+        "production",
+        1,
+        quote_ids=[quote_id],
+        include_failed=True,
+    )
+    if len(rows) != 1 or str(rows[0].get("youtube_id") or "") != youtube_id:
+        raise ValueError("the verified dry relay target is no longer eligible")
+    quote = rows[0]
+    active_review = (
+        supabase.table("conversation_mapping_reviews")
+        .select("quote_id,workflow_status")
+        .eq("quote_id", quote_id)
+        .eq("workflow_status", "source_unavailable")
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(active_review) != 1:
+        raise ValueError("the quote is no longer an active historical source hold")
+
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-youtube-audio-promotion:{dry_job_id}:{uuid.uuid4()}",
+        "job_type": "data_repair",
+        "source": "repair",
+        "parameters": {
+            "repair_type": "promote_verified_youtube_audio_alignment",
+            "promoted_from_job_id": dry_job_id,
+            "quote_id": quote_id,
+            "youtube_id": youtube_id,
+            "audio_sha256": parameters.get("audio_sha256"),
+            "operator_surface": "modal_cli_reviewed_dry_relay",
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        started_at=utcnow_iso(),
+        progress={"phase": "promoting_verified_youtube_audio", "current": 0, "total": 1},
+    )
+    try:
+        alignment = {
+            "status": "verified",
+            "start": float(youtube_start),
+            "end": float(youtube_end),
+            "confidence": float(confidence),
+            "method": "youtube_audio_transcript_match",
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+            "details": {
+                "caption_source": "youtube_audio_whisper_operator_relay",
+                "audio_sha256": parameters.get("audio_sha256"),
+                "promoted_from_job_id": dry_job_id,
+                "reviewed_dry_relay": True,
+                "episode_title": parameters.get("episode_title"),
+                "video_title": parameters.get("video_title"),
+                "title_match": parameters.get("title_match"),
+                "clip_start": parameters.get("clip_start"),
+                "clip_end": parameters.get("clip_end"),
+            },
+        }
+        record_youtube_alignment_result(
+            supabase,
+            quote_table=quote_table,
+            quote_id=quote_id,
+            youtube_id=youtube_id,
+            rss_start=quote.get("rss_timestamp_start"),
+            rss_end=quote.get("rss_timestamp_end"),
+            alignment=alignment,
+            processing_job_id=job_id,
+        )
+        source_url = (
+            f"https://www.youtube.com/watch?v={youtube_id}"
+            f"&t={max(0, int(float(youtube_start)))}s"
+        )
+        supabase.table("conversation_mapping_reviews").update({
+            "processing_job_id": job_id,
+            "source_kind": "youtube_audio_transcript",
+            "source_url": source_url,
+            "source_transcript_excerpt": evidence["excerpt"],
+            "source_start_segment": evidence.get("start_segment"),
+            "source_end_segment": evidence.get("end_segment"),
+            "source_segments": segments,
+            "source_alignment_confidence": float(confidence),
+            "abstention_reason": HISTORICAL_SOURCE_REPAIR_PENDING,
+            "updated_at": utcnow_iso(),
+        }).eq("quote_id", quote_id).eq(
+            "workflow_status", "source_unavailable"
+        ).execute()
+        final = {
+            "success": True,
+            "quote_id": quote_id,
+            "youtube_id": youtube_id,
+            "youtube_start": float(youtube_start),
+            "youtube_end": float(youtube_end),
+            "confidence": float(confidence),
+            "promoted_from_job_id": dry_job_id,
+            "mapping_retry_pending": True,
+        }
+        update_processing_job(
+            supabase,
+            job_id,
+            "succeeded",
+            result=final,
+            progress={
+                "phase": "verified_youtube_audio_promoted",
+                "current": 1,
+                "total": 1,
+                "verified": 1,
+            },
+            completed_at=utcnow_iso(),
+        )
+        return {"job_id": job_id, **final}
+    except Exception as exc:
+        update_processing_job(
+            supabase,
+            job_id,
+            "failed",
+            result={"success": False, "quote_id": quote_id, "youtube_id": youtube_id},
+            error_code="youtube_audio_promotion_failed",
+            error_message=str(exc)[:1000],
+            completed_at=utcnow_iso(),
+        )
+        raise
 
 
 @app.function(image=image, secrets=[my_secret], timeout=300)
@@ -10093,7 +10308,7 @@ def inspect_youtube_source_identity(target):
     }
 
 
-def download_bounded_youtube_audio(target, padding_seconds=300):
+def download_bounded_youtube_audio(target, padding_seconds=90):
     """Download one bounded audio window locally after verifying video identity."""
     import pathlib
     import subprocess
@@ -10195,6 +10410,7 @@ def main(
     alignment_scope: str = "recent_test",
     dry_run: bool = True,
     quote_id: str = "",
+    repair_job_id: str = "",
 ):
     """Operator-only CLI entrypoint for audited smoke checks and bounded runs."""
     import json
@@ -10345,6 +10561,13 @@ def main(
             "items": relayed,
             "skipped_items": skipped,
         }
+    elif action == "historical-source-audio-promote":
+        if not repair_job_id:
+            raise ValueError("repair_job_id is required for audio relay promotion")
+        deployed_audio_promotion = modal.Function.from_name(
+            "podcast-processor-full", "promote_verified_youtube_audio_relay"
+        )
+        result = deployed_audio_promotion.remote(dry_job_id=repair_job_id)
     elif action in {"youtube-alignment-relay", "historical-source-relay"}:
         import gzip
 
@@ -10421,7 +10644,7 @@ def main(
         raise ValueError(
             "action must be health, openai-check, process, scheduled-check, "
             "historical-backfill, historical-source-relay, historical-source-title-audit, "
-            "historical-source-audio-relay, "
+            "historical-source-audio-relay, historical-source-audio-promote, "
             "historical-source-remap, "
             "staged-source-repair, staged-analysis-quote, caption-check, "
             "youtube-alignment-backfill, or youtube-alignment-relay"
