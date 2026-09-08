@@ -2162,6 +2162,24 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
     confidence = first_numeric_value(dry_result.get("confidence"))
     evidence = dry_result.get("matched_evidence") or {}
     segments = evidence.get("segments") or []
+    first_segment = (
+        segments[0]
+        if isinstance(segments, list) and segments and isinstance(segments[0], dict)
+        else {}
+    )
+    last_segment = (
+        segments[-1]
+        if isinstance(segments, list) and segments and isinstance(segments[-1], dict)
+        else {}
+    )
+    source_start_segment = first_numeric_value(
+        evidence.get("start_segment"),
+        first_segment.get("id"),
+    )
+    source_end_segment = first_numeric_value(
+        evidence.get("end_segment"),
+        last_segment.get("id"),
+    )
     if (
         not quote_id
         or not re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_id)
@@ -2173,6 +2191,9 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
         or not isinstance(segments, list)
         or not segments
         or not str(evidence.get("excerpt") or "").strip()
+        or source_start_segment is None
+        or source_end_segment is None
+        or source_end_segment < source_start_segment
     ):
         raise ValueError("verified dry relay is missing bounded source evidence")
     for segment in segments:
@@ -2250,54 +2271,44 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
         progress={"phase": "promoting_verified_youtube_audio", "current": 0, "total": 1},
     )
     try:
-        alignment = {
-            "status": "verified",
-            "start": float(youtube_start),
-            "end": float(youtube_end),
-            "confidence": float(confidence),
-            "method": "youtube_audio_transcript_match",
-            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
-            "details": {
-                "caption_source": "youtube_audio_whisper_operator_relay",
-                "audio_sha256": parameters.get("audio_sha256"),
-                "promoted_from_job_id": dry_job_id,
-                "reviewed_dry_relay": True,
-                "episode_title": parameters.get("episode_title"),
-                "video_title": parameters.get("video_title"),
-                "title_match": parameters.get("title_match"),
-                "clip_start": parameters.get("clip_start"),
-                "clip_end": parameters.get("clip_end"),
-            },
+        alignment_details = {
+            "caption_source": "youtube_audio_whisper_operator_relay",
+            "audio_sha256": parameters.get("audio_sha256"),
+            "promoted_from_job_id": dry_job_id,
+            "reviewed_dry_relay": True,
+            "episode_title": parameters.get("episode_title"),
+            "video_title": parameters.get("video_title"),
+            "title_match": parameters.get("title_match"),
+            "clip_start": parameters.get("clip_start"),
+            "clip_end": parameters.get("clip_end"),
         }
-        if not alignment_already_applied:
-            record_youtube_alignment_result(
-                supabase,
-                quote_table=quote_table,
-                quote_id=quote_id,
-                youtube_id=youtube_id,
-                rss_start=quote.get("rss_timestamp_start"),
-                rss_end=quote.get("rss_timestamp_end"),
-                alignment=alignment,
-                processing_job_id=job_id,
-            )
         source_url = (
             f"https://www.youtube.com/watch?v={youtube_id}"
             f"&t={max(0, int(float(youtube_start)))}s"
         )
-        supabase.table("conversation_mapping_reviews").update({
-            "processing_job_id": job_id,
-            "source_kind": "youtube_audio_transcript",
-            "source_url": source_url,
-            "source_transcript_excerpt": evidence["excerpt"],
-            "source_start_segment": evidence.get("start_segment"),
-            "source_end_segment": evidence.get("end_segment"),
-            "source_segments": segments,
-            "source_alignment_confidence": float(confidence),
-            "abstention_reason": HISTORICAL_SOURCE_REPAIR_PENDING,
-            "updated_at": utcnow_iso(),
-        }).eq("quote_id", quote_id).eq(
-            "workflow_status", "source_unavailable"
-        ).execute()
+        promoted = supabase.rpc(
+            "promote_historical_youtube_audio_alignment",
+            {
+                "p_quote_id": quote_id,
+                "p_youtube_id": youtube_id,
+                "p_rss_start": quote.get("rss_timestamp_start"),
+                "p_rss_end": quote.get("rss_timestamp_end"),
+                "p_youtube_start": float(youtube_start),
+                "p_youtube_end": float(youtube_end),
+                "p_confidence": float(confidence),
+                "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                "p_details": alignment_details,
+                "p_processing_job_id": job_id,
+                "p_source_url": source_url,
+                "p_source_excerpt": evidence["excerpt"],
+                "p_source_start_segment": int(source_start_segment),
+                "p_source_end_segment": int(source_end_segment),
+                "p_source_segments": segments,
+            },
+        ).execute().data or {}
+        alignment_already_applied = bool(
+            promoted.get("alignment_already_applied", alignment_already_applied)
+        )
         final = {
             "success": True,
             "quote_id": quote_id,
