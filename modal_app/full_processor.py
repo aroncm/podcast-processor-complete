@@ -2186,16 +2186,36 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
         ):
             raise ValueError("verified dry relay contains invalid source segments")
 
-    quote_table, rows = select_youtube_alignment_rows(
-        supabase,
-        "production",
-        1,
-        quote_ids=[quote_id],
-        include_failed=True,
-    )
+    quote_table = "quotes"
+    rows = (
+        supabase.table(quote_table)
+        .select(
+            "id,text,episode_id,youtube_id,timestamp_start,timestamp_end,"
+            "rss_timestamp_start,rss_timestamp_end,youtube_alignment_status,"
+            "youtube_timestamp_start,youtube_timestamp_end,"
+            "youtube_alignment_details,created_at"
+        )
+        .eq("id", quote_id)
+        .limit(1)
+        .execute()
+    ).data or []
     if len(rows) != 1 or str(rows[0].get("youtube_id") or "") != youtube_id:
-        raise ValueError("the verified dry relay target is no longer eligible")
+        raise ValueError("the verified dry relay target no longer matches the stored Take")
     quote = rows[0]
+    stored_youtube_start = first_numeric_value(quote.get("youtube_timestamp_start"))
+    stored_youtube_end = first_numeric_value(quote.get("youtube_timestamp_end"))
+    alignment_already_applied = bool(
+        quote.get("youtube_alignment_status") == "verified"
+        and (quote.get("youtube_alignment_details") or {}).get(
+            "promoted_from_job_id"
+        ) == dry_job_id
+        and stored_youtube_start is not None
+        and stored_youtube_end is not None
+        and abs(stored_youtube_start - youtube_start) <= 0.01
+        and abs(stored_youtube_end - youtube_end) <= 0.01
+    )
+    if quote.get("youtube_alignment_status") == "verified" and not alignment_already_applied:
+        raise ValueError("the Take has a different verified YouTube alignment")
     active_review = (
         supabase.table("conversation_mapping_reviews")
         .select("quote_id,workflow_status")
@@ -2249,16 +2269,17 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
                 "clip_end": parameters.get("clip_end"),
             },
         }
-        record_youtube_alignment_result(
-            supabase,
-            quote_table=quote_table,
-            quote_id=quote_id,
-            youtube_id=youtube_id,
-            rss_start=quote.get("rss_timestamp_start"),
-            rss_end=quote.get("rss_timestamp_end"),
-            alignment=alignment,
-            processing_job_id=job_id,
-        )
+        if not alignment_already_applied:
+            record_youtube_alignment_result(
+                supabase,
+                quote_table=quote_table,
+                quote_id=quote_id,
+                youtube_id=youtube_id,
+                rss_start=quote.get("rss_timestamp_start"),
+                rss_end=quote.get("rss_timestamp_end"),
+                alignment=alignment,
+                processing_job_id=job_id,
+            )
         source_url = (
             f"https://www.youtube.com/watch?v={youtube_id}"
             f"&t={max(0, int(float(youtube_start)))}s"
@@ -2286,6 +2307,7 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             "confidence": float(confidence),
             "promoted_from_job_id": dry_job_id,
             "mapping_retry_pending": True,
+            "alignment_already_applied": alignment_already_applied,
         }
         update_processing_job(
             supabase,
