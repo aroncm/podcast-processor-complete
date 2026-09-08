@@ -27,6 +27,7 @@ from modal_app.full_processor import (
     historical_mapping_is_reviewable,
     HISTORICAL_SOURCE_REPAIR_PENDING,
     legacy_integer_timestamp,
+    legacy_clip_absolute_span,
     missing_take_verification_fields,
     merge_reviewed_question_taxonomy,
     merge_tentative_conversation_candidates,
@@ -51,6 +52,28 @@ from modal_app.full_processor import (
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_legacy_clip_filename_recovers_episode_absolute_span(self):
+        self.assertEqual(
+            legacy_clip_absolute_span({
+                "clip_link": "audio/8b81d054_1472_1562.mp3",
+                "quote_start": 21.346,
+                "quote_end": 58.654,
+                "rss_timestamp_start": 21.346,
+                "rss_timestamp_end": 58.654,
+            }),
+            (1493.346, 1530.654),
+        )
+        self.assertIsNone(legacy_clip_absolute_span({
+            "clip_link": "audio/invalid.mp3",
+            "quote_start": 21.346,
+            "quote_end": 58.654,
+        }))
+        self.assertIsNone(legacy_clip_absolute_span({
+            "clip_link": "audio/8b81d054_1472_1500.mp3",
+            "quote_start": 21.346,
+            "quote_end": 58.654,
+        }))
+
     def test_youtube_audio_relay_requires_episode_title_identity(self):
         matching = youtube_title_matches_episode(
             "Ep. 100 The Future of Ad Tech & Agencies: AI, Giving Back, Walled Gardens",

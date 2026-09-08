@@ -1325,11 +1325,43 @@ def record_youtube_alignment_candidate(
     return supabase.rpc("record_youtube_alignment_candidate", payload).execute().data
 
 
+def legacy_clip_absolute_span(row):
+    """Recover an episode-absolute span from a legacy bounded clip filename."""
+    clip_link = str(row.get("clip_link") or "").split("?", 1)[0]
+    match = re.search(
+        r"_(\d+(?:\.\d+)?)_(\d+(?:\.\d+)?)\.[A-Za-z0-9]+$",
+        clip_link,
+    )
+    local_start = first_numeric_value(
+        row.get("quote_start"), row.get("rss_timestamp_start"), row.get("timestamp_start")
+    )
+    local_end = first_numeric_value(
+        row.get("quote_end"), row.get("rss_timestamp_end"), row.get("timestamp_end")
+    )
+    if not match or local_start is None or local_end is None:
+        return None
+    clip_start = float(match.group(1))
+    clip_end = float(match.group(2))
+    clip_duration = clip_end - clip_start
+    if (
+        clip_start < 0
+        or clip_duration <= 0
+        or local_start < 0
+        or local_end <= local_start
+        or local_end > clip_duration + 5
+    ):
+        return None
+    return clip_start + local_start, clip_start + local_end
+
+
 def resolve_quote_source_span(supabase, row, quote_table):
     """Recover the RSS span from immutable transcript evidence when available."""
     rss_start = row.get("rss_timestamp_start")
     rss_end = row.get("rss_timestamp_end")
     if quote_table != "test_quotes":
+        recovered = legacy_clip_absolute_span(row)
+        if recovered:
+            return recovered
         return rss_start, rss_end
     if row.get("episode_guid") and row.get("source_start_segment") is not None:
         try:
@@ -1415,7 +1447,8 @@ def select_youtube_alignment_rows(
     quote_table = "quotes" if scope == "production" else "test_quotes"
     select_fields = (
         "id,text,episode_id,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
-        "rss_timestamp_end,youtube_alignment_status,created_at"
+        "rss_timestamp_end,quote_start,quote_end,clip_link,"
+        "youtube_alignment_status,created_at"
         if quote_table == "quotes" else
         "id,quote_text,youtube_id,timestamp_start,timestamp_end,rss_timestamp_start,"
         "rss_timestamp_end,youtube_alignment_status,episode_guid,"
@@ -1610,26 +1643,32 @@ def list_youtube_alignment_relay_targets(
                 str(row["id"]): str(row.get("title") or "")
                 for row in episode_rows
             }
+    targets = []
+    for row in rows:
+        resolved_start, resolved_end = resolve_quote_source_span(
+            supabase, row, quote_table
+        )
+        targets.append({
+            "quote_id": str(row["id"]),
+            "youtube_id": str(row["youtube_id"]),
+            "episode_id": str(row.get("episode_id") or ""),
+            "episode_name": episode_titles.get(str(row.get("episode_id") or ""), ""),
+            "expected_start": first_numeric_value(
+                resolved_start, row.get("timestamp_start")
+            ),
+            "expected_end": first_numeric_value(
+                resolved_end, row.get("timestamp_end")
+            ),
+            "source_span_recovered_from_clip": bool(
+                legacy_clip_absolute_span(row) if quote_table == "quotes" else False
+            ),
+        })
     return {
         "scope": scope,
         "quote_table": quote_table,
         "quote_ids": [str(row["id"]) for row in rows],
         "youtube_ids": sorted({str(row["youtube_id"]) for row in rows}),
-        "targets": [
-            {
-                "quote_id": str(row["id"]),
-                "youtube_id": str(row["youtube_id"]),
-                "episode_id": str(row.get("episode_id") or ""),
-                "episode_name": episode_titles.get(str(row.get("episode_id") or ""), ""),
-                "expected_start": first_numeric_value(
-                    row.get("rss_timestamp_start"), row.get("timestamp_start")
-                ),
-                "expected_end": first_numeric_value(
-                    row.get("rss_timestamp_end"), row.get("timestamp_end")
-                ),
-            }
-            for row in rows
-        ],
+        "targets": targets,
         "source_hold_only": source_hold_only,
     }
 
@@ -2223,6 +2262,12 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
     if len(rows) != 1 or str(rows[0].get("youtube_id") or "") != youtube_id:
         raise ValueError("the verified dry relay target no longer matches the stored Take")
     quote = rows[0]
+    promoted_rss_start = first_numeric_value(
+        dry_result.get("rss_start"), quote.get("rss_timestamp_start")
+    )
+    promoted_rss_end = first_numeric_value(
+        dry_result.get("rss_end"), quote.get("rss_timestamp_end")
+    )
     stored_youtube_start = first_numeric_value(quote.get("youtube_timestamp_start"))
     stored_youtube_end = first_numeric_value(quote.get("youtube_timestamp_end"))
     alignment_already_applied = bool(
@@ -2281,6 +2326,8 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             "title_match": parameters.get("title_match"),
             "clip_start": parameters.get("clip_start"),
             "clip_end": parameters.get("clip_end"),
+            "rss_start": promoted_rss_start,
+            "rss_end": promoted_rss_end,
         }
         source_url = (
             f"https://www.youtube.com/watch?v={youtube_id}"
@@ -2291,8 +2338,8 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             {
                 "p_quote_id": quote_id,
                 "p_youtube_id": youtube_id,
-                "p_rss_start": quote.get("rss_timestamp_start"),
-                "p_rss_end": quote.get("rss_timestamp_end"),
+                "p_rss_start": promoted_rss_start,
+                "p_rss_end": promoted_rss_end,
                 "p_youtube_start": float(youtube_start),
                 "p_youtube_end": float(youtube_end),
                 "p_confidence": float(confidence),
