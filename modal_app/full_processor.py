@@ -1623,7 +1623,7 @@ def list_youtube_alignment_relay_targets(
         scope,
         limit,
         quote_ids=(selected_ids if quote_filter_supplied else source_hold_ids),
-        include_failed=not source_hold_only,
+        include_failed=(not source_hold_only or bool(selected_ids)),
     )
     episode_titles = {}
     if quote_table == "quotes":
