@@ -1327,21 +1327,16 @@ def record_youtube_alignment_candidate(
 
 def legacy_clip_absolute_span(row):
     """Recover an episode-absolute span from a legacy bounded clip filename."""
-    clip_link = str(row.get("clip_link") or "").split("?", 1)[0]
-    match = re.search(
-        r"_(\d+(?:\.\d+)?)_(\d+(?:\.\d+)?)\.[A-Za-z0-9]+$",
-        clip_link,
-    )
+    bounds = legacy_clip_file_bounds(row.get("clip_link"))
     local_start = first_numeric_value(
         row.get("quote_start"), row.get("rss_timestamp_start"), row.get("timestamp_start")
     )
     local_end = first_numeric_value(
         row.get("quote_end"), row.get("rss_timestamp_end"), row.get("timestamp_end")
     )
-    if not match or local_start is None or local_end is None:
+    if not bounds or local_start is None or local_end is None:
         return None
-    clip_start = float(match.group(1))
-    clip_end = float(match.group(2))
+    clip_start, clip_end = bounds
     clip_duration = clip_end - clip_start
     if (
         clip_start < 0
@@ -1352,6 +1347,55 @@ def legacy_clip_absolute_span(row):
     ):
         return None
     return clip_start + local_start, clip_start + local_end
+
+
+def legacy_clip_file_bounds(clip_link):
+    """Read immutable clip start/end provenance encoded in a legacy filename."""
+    cleaned = str(clip_link or "").split("?", 1)[0]
+    match = re.search(
+        r"_(\d+(?:\.\d+)?)_(\d+(?:\.\d+)?)\.[A-Za-z0-9]+$",
+        cleaned,
+    )
+    if not match:
+        return None
+    clip_start = float(match.group(1))
+    clip_end = float(match.group(2))
+    if clip_start < 0 or clip_end <= clip_start:
+        return None
+    return clip_start, clip_end
+
+
+def stored_audio_object_reference(clip_link, supabase_url):
+    """Resolve a legacy clip link to its storage bucket, object, and stable URL."""
+    from urllib.parse import unquote, urlparse
+
+    raw = str(clip_link or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("audio/") or raw.startswith("clips/"):
+        bucket = "snippets" if raw.startswith("audio/") else "audio-clips"
+        object_name = raw
+    else:
+        parsed = urlparse(raw)
+        match = re.search(
+            r"/storage/v1/object/(?:public|sign)/([^/]+)/(.+)$",
+            parsed.path,
+        )
+        if not match:
+            return None
+        bucket = unquote(match.group(1))
+        object_name = unquote(match.group(2))
+    base_url = str(supabase_url or "").rstrip("/")
+    stable_url = (
+        f"{base_url}/storage/v1/object/public/{bucket}/{object_name}"
+        if bucket in {"snippets", "audio-clips"}
+        else raw
+    )
+    return {
+        "bucket": bucket,
+        "object_name": object_name,
+        "source_url": stable_url,
+    }
 
 
 def resolve_quote_source_span(supabase, row, quote_table):
@@ -2454,6 +2498,426 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             "failed",
             result={"success": False, "quote_id": quote_id, "youtube_id": youtube_id},
             error_code="youtube_audio_promotion_failed",
+            error_message=str(exc)[:1000],
+            completed_at=utcnow_iso(),
+        )
+        raise
+
+
+@app.function(image=image, secrets=[my_secret], timeout=900, cpu=2)
+def align_historical_stored_audio_clip(
+    quote_id: str,
+    clear_invalid_youtube_source: bool = False,
+    youtube_identity_audit: dict = None,
+):
+    """Dry-run strict alignment against the immutable stored legacy audio clip."""
+    import pathlib
+    import tempfile
+    from openai import OpenAI
+    from supabase import create_client
+
+    quote_id = str(quote_id or "").strip()
+    if not quote_id:
+        raise ValueError("quote ID is required")
+    supabase_url = os.environ["SUPABASE_URL"]
+    supabase = create_client(supabase_url, os.environ["SUPABASE_KEY"])
+    rows = (
+        supabase.table("quotes")
+        .select(
+            "id,text,episode_id,youtube_id,clip_link,quote_start,quote_end,"
+            "timestamp_start,timestamp_end,rss_timestamp_start,rss_timestamp_end,"
+            "youtube_alignment_status,created_at"
+        )
+        .eq("id", quote_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(rows) != 1:
+        raise ValueError("production Take was not found")
+    quote = rows[0]
+    review = (
+        supabase.table("conversation_mapping_reviews")
+        .select("quote_id,workflow_status")
+        .eq("quote_id", quote_id)
+        .eq("workflow_status", "source_unavailable")
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(review) != 1:
+        raise ValueError("the Take is not an active historical source hold")
+
+    stored_youtube_id = str(quote.get("youtube_id") or "").strip()
+    identity_audit = dict(youtube_identity_audit or {})
+    if clear_invalid_youtube_source:
+        if not stored_youtube_id:
+            raise ValueError("there is no stored YouTube source to clear")
+        if str(identity_audit.get("youtube_id") or "") != stored_youtube_id:
+            raise ValueError("the YouTube identity audit does not match the stored source")
+        audit_status = str(identity_audit.get("status") or "")
+        title_matches = bool((identity_audit.get("title_match") or {}).get("matches"))
+        if audit_status not in {"mismatch", "unavailable"} or title_matches:
+            raise ValueError("a mismatched or unavailable YouTube identity audit is required")
+    elif stored_youtube_id:
+        raise ValueError(
+            "a Take with a YouTube ID requires an explicit invalid-source clearance audit"
+        )
+
+    source_ref = stored_audio_object_reference(quote.get("clip_link"), supabase_url)
+    if not source_ref:
+        raise ValueError("the stored audio clip reference is unsupported")
+    audio_bytes = supabase.storage.from_(source_ref["bucket"]).download(
+        source_ref["object_name"]
+    )
+    if not audio_bytes or len(audio_bytes) > 15_000_000:
+        raise ValueError("stored audio clip must be between 1 byte and 15 MB")
+    audio_sha256 = hashlib.sha256(audio_bytes).hexdigest()
+    clip_bounds = legacy_clip_file_bounds(quote.get("clip_link"))
+    clip_offset = float(clip_bounds[0]) if clip_bounds else 0.0
+    transcription_model = os.environ.get(
+        "OPENAI_WINDOW_TRANSCRIPTION_MODEL", "whisper-1"
+    )
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-stored-audio-relay:{quote_id}:{audio_sha256}:{uuid.uuid4()}",
+        "job_type": "data_repair",
+        "source": "repair",
+        "parameters": {
+            "repair_type": "exact_stored_audio_source_alignment",
+            "quote_id": quote_id,
+            "stored_youtube_id": stored_youtube_id or None,
+            "clear_invalid_youtube_source": bool(clear_invalid_youtube_source),
+            "youtube_identity_audit": identity_audit,
+            "storage_bucket": source_ref["bucket"],
+            "storage_object": source_ref["object_name"],
+            "source_url": source_ref["source_url"],
+            "audio_sha256": audio_sha256,
+            "audio_bytes": len(audio_bytes),
+            "clip_offset": clip_offset,
+            "clip_bounds": list(clip_bounds) if clip_bounds else None,
+            "dry_run": True,
+            "operator_surface": "modal_stored_audio_source_relay",
+            "transcription_model": transcription_model,
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        started_at=utcnow_iso(),
+        progress={"phase": "transcribing_stored_audio", "current": 0, "total": 1},
+    )
+
+    audio_path = None
+    try:
+        suffix = pathlib.Path(source_ref["object_name"]).suffix or ".mp3"
+        temp_audio = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        audio_path = temp_audio.name
+        temp_audio.write(audio_bytes)
+        temp_audio.close()
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        with open(audio_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model=transcription_model,
+                file=audio_file,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+        processed = []
+        for segment in getattr(transcript, "segments", None) or []:
+            if isinstance(segment, dict):
+                text = segment.get("text", "")
+                start = float(segment.get("start", 0))
+                end = float(segment.get("end", start))
+            else:
+                text = getattr(segment, "text", "")
+                start = float(getattr(segment, "start", 0))
+                end = float(getattr(segment, "end", start))
+            parsed = _caption_event(
+                text,
+                clip_offset + start,
+                clip_offset + end,
+                "stored_legacy_audio_whisper",
+            )
+            if parsed:
+                parsed["audio_sha256"] = audio_sha256
+                processed.append(parsed)
+        if not processed:
+            raise RuntimeError("stored audio transcription returned no timed segments")
+
+        recovered_span = legacy_clip_absolute_span(quote)
+        expected_start = first_numeric_value(
+            recovered_span[0] if recovered_span else None,
+            quote.get("rss_timestamp_start"),
+            quote.get("quote_start"),
+            processed[0]["start"],
+        )
+        expected_end = first_numeric_value(
+            recovered_span[1] if recovered_span else None,
+            quote.get("rss_timestamp_end"),
+            quote.get("quote_end"),
+            processed[-1]["end"],
+        )
+        if expected_end is None or expected_end <= expected_start:
+            expected_end = expected_start + 30.0
+        aligned = align_quote_to_segments(
+            str(quote.get("text") or ""),
+            processed,
+            expected_start,
+            expected_end,
+            global_fallback=True,
+            max_window_events=32,
+        )
+        evidence = (
+            build_caption_evidence(processed, aligned["start"], aligned["end"])
+            if aligned else None
+        )
+        diagnostics = [] if aligned else rank_source_alignment_candidates(
+            str(quote.get("text") or ""),
+            processed,
+            expected_start,
+            expected_end,
+            max_candidates=3,
+        )
+        final = {
+            "success": bool(aligned and evidence),
+            "status": "verified" if aligned and evidence else "failed",
+            "dry_run": True,
+            "quote_id": quote_id,
+            "stored_youtube_id": stored_youtube_id or None,
+            "clear_invalid_youtube_source": bool(clear_invalid_youtube_source),
+            "source_url": source_ref["source_url"],
+            "clip_offset": clip_offset,
+            "source_start": aligned.get("start") if aligned else None,
+            "source_end": aligned.get("end") if aligned else None,
+            "confidence": aligned.get("confidence") if aligned else None,
+            "matched_excerpt": evidence.get("excerpt") if evidence else None,
+            "matched_evidence": evidence,
+            "diagnostic_candidates": diagnostics,
+            "transcript_events": len(processed),
+            "transcription_model": transcription_model,
+            "error_code": None if aligned and evidence else "no_unique_high_confidence_match",
+        }
+        verified = final["status"] == "verified"
+        update_processing_job(
+            supabase,
+            job_id,
+            "succeeded" if verified else "succeeded_with_warnings",
+            result=final,
+            progress={
+                "phase": "stored_audio_alignment_complete",
+                "current": 1,
+                "total": 1,
+                "verified": int(verified),
+                "failed": int(not verified),
+                "dry_run": True,
+            },
+            error_code=None if verified else "stored_audio_alignment_incomplete",
+            error_message=None if verified else "strict quote-to-stored-audio alignment did not pass",
+            completed_at=utcnow_iso(),
+        )
+        return {"job_id": job_id, **final}
+    except Exception as exc:
+        update_processing_job(
+            supabase,
+            job_id,
+            "failed",
+            result={"success": False, "quote_id": quote_id},
+            error_code=(
+                "provider_account_blocked"
+                if openai_error_is_account_blocking(exc)
+                else "stored_audio_relay_failed"
+            ),
+            error_message=str(exc)[:1000],
+            completed_at=utcnow_iso(),
+        )
+        raise
+    finally:
+        if audio_path:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+
+@app.function(image=image, secrets=[my_secret], timeout=300)
+def promote_verified_stored_audio_relay(dry_job_id: str):
+    """Promote one reviewed stored-audio match and optionally clear a bad video ID."""
+    from supabase import create_client
+
+    dry_job_id = str(dry_job_id or "").strip()
+    if not dry_job_id:
+        raise ValueError("dry-run repair job ID is required")
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    dry_rows = (
+        supabase.table("processing_jobs")
+        .select("id,job_type,source,state,parameters,result")
+        .eq("id", dry_job_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(dry_rows) != 1:
+        raise ValueError("dry-run repair job was not found")
+    dry_job = dry_rows[0]
+    parameters = dry_job.get("parameters") or {}
+    dry_result = dry_job.get("result") or {}
+    if (
+        dry_job.get("job_type") != "data_repair"
+        or dry_job.get("source") != "repair"
+        or dry_job.get("state") != "succeeded"
+        or parameters.get("repair_type") != "exact_stored_audio_source_alignment"
+        or parameters.get("dry_run") is not True
+        or dry_result.get("status") != "verified"
+        or dry_result.get("dry_run") is not True
+    ):
+        raise ValueError("job is not an eligible verified stored-audio dry run")
+
+    prior_promotions = (
+        supabase.table("processing_jobs")
+        .select("id,state,parameters,result")
+        .eq("job_type", "data_repair")
+        .eq("source", "repair")
+        .order("created_at", desc=True)
+        .limit(1000)
+        .execute()
+    ).data or []
+    existing = next((
+        row for row in prior_promotions
+        if (row.get("parameters") or {}).get("promoted_from_job_id") == dry_job_id
+        and row.get("state") == "succeeded"
+    ), None)
+    if existing:
+        return {
+            "success": True,
+            "no_op": True,
+            "job_id": existing["id"],
+            **(existing.get("result") or {}),
+        }
+
+    quote_id = str(dry_result.get("quote_id") or parameters.get("quote_id") or "")
+    evidence = dry_result.get("matched_evidence") or {}
+    segments = evidence.get("segments") or []
+    confidence = first_numeric_value(dry_result.get("confidence"))
+    source_start = first_numeric_value(dry_result.get("source_start"))
+    source_end = first_numeric_value(dry_result.get("source_end"))
+    if (
+        not quote_id
+        or confidence is None
+        or confidence < 0.70
+        or source_start is None
+        or source_end is None
+        or source_end <= source_start
+        or not isinstance(segments, list)
+        or not segments
+        or not str(evidence.get("excerpt") or "").strip()
+    ):
+        raise ValueError("verified dry relay is missing bounded stored-audio evidence")
+    rows = (
+        supabase.table("quotes")
+        .select("id,youtube_id,youtube_alignment_status")
+        .eq("id", quote_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(rows) != 1:
+        raise ValueError("the stored-audio Take no longer exists")
+    stored_youtube_id = str(rows[0].get("youtube_id") or "")
+    expected_youtube_id = str(parameters.get("stored_youtube_id") or "")
+    clear_invalid = bool(parameters.get("clear_invalid_youtube_source"))
+    if clear_invalid:
+        if not expected_youtube_id or stored_youtube_id != expected_youtube_id:
+            raise ValueError("the Take's YouTube source changed after the reviewed dry run")
+    elif stored_youtube_id:
+        raise ValueError("the Take gained a YouTube source after the reviewed dry run")
+    active_review = (
+        supabase.table("conversation_mapping_reviews")
+        .select("quote_id")
+        .eq("quote_id", quote_id)
+        .eq("workflow_status", "source_unavailable")
+        .limit(1)
+        .execute()
+    ).data or []
+    if len(active_review) != 1:
+        raise ValueError("the Take is no longer an active historical source hold")
+
+    job = supabase.table("processing_jobs").insert({
+        "idempotency_key": f"operator-stored-audio-promotion:{dry_job_id}:{uuid.uuid4()}",
+        "job_type": "data_repair",
+        "source": "repair",
+        "parameters": {
+            "repair_type": "promote_verified_stored_audio_alignment",
+            "promoted_from_job_id": dry_job_id,
+            "quote_id": quote_id,
+            "clear_invalid_youtube_source": clear_invalid,
+            "expected_youtube_id": expected_youtube_id or None,
+            "audio_sha256": parameters.get("audio_sha256"),
+            "operator_surface": "modal_cli_reviewed_stored_audio_relay",
+            "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+        },
+    }).execute()
+    job_id = job.data[0]["id"]
+    update_processing_job(
+        supabase,
+        job_id,
+        "claimed",
+        started_at=utcnow_iso(),
+        progress={"phase": "promoting_verified_stored_audio", "current": 0, "total": 1},
+    )
+    try:
+        promoted = supabase.rpc(
+            "promote_historical_stored_audio_alignment",
+            {
+                "p_quote_id": quote_id,
+                "p_expected_youtube_id": expected_youtube_id or None,
+                "p_clear_youtube_source": clear_invalid,
+                "p_source_start": source_start,
+                "p_source_end": source_end,
+                "p_confidence": confidence,
+                "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                "p_details": {
+                    "promoted_from_job_id": dry_job_id,
+                    "reviewed_dry_relay": True,
+                    "audio_sha256": parameters.get("audio_sha256"),
+                    "storage_bucket": parameters.get("storage_bucket"),
+                    "storage_object": parameters.get("storage_object"),
+                    "clear_invalid_youtube_source": clear_invalid,
+                    "youtube_identity_audit": parameters.get("youtube_identity_audit") or {},
+                },
+                "p_processing_job_id": job_id,
+                "p_source_url": str(dry_result.get("source_url") or ""),
+                "p_source_excerpt": str(evidence.get("excerpt") or ""),
+                "p_source_start_segment": int(evidence.get("start_segment")),
+                "p_source_end_segment": int(evidence.get("end_segment")),
+                "p_source_segments": segments,
+            },
+        ).execute().data or {}
+        final = {
+            "success": True,
+            "quote_id": quote_id,
+            "source_start": source_start,
+            "source_end": source_end,
+            "confidence": confidence,
+            "cleared_youtube_id": expected_youtube_id if clear_invalid else None,
+            "promoted_from_job_id": dry_job_id,
+            "mapping_retry_pending": True,
+            **promoted,
+        }
+        update_processing_job(
+            supabase,
+            job_id,
+            "succeeded",
+            result=final,
+            progress={"phase": "verified_stored_audio_promoted", "current": 1, "total": 1},
+            completed_at=utcnow_iso(),
+        )
+        return {"job_id": job_id, **final}
+    except Exception as exc:
+        update_processing_job(
+            supabase,
+            job_id,
+            "failed",
+            result={"success": False, "quote_id": quote_id},
+            error_code="stored_audio_promotion_failed",
             error_message=str(exc)[:1000],
             completed_at=utcnow_iso(),
         )
@@ -3953,7 +4417,14 @@ def repaired_historical_caption_source(review, quote):
         return None
     if review.get("abstention_reason") != HISTORICAL_SOURCE_REPAIR_PENDING:
         return None
-    if quote.get("youtube_alignment_status") not in {"verified", "manual_verified"}:
+    source_kind = str(review.get("source_kind") or "")
+    if source_kind in {"youtube_captions", "youtube_audio_transcript"}:
+        if quote.get("youtube_alignment_status") not in {"verified", "manual_verified"}:
+            return None
+    elif source_kind == "rss_audio_transcript":
+        if str(quote.get("youtube_id") or "").strip():
+            return None
+    else:
         return None
     raw_segments = review.get("source_segments") or []
     if not isinstance(raw_segments, list) or not raw_segments:
@@ -3975,11 +4446,11 @@ def repaired_historical_caption_source(review, quote):
             "caption_source": "verified_operator_relay",
         })
     start = first_numeric_value(
-        quote.get("youtube_timestamp_start"),
+        quote.get("youtube_timestamp_start") if source_kind.startswith("youtube_") else None,
         captions[0]["start"],
     )
     end = first_numeric_value(
-        quote.get("youtube_timestamp_end"),
+        quote.get("youtube_timestamp_end") if source_kind.startswith("youtube_") else None,
         captions[-1]["end"],
     )
     if start is None or end is None or end <= start:
@@ -3993,7 +4464,7 @@ def repaired_historical_caption_source(review, quote):
             "verification_required": False,
             "search_scope": "persisted_operator_relay",
         },
-        "source_kind": review.get("source_kind") or "youtube_captions",
+        "source_kind": source_kind,
         "source_url": review.get("source_url"),
     }
 
@@ -10558,6 +11029,7 @@ def main(
     quote_id: str = "",
     repair_job_id: str = "",
     replacement_youtube_id: str = "",
+    clear_invalid_youtube_source: bool = False,
 ):
     """Operator-only CLI entrypoint for audited smoke checks and bounded runs."""
     import json
@@ -10735,6 +11207,55 @@ def main(
             "podcast-processor-full", "promote_verified_youtube_audio_relay"
         )
         result = deployed_audio_promotion.remote(dry_job_id=repair_job_id)
+    elif action == "historical-stored-audio-relay":
+        if not quote_id:
+            raise ValueError("quote_id is required for stored-audio relay")
+        youtube_identity_audit = {}
+        if clear_invalid_youtube_source:
+            deployed_target_list = modal.Function.from_name(
+                "podcast-processor-full", "list_youtube_alignment_relay_targets"
+            )
+            targets = deployed_target_list.remote(
+                scope="production",
+                limit=1,
+                source_hold_only=True,
+                quote_ids=[quote_id],
+            )
+            if len(targets.get("targets") or []) != 1:
+                raise ValueError("the invalid YouTube source is no longer an eligible hold")
+            target = targets["targets"][0]
+            try:
+                identity = inspect_youtube_source_identity(target)
+                if identity["title_match"]["matches"]:
+                    raise ValueError(
+                        "stored YouTube title matches the episode; it cannot be cleared here"
+                    )
+                youtube_identity_audit = {**identity, "status": "mismatch"}
+            except ValueError:
+                raise
+            except Exception as exc:
+                youtube_identity_audit = {
+                    "status": "unavailable",
+                    "quote_id": quote_id,
+                    "youtube_id": target["youtube_id"],
+                    "episode_title": target.get("episode_name") or "",
+                    "reason": str(exc)[:1000],
+                }
+        deployed_stored_audio_relay = modal.Function.from_name(
+            "podcast-processor-full", "align_historical_stored_audio_clip"
+        )
+        result = deployed_stored_audio_relay.remote(
+            quote_id=quote_id,
+            clear_invalid_youtube_source=clear_invalid_youtube_source,
+            youtube_identity_audit=youtube_identity_audit,
+        )
+    elif action == "historical-stored-audio-promote":
+        if not repair_job_id:
+            raise ValueError("repair_job_id is required for stored-audio promotion")
+        deployed_stored_audio_promotion = modal.Function.from_name(
+            "podcast-processor-full", "promote_verified_stored_audio_relay"
+        )
+        result = deployed_stored_audio_promotion.remote(dry_job_id=repair_job_id)
     elif action in {"youtube-alignment-relay", "historical-source-relay"}:
         import gzip
 
@@ -10812,6 +11333,7 @@ def main(
             "action must be health, openai-check, process, scheduled-check, "
             "historical-backfill, historical-source-relay, historical-source-title-audit, "
             "historical-source-audio-relay, historical-source-audio-promote, "
+            "historical-stored-audio-relay, historical-stored-audio-promote, "
             "historical-source-remap, "
             "staged-source-repair, staged-analysis-quote, caption-check, "
             "youtube-alignment-backfill, or youtube-alignment-relay"

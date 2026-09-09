@@ -28,6 +28,7 @@ from modal_app.full_processor import (
     HISTORICAL_SOURCE_REPAIR_PENDING,
     legacy_integer_timestamp,
     legacy_clip_absolute_span,
+    legacy_clip_file_bounds,
     missing_take_verification_fields,
     merge_reviewed_question_taxonomy,
     merge_tentative_conversation_candidates,
@@ -44,6 +45,7 @@ from modal_app.full_processor import (
     start_openai_usage_tracking,
     staged_analysis_should_skip_source_retry,
     staged_analysis_write_plan,
+    stored_audio_object_reference,
     summarize_processing_job_item_rows,
     summarize_openai_usage,
     theme_match_is_controlled,
@@ -74,6 +76,27 @@ class PipelineQualityTests(unittest.TestCase):
             "quote_start": 21.346,
             "quote_end": 58.654,
         }))
+        self.assertEqual(
+            legacy_clip_file_bounds("audio/8b81d054_1472_1562.mp3"),
+            (1472.0, 1562.0),
+        )
+
+    def test_stored_audio_reference_normalizes_public_legacy_objects(self):
+        base = "https://project.supabase.co"
+        relative = stored_audio_object_reference("audio/example_10_20.mp3", base)
+        self.assertEqual(relative["bucket"], "snippets")
+        self.assertEqual(relative["object_name"], "audio/example_10_20.mp3")
+        self.assertEqual(
+            relative["source_url"],
+            f"{base}/storage/v1/object/public/snippets/audio/example_10_20.mp3",
+        )
+
+        signed = stored_audio_object_reference(
+            f"{base}/storage/v1/object/sign/podcast-clips/private.mp3?token=redacted",
+            base,
+        )
+        self.assertEqual(signed["bucket"], "podcast-clips")
+        self.assertEqual(signed["object_name"], "private.mp3")
 
     def test_youtube_audio_relay_requires_episode_title_identity(self):
         matching = youtube_title_matches_episode(
@@ -146,6 +169,23 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertIsNone(repaired_historical_caption_source(
             review,
             {**quote, "youtube_alignment_status": "legacy_unverified"},
+        ))
+
+        rss_review = {
+            **review,
+            "source_kind": "rss_audio_transcript",
+            "source_url": "https://project.supabase.co/storage/v1/object/public/snippets/audio/a.mp3",
+        }
+        rss_quote = {
+            "youtube_id": None,
+            "youtube_alignment_status": "not_applicable",
+        }
+        rss_repaired = repaired_historical_caption_source(rss_review, rss_quote)
+        self.assertEqual(rss_repaired["source_kind"], "rss_audio_transcript")
+        self.assertEqual(rss_repaired["aligned"]["start"], 8.0)
+        self.assertIsNone(repaired_historical_caption_source(
+            rss_review,
+            {**rss_quote, "youtube_id": "still-linked"},
         ))
 
     def test_processing_job_item_summary_is_retry_stable(self):
