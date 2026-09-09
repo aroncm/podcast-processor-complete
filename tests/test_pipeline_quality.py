@@ -47,6 +47,7 @@ from modal_app.full_processor import (
     summarize_processing_job_item_rows,
     summarize_openai_usage,
     theme_match_is_controlled,
+    validate_youtube_audio_relay_identity,
     youtube_title_matches_episode,
 )
 
@@ -86,6 +87,36 @@ class PipelineQualityTests(unittest.TestCase):
             "Creating Shareholder Value with Marpipe CEO Dan Pantelo",
         )
         self.assertFalse(mismatched["matches"])
+
+    def test_youtube_audio_source_replacement_requires_explicit_dry_run_provenance(self):
+        unchanged = validate_youtube_audio_relay_identity(
+            "stored-id1", "stored-id1", dry_run=True
+        )
+        self.assertFalse(unchanged["source_identity_replacement"])
+
+        replacement = validate_youtube_audio_relay_identity(
+            "stored-id1",
+            "correct-id2",
+            expected_previous_youtube_id="stored-id1",
+            dry_run=True,
+        )
+        self.assertTrue(replacement["source_identity_replacement"])
+        self.assertEqual(replacement["expected_previous_youtube_id"], "stored-id1")
+
+        with self.assertRaisesRegex(ValueError, "reviewed dry run"):
+            validate_youtube_audio_relay_identity(
+                "stored-id1",
+                "correct-id2",
+                expected_previous_youtube_id="stored-id1",
+                dry_run=False,
+            )
+        with self.assertRaisesRegex(ValueError, "expected prior ID"):
+            validate_youtube_audio_relay_identity(
+                "changed-id3",
+                "correct-id2",
+                expected_previous_youtube_id="stored-id1",
+                dry_run=True,
+            )
 
     def test_repaired_historical_source_requires_verified_relay_evidence(self):
         review = {

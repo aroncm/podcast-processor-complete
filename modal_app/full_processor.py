@@ -1698,6 +1698,32 @@ def youtube_title_matches_episode(video_title, episode_title):
     }
 
 
+def validate_youtube_audio_relay_identity(
+    stored_youtube_id,
+    relayed_youtube_id,
+    expected_previous_youtube_id="",
+    dry_run=True,
+):
+    """Authorize an unchanged source or an explicit dry-run source replacement."""
+    stored = str(stored_youtube_id or "").strip()
+    relayed = str(relayed_youtube_id or "").strip()
+    expected_previous = str(expected_previous_youtube_id or "").strip()
+    if not stored or not relayed:
+        raise ValueError("stored and relayed YouTube IDs are required")
+    replacement = bool(expected_previous and expected_previous != relayed)
+    if replacement:
+        if not dry_run:
+            raise ValueError("YouTube source replacements require a reviewed dry run")
+        if stored != expected_previous:
+            raise ValueError("the stored YouTube source no longer matches the expected prior ID")
+    elif stored != relayed:
+        raise ValueError("the relayed audio target is no longer eligible")
+    return {
+        "source_identity_replacement": replacement,
+        "expected_previous_youtube_id": expected_previous if replacement else None,
+    }
+
+
 @app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
 def apply_relayed_youtube_alignments(
     scope: str,
@@ -1899,6 +1925,7 @@ def apply_relayed_youtube_audio_alignment(
     audio_bytes: bytes,
     audio_sha256: str,
     dry_run: bool = True,
+    expected_previous_youtube_id: str = "",
 ):
     """Transcribe one bounded operator-relayed YouTube clip and gate exact alignment."""
     import tempfile
@@ -1930,9 +1957,15 @@ def apply_relayed_youtube_audio_alignment(
         quote_ids=[quote_id],
         include_failed=True,
     )
-    if len(rows) != 1 or str(rows[0].get("youtube_id") or "") != youtube_id:
+    if len(rows) != 1:
         raise ValueError("the relayed audio target is no longer eligible")
-    quote = rows[0]
+    identity_change = validate_youtube_audio_relay_identity(
+        rows[0].get("youtube_id"),
+        youtube_id,
+        expected_previous_youtube_id,
+        dry_run=dry_run,
+    )
+    quote = {**rows[0], "youtube_id": youtube_id}
     stored_episode = (
         supabase.table("episodes")
         .select("id,title")
@@ -1974,6 +2007,7 @@ def apply_relayed_youtube_audio_alignment(
             "repair_type": "exact_youtube_audio_source_alignment",
             "quote_id": quote_id,
             "youtube_id": youtube_id,
+            **identity_change,
             "episode_title": authoritative_episode_title,
             "video_title": video_title,
             "title_match": authoritative_title_check,
@@ -2085,6 +2119,7 @@ def apply_relayed_youtube_audio_alignment(
             "dry_run": dry_run,
             "quote_id": quote_id,
             "youtube_id": youtube_id,
+            **identity_change,
             "episode_title": authoritative_episode_title,
             "video_title": video_title,
             "title_match": authoritative_title_check,
@@ -2196,6 +2231,10 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
 
     quote_id = str(dry_result.get("quote_id") or parameters.get("quote_id") or "")
     youtube_id = str(dry_result.get("youtube_id") or parameters.get("youtube_id") or "")
+    source_identity_replacement = bool(parameters.get("source_identity_replacement"))
+    expected_previous_youtube_id = str(
+        parameters.get("expected_previous_youtube_id") or ""
+    ).strip()
     youtube_start = first_numeric_value(dry_result.get("youtube_start"))
     youtube_end = first_numeric_value(dry_result.get("youtube_end"))
     confidence = first_numeric_value(dry_result.get("confidence"))
@@ -2259,9 +2298,17 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
         .limit(1)
         .execute()
     ).data or []
-    if len(rows) != 1 or str(rows[0].get("youtube_id") or "") != youtube_id:
+    if len(rows) != 1:
         raise ValueError("the verified dry relay target no longer matches the stored Take")
     quote = rows[0]
+    stored_youtube_id = str(quote.get("youtube_id") or "")
+    if source_identity_replacement:
+        if not expected_previous_youtube_id or expected_previous_youtube_id == youtube_id:
+            raise ValueError("verified replacement relay is missing prior-source provenance")
+        if stored_youtube_id not in {expected_previous_youtube_id, youtube_id}:
+            raise ValueError("the Take's YouTube source changed after the reviewed dry run")
+    elif stored_youtube_id != youtube_id:
+        raise ValueError("the verified dry relay target no longer matches the stored Take")
     promoted_rss_start = first_numeric_value(
         dry_result.get("rss_start"), quote.get("rss_timestamp_start")
     )
@@ -2302,6 +2349,10 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             "promoted_from_job_id": dry_job_id,
             "quote_id": quote_id,
             "youtube_id": youtube_id,
+            "source_identity_replacement": source_identity_replacement,
+            "expected_previous_youtube_id": (
+                expected_previous_youtube_id if source_identity_replacement else None
+            ),
             "audio_sha256": parameters.get("audio_sha256"),
             "operator_surface": "modal_cli_reviewed_dry_relay",
             "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
@@ -2328,30 +2379,41 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             "clip_end": parameters.get("clip_end"),
             "rss_start": promoted_rss_start,
             "rss_end": promoted_rss_end,
+            "source_identity_replacement": source_identity_replacement,
+            "expected_previous_youtube_id": (
+                expected_previous_youtube_id if source_identity_replacement else None
+            ),
         }
         source_url = (
             f"https://www.youtube.com/watch?v={youtube_id}"
             f"&t={max(0, int(float(youtube_start)))}s"
         )
+        promotion_args = {
+            "p_quote_id": quote_id,
+            "p_youtube_id": youtube_id,
+            "p_rss_start": promoted_rss_start,
+            "p_rss_end": promoted_rss_end,
+            "p_youtube_start": float(youtube_start),
+            "p_youtube_end": float(youtube_end),
+            "p_confidence": float(confidence),
+            "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+            "p_details": alignment_details,
+            "p_processing_job_id": job_id,
+            "p_source_url": source_url,
+            "p_source_excerpt": evidence["excerpt"],
+            "p_source_start_segment": int(source_start_segment),
+            "p_source_end_segment": int(source_end_segment),
+            "p_source_segments": segments,
+        }
+        if source_identity_replacement:
+            promotion_args["p_expected_previous_youtube_id"] = expected_previous_youtube_id
         promoted = supabase.rpc(
-            "promote_historical_youtube_audio_alignment",
-            {
-                "p_quote_id": quote_id,
-                "p_youtube_id": youtube_id,
-                "p_rss_start": promoted_rss_start,
-                "p_rss_end": promoted_rss_end,
-                "p_youtube_start": float(youtube_start),
-                "p_youtube_end": float(youtube_end),
-                "p_confidence": float(confidence),
-                "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
-                "p_details": alignment_details,
-                "p_processing_job_id": job_id,
-                "p_source_url": source_url,
-                "p_source_excerpt": evidence["excerpt"],
-                "p_source_start_segment": int(source_start_segment),
-                "p_source_end_segment": int(source_end_segment),
-                "p_source_segments": segments,
-            },
+            (
+                "promote_historical_youtube_audio_source_replacement"
+                if source_identity_replacement
+                else "promote_historical_youtube_audio_alignment"
+            ),
+            promotion_args,
         ).execute().data or {}
         alignment_already_applied = bool(
             promoted.get("alignment_already_applied", alignment_already_applied)
@@ -2366,6 +2428,10 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             "promoted_from_job_id": dry_job_id,
             "mapping_retry_pending": True,
             "alignment_already_applied": alignment_already_applied,
+            "source_identity_replacement": source_identity_replacement,
+            "previous_youtube_id": (
+                expected_previous_youtube_id if source_identity_replacement else None
+            ),
         }
         update_processing_job(
             supabase,
@@ -10491,6 +10557,7 @@ def main(
     dry_run: bool = True,
     quote_id: str = "",
     repair_job_id: str = "",
+    replacement_youtube_id: str = "",
 ):
     """Operator-only CLI entrypoint for audited smoke checks and bounded runs."""
     import json
@@ -10595,6 +10662,23 @@ def main(
             source_hold_only=True,
             quote_ids=[quote_id] if quote_id else None,
         )
+        replacement_youtube_id = str(replacement_youtube_id or "").strip()
+        if replacement_youtube_id:
+            if not quote_id or len(targets.get("targets") or []) != 1:
+                raise ValueError(
+                    "a replacement YouTube ID requires one explicit eligible quote ID"
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", replacement_youtube_id):
+                raise ValueError("replacement YouTube ID is invalid")
+            original_target = targets["targets"][0]
+            previous_youtube_id = str(original_target.get("youtube_id") or "")
+            if previous_youtube_id == replacement_youtube_id:
+                raise ValueError("replacement YouTube ID must differ from the stored ID")
+            targets["targets"][0] = {
+                **original_target,
+                "youtube_id": replacement_youtube_id,
+                "expected_previous_youtube_id": previous_youtube_id,
+            }
         relayed = []
         skipped = []
         for index, target in enumerate(targets["targets"], start=1):
@@ -10618,6 +10702,9 @@ def main(
                     audio_bytes=clip["audio_bytes"],
                     audio_sha256=clip["audio_sha256"],
                     dry_run=dry_run,
+                    expected_previous_youtube_id=target.get(
+                        "expected_previous_youtube_id", ""
+                    ),
                 )
                 relayed.append(relay_result)
             except Exception as exc:
