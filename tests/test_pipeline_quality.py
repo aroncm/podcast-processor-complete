@@ -902,17 +902,21 @@ class PipelineQualityTests(unittest.TestCase):
             expected_end=34,
         )
         self.assertGreaterEqual(len(candidates), 1)
+        diagnostics = {}
         aligned = align_quote_to_segments_semantically(
             'The risk is turning measurement into procurement instead of learning whether advertising changes behavior.',
             segments,
             expected_start=18,
             expected_end=34,
             client=SimpleNamespace(responses=Responses()),
+            diagnostics=diagnostics,
         )
         self.assertIsNotNone(aligned)
         self.assertTrue(aligned['verification_required'])
         self.assertEqual(aligned['start'], 20)
         self.assertEqual(aligned['end'], 31)
+        self.assertEqual(diagnostics['gate'], 'model_decision')
+        self.assertTrue(diagnostics['decision']['supported'])
 
     def test_first_numeric_value_preserves_zero_and_skips_invalid_values(self):
         self.assertEqual(first_numeric_value(None, '', 'bad', 0, 12), 0)

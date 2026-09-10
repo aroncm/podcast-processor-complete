@@ -2165,6 +2165,7 @@ def apply_relayed_youtube_audio_alignment(
             "strict_lexical" if result.get("status") == "verified" else None
         )
         if semantic_fallback and result.get("status") != "verified":
+            semantic_diagnostics = {}
             semantic = align_quote_to_segments_semantically(
                 str(quote.get("text") or ""),
                 processed,
@@ -2175,10 +2176,16 @@ def apply_relayed_youtube_audio_alignment(
                     quote.get("rss_timestamp_end"), quote.get("timestamp_end"), 30
                 ),
                 client,
+                diagnostics=semantic_diagnostics,
             )
             if semantic:
                 result = build_semantic_audio_alignment_result(result, semantic)
                 alignment_mode = "semantic_source_candidate"
+            else:
+                result = {
+                    **result,
+                    "semantic_alignment_diagnostic": semantic_diagnostics,
+                }
         diagnostic_candidates = []
         if result.get("status") != "verified":
             diagnostic_candidates = rank_source_alignment_candidates(
@@ -4830,6 +4837,7 @@ def align_quote_to_segments_semantically(
     expected_start,
     expected_end,
     client,
+    diagnostics=None,
 ):
     """Stage a source-bounded paraphrase match that still requires SME review."""
     candidates = rank_source_alignment_candidates(
@@ -4838,10 +4846,25 @@ def align_quote_to_segments_semantically(
         expected_start,
         expected_end,
     )
+    if diagnostics is not None:
+        diagnostics.update({
+            "candidate_count": len(candidates),
+            "minimum_confidence": 0.86,
+            "minimum_lexical_score": 0.24,
+            "minimum_distinctive_overlap": 2,
+        })
     if not candidates:
+        if diagnostics is not None:
+            diagnostics["gate"] = "no_candidates"
         return None
     best = candidates[0]
     if best["lexical_score"] < 0.24 or best["distinctive_overlap"] < 2:
+        if diagnostics is not None:
+            diagnostics.update({
+                "gate": "candidate_floor",
+                "best_lexical_score": best["lexical_score"],
+                "best_distinctive_overlap": best["distinctive_overlap"],
+            })
         return None
 
     candidate_text = []
@@ -4903,6 +4926,18 @@ def align_quote_to_segments_semantically(
         reasoning_effort="high",
         max_output_tokens=1400,
     )
+    if diagnostics is not None:
+        diagnostics.update({
+            "gate": "model_decision",
+            "decision": {
+                "supported": bool(result.get("supported")),
+                "candidate_id": result.get("candidate_id"),
+                "match_type": result.get("match_type"),
+                "confidence": result.get("confidence"),
+                "supporting_segment_ids": result.get("supporting_segment_ids") or [],
+                "reason": str(result.get("reason") or "")[:1000],
+            },
+        })
     candidate_id = int(result.get("candidate_id", -1))
     if (
         not result.get("supported")
