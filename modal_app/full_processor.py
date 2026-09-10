@@ -4535,15 +4535,37 @@ def align_quote_to_segments(
                     precision = len(common) / len(candidate_word_set)
                     recall = len(common) / len(quote_word_set)
                     f1 = 2 * precision * recall / (precision + recall)
-                score = (0.6 * sequence_score) + (0.25 * f1) + (0.15 * recall)
+                exact_contiguous_match = any(
+                    window_words[offset:offset + len(quote_words)] == quote_words
+                    for offset in range(len(window_words) - len(quote_words) + 1)
+                )
+                score = (
+                    1.0
+                    if exact_contiguous_match
+                    else (0.6 * sequence_score) + (0.25 * f1) + (0.15 * recall)
+                )
                 candidate = {
                     "score": score,
+                    "exact_contiguous_match": exact_contiguous_match,
+                    "window_word_count": len(window_words),
                     "start_index": source_index,
                     "end_index": window[-1][0],
                     "start": float(window[0][1].get("start", 0)),
                     "end": float(window[-1][1].get("end", 0)),
                 }
-                if best is None or score > best["score"]:
+                is_better = (
+                    best is None
+                    or score > best["score"]
+                    or (
+                        score == best["score"]
+                        and exact_contiguous_match
+                        and (
+                            not best.get("exact_contiguous_match")
+                            or len(window_words) < best.get("window_word_count", float("inf"))
+                        )
+                    )
+                )
+                if is_better:
                     if best is not None and (
                         candidate["start_index"] > best["end_index"]
                         or candidate["end_index"] < best["start_index"]

@@ -55,6 +55,49 @@ from modal_app.full_processor import (
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_exact_short_quote_inside_caption_context_passes_uniquely(self):
+        segments = [
+            {
+                "start": 803.16,
+                "end": 809.24,
+                "raw_text": "he said value is not defined by the absence",
+            },
+            {
+                "start": 809.24,
+                "end": 815.32,
+                "raw_text": "of bad but the presence of good which sets the tone",
+            },
+            {
+                "start": 818.84,
+                "end": 821.96,
+                "raw_text": "media quality used to mean blocking the bad",
+            },
+        ]
+        aligned = align_quote_to_segments(
+            "Value is not defined by the absence of bad, but the presence of good.",
+            segments,
+            811.0,
+            820.0,
+        )
+        self.assertIsNotNone(aligned)
+        self.assertEqual(aligned["confidence"], 1.0)
+        self.assertEqual(aligned["start_segment"], 0)
+        self.assertEqual(aligned["end_segment"], 1)
+
+    def test_duplicate_exact_short_quote_remains_ambiguous(self):
+        quote = "Value is not defined by the absence of bad but the presence of good"
+        segments = [
+            {"start": 0.0, "end": 4.0, "raw_text": quote},
+            {"start": 10.0, "end": 14.0, "raw_text": "unrelated transition words"},
+            {"start": 20.0, "end": 24.0, "raw_text": quote},
+        ]
+        self.assertIsNone(align_quote_to_segments(
+            quote,
+            segments,
+            0.0,
+            24.0,
+        ))
+
     def test_legacy_clip_filename_recovers_episode_absolute_span(self):
         self.assertEqual(
             legacy_clip_absolute_span({
