@@ -10,6 +10,7 @@ from modal_app.full_processor import (
     align_quote_to_segments_semantically,
     build_extraction_chunks,
     build_caption_evidence,
+    build_semantic_audio_alignment_result,
     align_quote_to_segments,
     bind_candidate_to_directories,
     call_openai_structured,
@@ -50,6 +51,7 @@ from modal_app.full_processor import (
     summarize_openai_usage,
     theme_match_is_controlled,
     validate_youtube_audio_relay_identity,
+    validate_youtube_audio_alignment_policy,
     youtube_title_matches_episode,
 )
 
@@ -183,6 +185,39 @@ class PipelineQualityTests(unittest.TestCase):
                 expected_previous_youtube_id="stored-id1",
                 dry_run=True,
             )
+
+    def test_semantic_audio_alignment_requires_reviewed_dry_promotion(self):
+        validate_youtube_audio_alignment_policy(True, True)
+        validate_youtube_audio_alignment_policy(False, False)
+        with self.assertRaisesRegex(ValueError, "reviewed as a dry run"):
+            validate_youtube_audio_alignment_policy(True, False)
+
+    def test_semantic_audio_candidate_preserves_bounded_audit_details(self):
+        result = build_semantic_audio_alignment_result(
+            {
+                "status": "failed",
+                "youtube_start": None,
+                "youtube_end": None,
+                "confidence": None,
+                "error_code": "no_unique_high_confidence_match",
+            },
+            {
+                "start": 100.0,
+                "end": 112.0,
+                "confidence": 0.93,
+                "match_kind": "faithful_paraphrase",
+                "lexical_score": 0.61,
+                "semantic_reason": "Every material assertion is present in the source.",
+                "semantic_model": "source-model",
+            },
+        )
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["youtube_start"], 98.5)
+        self.assertEqual(result["youtube_end"], 113.5)
+        self.assertEqual(result["confidence"], 0.93)
+        self.assertTrue(
+            result["semantic_alignment"]["requires_reviewed_promotion"]
+        )
 
     def test_repaired_historical_source_requires_verified_relay_evidence(self):
         review = {

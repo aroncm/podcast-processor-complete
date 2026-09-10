@@ -1768,6 +1768,43 @@ def validate_youtube_audio_relay_identity(
     }
 
 
+def validate_youtube_audio_alignment_policy(semantic_fallback, dry_run):
+    """Require a reviewed dry job before any semantic source promotion."""
+    if semantic_fallback and not dry_run:
+        raise ValueError(
+            "semantic audio alignment must be reviewed as a dry run before promotion"
+        )
+
+
+def build_semantic_audio_alignment_result(base_result, semantic):
+    """Convert a high-confidence semantic source candidate into dry-run evidence."""
+    if not semantic:
+        return base_result
+    suggested_start = round(max(0.0, float(semantic["start"]) - 1.5), 3)
+    suggested_end = round(
+        max(suggested_start + 1.0, float(semantic["end"]) + 1.5),
+        3,
+    )
+    return {
+        **base_result,
+        "status": "verified",
+        "youtube_start": suggested_start,
+        "youtube_end": suggested_end,
+        "confidence": semantic.get("confidence"),
+        "error_code": None,
+        "semantic_alignment": {
+            "match_start": semantic.get("start"),
+            "match_end": semantic.get("end"),
+            "match_kind": semantic.get("match_kind"),
+            "lexical_score": semantic.get("lexical_score"),
+            "reason": semantic.get("semantic_reason"),
+            "model": semantic.get("semantic_model"),
+            "prompt_version": SEMANTIC_ALIGNMENT_PROMPT_VERSION,
+            "requires_reviewed_promotion": True,
+        },
+    }
+
+
 @app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
 def apply_relayed_youtube_alignments(
     scope: str,
@@ -1970,8 +2007,9 @@ def apply_relayed_youtube_audio_alignment(
     audio_sha256: str,
     dry_run: bool = True,
     expected_previous_youtube_id: str = "",
+    semantic_fallback: bool = False,
 ):
-    """Transcribe one bounded operator-relayed YouTube clip and gate exact alignment."""
+    """Transcribe one bounded operator-relayed YouTube clip and gate alignment."""
     import tempfile
     from openai import OpenAI
     from supabase import create_client
@@ -1988,6 +2026,7 @@ def apply_relayed_youtube_audio_alignment(
         raise ValueError("relayed audio must be between 1 byte and 15 MB")
     if hashlib.sha256(audio_bytes).hexdigest() != str(audio_sha256):
         raise ValueError("relayed audio digest mismatch")
+    validate_youtube_audio_alignment_policy(semantic_fallback, dry_run)
 
     title_check = youtube_title_matches_episode(video_title, episode_title)
     if not title_check["matches"]:
@@ -2048,7 +2087,11 @@ def apply_relayed_youtube_audio_alignment(
         "job_type": "data_repair",
         "source": "repair",
         "parameters": {
-            "repair_type": "exact_youtube_audio_source_alignment",
+            "repair_type": (
+                "youtube_audio_source_alignment"
+                if semantic_fallback
+                else "exact_youtube_audio_source_alignment"
+            ),
             "quote_id": quote_id,
             "youtube_id": youtube_id,
             **identity_change,
@@ -2060,6 +2103,7 @@ def apply_relayed_youtube_audio_alignment(
             "audio_sha256": audio_sha256,
             "audio_bytes": len(audio_bytes),
             "dry_run": dry_run,
+            "semantic_fallback": bool(semantic_fallback),
             "operator_surface": "modal_local_youtube_audio_relay",
             "transcription_model": transcription_model,
             "alignment_version": YOUTUBE_ALIGNMENT_VERSION,
@@ -2117,6 +2161,24 @@ def apply_relayed_youtube_audio_alignment(
             dry_run=dry_run,
             processing_job_id=job_id,
         )
+        alignment_mode = (
+            "strict_lexical" if result.get("status") == "verified" else None
+        )
+        if semantic_fallback and result.get("status") != "verified":
+            semantic = align_quote_to_segments_semantically(
+                str(quote.get("text") or ""),
+                processed,
+                first_numeric_value(
+                    quote.get("rss_timestamp_start"), quote.get("timestamp_start"), 0
+                ),
+                first_numeric_value(
+                    quote.get("rss_timestamp_end"), quote.get("timestamp_end"), 30
+                ),
+                client,
+            )
+            if semantic:
+                result = build_semantic_audio_alignment_result(result, semantic)
+                alignment_mode = "semantic_source_candidate"
         diagnostic_candidates = []
         if result.get("status") != "verified":
             diagnostic_candidates = rank_source_alignment_candidates(
@@ -2174,6 +2236,7 @@ def apply_relayed_youtube_audio_alignment(
             "matched_excerpt": evidence.get("excerpt") if evidence else None,
             "matched_evidence": evidence,
             "diagnostic_candidates": diagnostic_candidates,
+            "alignment_mode": alignment_mode,
             **result,
         }
         verified = result.get("status") == "verified"
@@ -2191,7 +2254,11 @@ def apply_relayed_youtube_audio_alignment(
                 "dry_run": dry_run,
             },
             error_code=None if verified else "youtube_audio_alignment_incomplete",
-            error_message=None if verified else "strict quote-to-audio alignment did not pass",
+            error_message=(
+                None
+                if verified
+                else "quote-to-audio alignment did not pass the configured source gates"
+            ),
             completed_at=utcnow_iso(),
         )
         return {"job_id": job_id, **final}
@@ -2220,7 +2287,7 @@ def apply_relayed_youtube_audio_alignment(
 
 @app.function(image=image, secrets=[my_secret], timeout=300)
 def promote_verified_youtube_audio_relay(dry_job_id: str):
-    """Apply one reviewed, strict-match dry audio relay without retranscription."""
+    """Apply one reviewed, source-grounded dry audio relay without retranscription."""
     from supabase import create_client
 
     dry_job_id = str(dry_job_id or "").strip()
@@ -2243,7 +2310,10 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
         dry_job.get("job_type") != "data_repair"
         or dry_job.get("source") != "repair"
         or dry_job.get("state") != "succeeded"
-        or parameters.get("repair_type") != "exact_youtube_audio_source_alignment"
+        or parameters.get("repair_type") not in {
+            "exact_youtube_audio_source_alignment",
+            "youtube_audio_source_alignment",
+        }
         or parameters.get("dry_run") is not True
         or dry_result.get("status") != "verified"
         or dry_result.get("dry_run") is not True
@@ -2282,6 +2352,8 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
     youtube_start = first_numeric_value(dry_result.get("youtube_start"))
     youtube_end = first_numeric_value(dry_result.get("youtube_end"))
     confidence = first_numeric_value(dry_result.get("confidence"))
+    alignment_mode = str(dry_result.get("alignment_mode") or "strict_lexical")
+    semantic_alignment = dry_result.get("semantic_alignment") or {}
     evidence = dry_result.get("matched_evidence") or {}
     segments = evidence.get("segments") or []
     first_segment = (
@@ -2309,7 +2381,12 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
         or youtube_end is None
         or youtube_end <= youtube_start
         or confidence is None
-        or confidence < 0.70
+        or alignment_mode not in {"strict_lexical", "semantic_source_candidate"}
+        or (
+            alignment_mode == "semantic_source_candidate"
+            and parameters.get("semantic_fallback") is not True
+        )
+        or confidence < (0.86 if alignment_mode == "semantic_source_candidate" else 0.70)
         or not isinstance(segments, list)
         or not segments
         or not str(evidence.get("excerpt") or "").strip()
@@ -2414,6 +2491,7 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
         alignment_details = {
             "caption_source": "youtube_audio_whisper_operator_relay",
             "audio_sha256": parameters.get("audio_sha256"),
+            "alignment_mode": alignment_mode,
             "promoted_from_job_id": dry_job_id,
             "reviewed_dry_relay": True,
             "episode_title": parameters.get("episode_title"),
@@ -2423,6 +2501,7 @@ def promote_verified_youtube_audio_relay(dry_job_id: str):
             "clip_end": parameters.get("clip_end"),
             "rss_start": promoted_rss_start,
             "rss_end": promoted_rss_end,
+            "semantic_alignment": semantic_alignment,
             "source_identity_replacement": source_identity_replacement,
             "expected_previous_youtube_id": (
                 expected_previous_youtube_id if source_identity_replacement else None
@@ -4723,8 +4802,12 @@ def rank_source_alignment_candidates(
                 break
         if substantially_overlaps:
             continue
-        context_start = max(0, candidate["start_index"] - 2)
-        context_end = min(len(segments) - 1, candidate["end_index"] + 2)
+        # Editorial Takes can condense two adjacent sentences separated by
+        # disfluencies. Give the source-only adjudicator enough neighboring
+        # transcript to verify every material assertion without expanding the
+        # ranked time span itself.
+        context_start = max(0, candidate["start_index"] - 8)
+        context_end = min(len(segments) - 1, candidate["end_index"] + 8)
         candidate["segments"] = [
             {
                 "id": index,
@@ -11054,6 +11137,7 @@ def main(
     repair_job_id: str = "",
     replacement_youtube_id: str = "",
     clear_invalid_youtube_source: bool = False,
+    semantic_fallback: bool = False,
 ):
     """Operator-only CLI entrypoint for audited smoke checks and bounded runs."""
     import json
@@ -11201,6 +11285,7 @@ def main(
                     expected_previous_youtube_id=target.get(
                         "expected_previous_youtube_id", ""
                     ),
+                    semantic_fallback=semantic_fallback,
                 )
                 relayed.append(relay_result)
             except Exception as exc:
