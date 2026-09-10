@@ -11265,6 +11265,7 @@ def main(
             scope=relay_scope,
             limit=backfill_limit,
             source_hold_only=source_hold_only,
+            quote_ids=[quote_id] if quote_id else None,
         )
         if not targets["quote_ids"]:
             result = {
