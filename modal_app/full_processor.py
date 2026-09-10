@@ -4514,7 +4514,11 @@ def align_quote_to_segments(
                 ).split()
                 if len(window_words) < minimum_words:
                     continue
-                if len(window_words) > maximum_words:
+                exact_contiguous_match = any(
+                    window_words[offset:offset + len(quote_words)] == quote_words
+                    for offset in range(len(window_words) - len(quote_words) + 1)
+                )
+                if len(window_words) > maximum_words and not exact_contiguous_match:
                     break
                 # Compare token sequences, not raw characters. Character-level
                 # SequenceMatcher enables auto-junk on long quotes and can
@@ -4535,10 +4539,6 @@ def align_quote_to_segments(
                     precision = len(common) / len(candidate_word_set)
                     recall = len(common) / len(quote_word_set)
                     f1 = 2 * precision * recall / (precision + recall)
-                exact_contiguous_match = any(
-                    window_words[offset:offset + len(quote_words)] == quote_words
-                    for offset in range(len(window_words) - len(quote_words) + 1)
-                )
                 score = (
                     1.0
                     if exact_contiguous_match
@@ -4577,6 +4577,8 @@ def align_quote_to_segments(
                     or candidate["end_index"] < best["start_index"]
                 ):
                     runner_up = max(runner_up, score)
+                if exact_contiguous_match:
+                    break
         return best, runner_up
 
     search_start = max(0.0, float(expected_start) - 300)
