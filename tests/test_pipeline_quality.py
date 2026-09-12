@@ -918,6 +918,38 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(diagnostics['gate'], 'model_decision')
         self.assertTrue(diagnostics['decision']['supported'])
 
+    def test_semantic_candidate_contexts_do_not_duplicate_the_same_source_span(self):
+        segments = [
+            {
+                'start': index * 4,
+                'end': (index + 1) * 4,
+                'raw_text': (
+                    'digital out of home inventory is fragmented'
+                    if index == 8
+                    else 'the majority is transacted through a private marketplace'
+                    if index == 9
+                    else f'unrelated discussion segment {index}'
+                ),
+            }
+            for index in range(22)
+        ]
+        candidates = rank_source_alignment_candidates(
+            'Digital out of home inventory is fragmented and the majority is transacted through a private marketplace.',
+            segments,
+            expected_start=30,
+            expected_end=42,
+            max_candidates=6,
+        )
+        self.assertGreaterEqual(len(candidates), 1)
+        for index, candidate in enumerate(candidates):
+            candidate_ids = {row['id'] for row in candidate['segments']}
+            for prior in candidates[:index]:
+                prior_ids = {row['id'] for row in prior['segments']}
+                overlap = len(candidate_ids & prior_ids) / min(
+                    len(candidate_ids), len(prior_ids)
+                )
+                self.assertLess(overlap, 0.60)
+
     def test_first_numeric_value_preserves_zero_and_skips_invalid_values(self):
         self.assertEqual(first_numeric_value(None, '', 'bad', 0, 12), 0)
 

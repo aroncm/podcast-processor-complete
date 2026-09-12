@@ -4825,6 +4825,15 @@ def rank_source_alignment_candidates(
             for index in range(context_start, context_end + 1)
             if str(segments[index].get("raw_text") or segments[index].get("text") or "").strip()
         ]
+        candidate_context_ids = {row["id"] for row in candidate["segments"]}
+        if any(
+            len(candidate_context_ids & {row["id"] for row in prior["segments"]})
+            / min(len(candidate_context_ids), len(prior["segments"]))
+            >= 0.60
+            for prior in selected
+            if candidate_context_ids and prior.get("segments")
+        ):
+            continue
         selected.append(candidate)
         if len(selected) >= max_candidates:
             break
