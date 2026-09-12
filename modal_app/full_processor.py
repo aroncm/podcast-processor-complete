@@ -4813,8 +4813,8 @@ def rank_source_alignment_candidates(
         # disfluencies. Give the source-only adjudicator enough neighboring
         # transcript to verify every material assertion without expanding the
         # ranked time span itself.
-        context_start = max(0, candidate["start_index"] - 8)
-        context_end = min(len(segments) - 1, candidate["end_index"] + 8)
+        context_start = max(0, candidate["start_index"] - 12)
+        context_end = min(len(segments) - 1, candidate["end_index"] + 12)
         candidate["segments"] = [
             {
                 "id": index,
