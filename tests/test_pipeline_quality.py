@@ -31,6 +31,8 @@ from modal_app.full_processor import (
     legacy_clip_absolute_span,
     legacy_clip_file_bounds,
     missing_take_verification_fields,
+    PUBLISH_FIELDS,
+    publish_blockers,
     merge_reviewed_question_taxonomy,
     merge_tentative_conversation_candidates,
     merge_verified_speaker_connections,
@@ -1139,3 +1141,47 @@ class PipelineQualityTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PublishPathTests(unittest.TestCase):
+    """Oct 20, 2026: the publish select never loaded guest_id, which the readiness check requires, so every
+    publish failed from Aug 25 on. These keep the select and the checks in step."""
+
+    READY = {
+        "quote_text": "Agents can optimize in near real time.", "speaker_name": "Joe Zappa",
+        "speaker_title": "Founder & CEO", "speaker_company": "Sharp Pen Media", "guest_id": "g1",
+        "youtube_id": "", "approval_status": "approved", "context_review_status": "approved",
+        "editorial_context": "Context.", "source_transcript_excerpt": "Transcript.",
+        "mapping_review_status": "approved", "proposed_theme_name": "Agentic buying",
+        "proposed_theme_summary": "Summary.", "proposed_question_text": "What changes?",
+        "connection_context": "How it connects.",
+    }
+
+    def test_every_field_the_checks_read_is_selected(self):
+        read = set()
+
+        class Recorder(dict):
+            def get(self, key, default=None):
+                read.add(key)
+                return super().get(key, default)
+
+        publish_blockers(Recorder(self.READY))
+        publish_blockers(Recorder({}))
+        selected = {field.strip() for field in PUBLISH_FIELDS.split(",")}
+        self.assertEqual(read - selected, set(), "publish checks read a column the publish select does not load")
+
+    def test_ready_take_has_no_blockers(self):
+        self.assertEqual(publish_blockers(self.READY), [])
+
+    def test_missing_directory_match_is_reported(self):
+        record = dict(self.READY, guest_id=None)
+        self.assertIn("verify the speaker directory match", publish_blockers(record))
+
+    def test_category_is_not_required(self):
+        self.assertEqual(publish_blockers(dict(self.READY, category=None, category_id=None)), [])
+
+    def test_every_missing_item_is_listed_at_once(self):
+        blockers = publish_blockers({})
+        for item in ("approve the take", "approve the context", "attach the transcript evidence",
+                     "approve the theme, question and connections"):
+            self.assertIn(item, blockers)

@@ -3040,38 +3040,44 @@ def promote_quote_to_production(quote_id: str, reviewer_id: str = None):
     from supabase import create_client
     supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
     try:
+        # Oct 20, 2026: this select never loaded guest_id, which the check below requires, so every
+        # publish failed with "Verify speaker directory match" from Aug 25 on. PUBLISH_FIELDS now holds
+        # every column publish_blockers reads, and a test keeps the two in step.
         staged_result = (
             supabase.table("test_quotes")
-            .select(
-                "quote_text,speaker_name,speaker_title,speaker_company,category,"
-                "youtube_id,youtube_alignment_status,youtube_timestamp_start,"
-                "youtube_timestamp_end,approval_status,context_review_status,"
-                "mapping_review_status"
-            )
+            .select(PUBLISH_FIELDS)
             .eq("id", quote_id)
             .single()
             .execute()
         )
         staged = staged_result.data or {}
-        missing = missing_take_verification_fields(staged)
-        if missing:
+        blockers = publish_blockers(staged)
+        if blockers:
             return {
                 "success": False,
-                "error": f"Verify {', '.join(missing)} before publication",
+                "error": f"Before publishing: {'; '.join(blockers)}",
+                "blockers": blockers,
             }
-        if staged.get("approval_status") != "approved":
-            return {"success": False, "error": "The take must be approved before publication"}
-        if staged.get("context_review_status") != "approved":
-            return {"success": False, "error": "Context must be approved before publication"}
-        if staged.get("mapping_review_status") != "approved":
-            return {"success": False, "error": "Connections must be approved before publication"}
         result = supabase.rpc(
             "promote_curated_quote_with_conversation",
             {"p_quote_id": quote_id, "p_reviewer_id": reviewer_id},
         ).execute()
         production_quote_id = result.data
+        placement = (
+            supabase.table("conversation_take_links")
+            .select("theme_id,question_id")
+            .eq("quote_id", production_quote_id)
+            .eq("source_test_quote_id", quote_id)
+            .limit(1)
+            .execute()
+        ).data or []
         print(f"✅ Atomic promotion complete: {production_quote_id}")
-        return {"success": True, "production_quote_id": production_quote_id}
+        return {
+            "success": True,
+            "production_quote_id": production_quote_id,
+            "theme_id": placement[0]["theme_id"] if placement else None,
+            "question_id": placement[0]["question_id"] if placement else None,
+        }
     except Exception as exc:
         print(f"❌ Promotion failed: {exc}")
         return {"success": False, "error": str(exc)}
@@ -4371,6 +4377,42 @@ def missing_take_verification_fields(record):
     ):
         missing.append("exact YouTube segment")
     return missing
+
+
+# Every test_quotes column the publish path reads. promote_quote_to_production and /publish-readiness select exactly
+# these, so a check can never look at a field that was not loaded (the Aug 25 to Oct 20, 2026 publish bug).
+PUBLISH_FIELDS = (
+    "quote_text,speaker_name,speaker_title,speaker_company,guest_id,category,category_id,"
+    "youtube_id,youtube_alignment_status,youtube_timestamp_start,youtube_timestamp_end,"
+    "approval_status,context_review_status,mapping_review_status,editorial_context,"
+    "source_transcript_excerpt,proposed_theme_name,proposed_theme_summary,"
+    "proposed_question_text,connection_context"
+)
+
+
+def publish_blockers(record):
+    """Everything still standing between a staged take and the reader, in the order an editor fixes it.
+    Mirrors the database's own checks (promote_curated_quote and promote_curated_quote_with_conversation),
+    so the Admin can show the whole list before Publish instead of one error at a time."""
+    record = record or {}
+    text = lambda field: str(record.get(field) or "").strip()
+    blockers = [f"verify the {label}" for label in missing_take_verification_fields(record)]
+    if record.get("approval_status") != "approved":
+        blockers.append("approve the take")
+    if record.get("context_review_status") != "approved":
+        blockers.append("approve the context")
+    elif not text("editorial_context"):
+        blockers.append("write the context")
+    if not text("source_transcript_excerpt"):
+        blockers.append("attach the transcript evidence")
+    if record.get("mapping_review_status") != "approved":
+        blockers.append("approve the theme, question and connections")
+    else:
+        for field, label in (("proposed_theme_name", "theme"), ("proposed_theme_summary", "theme summary"),
+                             ("proposed_question_text", "question"), ("connection_context", "connection note")):
+            if not text(field):
+                blockers.append(f"add the {label}")
+    return blockers
 
 
 def editorial_gate_invalidations(before, updates):
@@ -10662,6 +10704,19 @@ def fastapi_app():
     async def approve_quote_compat(req: ReviewRequest, admin=Depends(require_admin)):
         req.action = "approve"
         return await review_quote_endpoint(req, admin)
+
+    @web_app.get("/publish-readiness/{quote_id}")
+    async def publish_readiness_endpoint(quote_id: str, admin=Depends(require_admin)):
+        """Read-only: what still blocks this take from publishing (the same list the publish step enforces)."""
+        try:
+            supabase = service_client()
+            row = supabase.table("test_quotes").select(PUBLISH_FIELDS).eq("id", quote_id).limit(1).execute().data or []
+            if not row:
+                return JSONResponse(status_code=404, content={"ready": False, "blockers": ["take not found"]})
+            blockers = publish_blockers(row[0])
+            return {"ready": not blockers, "blockers": blockers}
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"ready": False, "blockers": [str(exc)]})
 
     @web_app.post("/promote-quote")
     async def promote_quote_endpoint(req: ClipRequest, admin=Depends(require_admin)):
