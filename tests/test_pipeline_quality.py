@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     THREAD_MATCH_SCHEMA,
+    speaker_is_verified,
     DISCOVERY_SCHEMA,
     THEME_SCAN_SCHEMA,
     build_discovery_prompt,
@@ -1325,3 +1326,10 @@ class ThreadDiscoveryTests(unittest.TestCase):
     def test_slug_is_stable_and_safe(self):
         self.assertEqual(_slugify("Who controls  the data?"), _slugify("who controls the data?"))
         self.assertRegex(_slugify("Who controls the data?"), r"^who-controls-the-data-[0-9a-f]{8}$")
+
+
+class SpeakerVerificationTests(unittest.TestCase):
+    def test_only_directory_people_with_real_names_can_join_threads(self):
+        self.assertTrue(speaker_is_verified("Ari Paparo", "ari-paparo"))
+        for name, gid in (("Unknown", "x"), ("Name", "x"), ("Ari Paparo", None), ("  ", "x"), ("Speaker", "x")):
+            self.assertFalse(speaker_is_verified(name, gid), (name, gid))

@@ -5822,6 +5822,155 @@ def _slugify(text):
     return f"{base}-{hashlib.md5(' '.join(str(text or '').split()).lower().encode()).hexdigest()[:8]}"
 
 
+PLACEHOLDER_SPEAKERS = {"", "unknown", "unknown speaker", "unnamed", "unnamed speaker", "host", "guest", "name", "speaker", "n/a", "na", "tbd"}
+
+
+def speaker_is_verified(name, guest_id):
+    """A perspective can join a thread only when its speaker is a real person in the directory."""
+    return bool(guest_id) and normalize_directory_value(name) not in PLACEHOLDER_SPEAKERS
+
+
+def ensure_directory_person(supabase, name, title, company, linkedin=None):
+    """Find a directory person by name, or create one (full name, title and company required)."""
+    name = " ".join(str(name or "").split()); title = " ".join(str(title or "").split()); company = " ".join(str(company or "").split())
+    if normalize_directory_value(name) in PLACEHOLDER_SPEAKERS or len(name.split()) < 2:
+        raise ValueError("Enter the speaker's full name")
+    people = supabase.table("guests").select("id,name,title,company").limit(5000).execute().data or []
+    person = next((p for p in people if normalize_directory_value(p.get("name")) == normalize_directory_value(name)), None)
+    if person:
+        return person
+    if not title or not company:
+        raise ValueError("A new person needs a title and company")
+    slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")
+    guest_id = f"{slug}-{hashlib.sha256(name.casefold().encode()).hexdigest()[:8]}"
+    row = {"id": guest_id, "slug": guest_id, "name": name, "title": title, "company": company, "linkedin_url": (linkedin or "").strip() or None}
+    return (supabase.table("guests").insert(row).execute().data or [row])[0]
+
+
+def apply_perspective_edit(supabase, kind, row_id, edits, admin_id, context):
+    """Correct a perspective in place: words, speaker, episode details and the exact YouTube moment.
+    Published perspectives live in quotes (episode details in episodes, shared by the whole episode); approved takes
+    that are not yet published live in test_quotes. Timing always goes through the audited alignment path."""
+    table, text_field = ("quotes", "text") if kind == "published" else ("test_quotes", "quote_text")
+    before = (supabase.table(table).select("*").eq("id", row_id).single().execute()).data
+    if not before:
+        raise ValueError("Perspective not found")
+    updates = {}
+    if edits.get("text") is not None:
+        text = " ".join(str(edits["text"]).split())
+        if len(text.split()) < 4:
+            raise ValueError("The quote needs at least a few words")
+        if text != " ".join(str(before.get(text_field) or "").split()):
+            updates[text_field] = text
+    person = None
+    if edits.get("guest_id"):
+        found = supabase.table("guests").select("id,name,title,company,linkedin_url").eq("id", edits["guest_id"]).limit(1).execute().data or []
+        if not found:
+            raise ValueError("That person is not in the directory")
+        person = found[0]
+    elif edits.get("new_speaker_name"):
+        person = ensure_directory_person(supabase, edits.get("new_speaker_name"), edits.get("new_speaker_title"),
+                                         edits.get("new_speaker_company"), edits.get("new_speaker_linkedin"))
+    if person:
+        if kind == "published":
+            updates.update({"guest_id": person["id"], "speaker": person["name"], "guest_name": person["name"]})
+        else:
+            updates.update({"guest_id": person["id"], "speaker_name": person["name"], "speaker_title": person.get("title") or "",
+                            "speaker_company": person.get("company") or "", "speaker_linkedin": person.get("linkedin_url") or ""})
+    episode_title = " ".join(str(edits.get("episode_title") or "").split())
+    episode_date = str(edits.get("episode_date") or "").strip()[:10]
+    if episode_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", episode_date):
+        raise ValueError("Enter the episode date as YYYY-MM-DD")
+    if kind == "published" and (episode_title or episode_date) and before.get("episode_id"):
+        ep = {k: v for k, v in (("title", episode_title), ("date", episode_date)) if v}
+        supabase.table("episodes").update(ep).eq("id", before["episode_id"]).execute()
+    elif kind != "published":
+        if episode_title:
+            updates["episode_name"] = episode_title
+        if episode_date:
+            updates["date_published"] = episode_date
+    if updates:
+        updates["updated_at"] = utcnow_iso()
+        supabase.table(table).update(updates).eq("id", row_id).execute()
+    youtube_id = str(edits.get("youtube_id") or "").strip()
+    start, end = edits.get("start"), edits.get("end")
+    if youtube_id or start is not None or end is not None:
+        youtube_id = (extract_youtube_id(youtube_id) or "") if "youtu" in youtube_id else youtube_id
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_id or ""):
+            raise ValueError("Enter the 11-character YouTube video ID or a YouTube link")
+        if start is None or end is None or start < 0 or end <= start or end - start > 600:
+            raise ValueError("Enter a start and end time, with the end after the start (10 minutes at most)")
+        if youtube_id != str(before.get("youtube_id") or ""):
+            supabase.table(table).update({"youtube_id": youtube_id}).eq("id", row_id).execute()
+        supabase.rpc("apply_youtube_alignment_result", {
+            "p_quote_table": table, "p_quote_id": str(row_id), "p_status": "manual_verified", "p_youtube_id": youtube_id,
+            "p_rss_start": before.get("rss_timestamp_start"), "p_rss_end": before.get("rss_timestamp_end"),
+            "p_youtube_start": start, "p_youtube_end": end, "p_confidence": None,
+            "p_method": "sme_manual_source_verification", "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+            "p_details": {"reviewer_id": admin_id, "context": context}, "p_processing_job_id": before.get("processing_job_id"),
+        }).execute()
+    print(f"AUDIT perspective_edited table={table} row={row_id} fields={sorted(updates)} by={admin_id} context={context}")
+    return True
+
+
+def perspective_speaker_check(supabase, kind, row_id):
+    """Current speaker verification for one perspective, read fresh from the database."""
+    if kind == "published":
+        rows = supabase.table("reader_perspectives_v1").select("speaker_name,guest_id").eq("id", row_id).limit(1).execute().data or []
+    else:
+        rows = supabase.table("test_quotes").select("speaker_name,guest_id").eq("id", row_id).limit(1).execute().data or []
+    return bool(rows) and speaker_is_verified(rows[0].get("speaker_name"), rows[0].get("guest_id"))
+
+
+@app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
+def refresh_thread_proposal(proposal_id: str, job_id: str = None):
+    """Re-read the perspectives against a proposal's edited theme and question and replace its suggested members."""
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import OpenAI
+    from supabase import create_client
+
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    try:
+        update_processing_job(supabase, job_id, "claimed", started_at=utcnow_iso())
+        prop = supabase.table("thread_proposals").select("*").eq("id", proposal_id).single().execute().data
+        candidates = discovery_candidates(supabase, prop.get("theme_id") if prop["scope"] == "theme" else None)
+        known = {(c["kind"], c["id"]) for c in candidates}
+        for m in prop.get("members") or []:
+            if (m["kind"], m["id"]) not in known:
+                table = "reader_perspectives_v1" if m["kind"] == "published" else "test_quotes"
+                cols = "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_date" if m["kind"] == "published" else "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,date_published"
+                r = (supabase.table(table).select(cols).eq("id", m["id"]).limit(1).execute().data or [None])[0]
+                if r:
+                    candidates.append({"kind": m["kind"], "id": r["id"], "text": r.get("text") or r.get("quote_text"), "speaker_name": r.get("speaker_name"),
+                                       "speaker_title": r.get("speaker_title"), "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"),
+                                       "episode_date": r.get("episode_date") or str(r.get("date_published") or "")[:10] or None})
+        for index, c in enumerate(candidates, start=1):
+            c["key"] = f"P{index}"
+        batches = [candidates[i:i + THREAD_MATCH_BATCH] for i in range(0, len(candidates), THREAD_MATCH_BATCH)]
+        update_processing_job(supabase, job_id, "mapping", progress={"candidates": len(candidates), "batches": len(batches)})
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+        theme = {"name": prop["theme_name"], "summary": prop.get("theme_summary")}
+        question = {"question_text": prop["question_text"]}
+
+        def run(batch):
+            result = call_openai_structured(client, model=model, system_prompt=THREAD_MATCH_SYSTEM_PROMPT,
+                user_prompt=build_thread_match_prompt(theme, question, [], batch), schema_name="thread_matches",
+                schema=THREAD_MATCH_SCHEMA, reasoning_effort=os.environ.get("OPENAI_THREAD_MATCH_REASONING", "medium"), max_output_tokens=4000)
+            return filter_thread_matches(result, batch)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            matches = sorted((m for found in pool.map(run, batches) for m in found), key=lambda m: -m["fit_score"])[:15]
+        members = [{"kind": m["kind"], "id": m["id"], "fit_score": m["fit_score"], "reason": m["reason"]} for m in matches]
+        supabase.table("thread_proposals").update({"members": members, "model": model, "processing_job_id": job_id}).eq("id", proposal_id).execute()
+        summary = {"candidates": len(candidates), "members": len(members)}
+        update_processing_job(supabase, job_id, "succeeded", progress=summary, result=summary, completed_at=utcnow_iso())
+        return {"success": True, **summary}
+    except Exception as exc:
+        update_processing_job(supabase, job_id, "failed", error_code="thread_proposal_refresh_failed", error_message=str(exc)[:500], completed_at=utcnow_iso())
+        raise
+
+
 def propose_historical_conversation_mapping(
     quote,
     source_evidence,
@@ -9614,6 +9763,27 @@ def fastapi_app():
         question_summary: str | None = None
         member_ids: list[str]
 
+    class PerspectiveEditRequest(BaseModel):
+        kind: str
+        id: str
+        text: str | None = None
+        guest_id: str | None = None
+        new_speaker_name: str | None = None
+        new_speaker_title: str | None = None
+        new_speaker_company: str | None = None
+        new_speaker_linkedin: str | None = None
+        episode_title: str | None = None
+        episode_date: str | None = None
+        youtube_id: str | None = None
+        start: float | None = None
+        end: float | None = None
+
+    class ThreadProposalRefreshRequest(BaseModel):
+        theme_name: str | None = None
+        theme_summary: str | None = None
+        question_text: str | None = None
+        question_summary: str | None = None
+
     class ThreadMatchEditRequest(BaseModel):
         text: str
         youtube_id: str | None = None
@@ -10728,30 +10898,41 @@ def fastapi_app():
         pub_ids = [s["quote_id"] for s in suggestions if s.get("quote_id")]
         staged_ids = [s["test_quote_id"] for s in suggestions if s.get("test_quote_id")]
         pub = {r["id"]: r for r in (supabase.table("reader_perspectives_v1").select(
-            "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end").in_("id", pub_ids).execute().data or [])} if pub_ids else {}
+            "id,text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end").in_("id", pub_ids).execute().data or [])} if pub_ids else {}
         staged = {r["id"]: r for r in (supabase.table("test_quotes").select(
-            "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,timestamp_start,timestamp_end,youtube_alignment_status").in_("id", staged_ids).execute().data or [])} if staged_ids else {}
+            "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,timestamp_start,timestamp_end,youtube_alignment_status").in_("id", staged_ids).execute().data or [])} if staged_ids else {}
         rows = []
         for s in suggestions:
             if s.get("quote_id") and s["quote_id"] in pub:
                 r = pub[s["quote_id"]]
                 rows.append({**s, "kind": "published", "text": r["text"], "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
                              "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_title"), "episode_date": r.get("episode_date"),
-                             "youtube_id": r.get("youtube_id"), "youtube_start": r.get("youtube_start"), "youtube_end": r.get("youtube_end"), "moment_verified": r.get("youtube_start") is not None})
+                             "youtube_id": r.get("youtube_id"), "youtube_start": r.get("youtube_start"), "youtube_end": r.get("youtube_end"), "moment_verified": r.get("youtube_start") is not None,
+                             "guest_id": r.get("guest_id"), "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
             elif s.get("test_quote_id") and s["test_quote_id"] in staged:
                 r = staged[s["test_quote_id"]]
                 rows.append({**s, "kind": "staged", "text": r["quote_text"], "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
                              "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_name"),
                              "episode_date": str(r.get("date_published") or "")[:10] or None,
                              "youtube_id": r.get("youtube_id"), "youtube_start": r.get("timestamp_start"), "youtube_end": r.get("timestamp_end"),
-                             "moment_verified": r.get("youtube_alignment_status") in ("verified", "manual_verified")})
+                             "moment_verified": r.get("youtube_alignment_status") in ("verified", "manual_verified"),
+                             "guest_id": r.get("guest_id"), "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
         placed_ids = [r["quote_id"] for r in (supabase.table("reader_placements_v1").select("quote_id").eq("question_id", question_id).execute().data or [])]
-        placed = (supabase.table("reader_perspectives_v1").select("id,text,speaker_name,speaker_company,podcast_name,episode_date")
+        placed = (supabase.table("reader_perspectives_v1").select(
+            "id,text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end")
                   .in_("id", placed_ids).execute().data or []) if placed_ids else []
+        for r in placed:
+            r.update({"kind": "published", "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id")), "moment_verified": r.get("youtube_start") is not None})
         return {"success": True, "suggestions": rows, "placed": placed}
 
     @web_app.post("/thread-matches/{match_id}/accept")
     async def accept_thread_match_endpoint(match_id: str, admin=Depends(require_admin)):
+        supabase = service_client()
+        rows = supabase.table("thread_match_suggestions").select("quote_id,test_quote_id").eq("id", match_id).limit(1).execute().data or []
+        if rows:
+            kind, row_id = ("published", rows[0]["quote_id"]) if rows[0].get("quote_id") else ("staged", rows[0]["test_quote_id"])
+            if not perspective_speaker_check(supabase, kind, row_id):
+                return JSONResponse(status_code=422, content={"success": False, "error": "Fix the speaker first: link this perspective to a real person in the directory (Edit)."})
         try:
             result = service_client().rpc("accept_thread_match", {"p_match_id": match_id, "p_reviewer_id": admin["id"]}).execute()
             return {"success": True, "id": result.data}
@@ -10794,10 +10975,10 @@ def fastapi_app():
         pub_ids = list({m["id"] for r in rows for m in r.get("members") or [] if m.get("kind") == "published"})
         staged_ids = list({m["id"] for r in rows for m in r.get("members") or [] if m.get("kind") == "staged"})
         pub = {r["id"]: r for r in (supabase.table("reader_perspectives_v1").select(
-            "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end")
+            "id,text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end")
             .in_("id", pub_ids).execute().data or [])} if pub_ids else {}
         staged = {r["id"]: r for r in (supabase.table("test_quotes").select(
-            "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published")
+            "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,timestamp_start,timestamp_end,youtube_alignment_status")
             .in_("id", staged_ids).execute().data or [])} if staged_ids else {}
         for row in rows:
             hydrated = []
@@ -10808,7 +10989,11 @@ def fastapi_app():
                 hydrated.append({**m, "text": src.get("text") or src.get("quote_text"), "speaker_name": src.get("speaker_name"),
                                  "speaker_title": src.get("speaker_title"), "speaker_company": src.get("speaker_company"),
                                  "podcast_name": src.get("podcast_name"), "episode_title": src.get("episode_title") or src.get("episode_name"),
-                                 "episode_date": src.get("episode_date") or str(src.get("date_published") or "")[:10] or None})
+                                 "episode_date": src.get("episode_date") or str(src.get("date_published") or "")[:10] or None,
+                                 "guest_id": src.get("guest_id"), "speaker_verified": speaker_is_verified(src.get("speaker_name"), src.get("guest_id")),
+                                 "youtube_id": src.get("youtube_id"), "youtube_start": src.get("youtube_start", src.get("timestamp_start")),
+                                 "youtube_end": src.get("youtube_end", src.get("timestamp_end")),
+                                 "moment_verified": src.get("youtube_start") is not None if m.get("kind") == "published" else src.get("youtube_alignment_status") in ("verified", "manual_verified")})
             row["members"] = hydrated
         return {"success": True, "proposals": [r for r in rows if len(r["members"]) >= 1]}
 
@@ -10867,6 +11052,9 @@ def fastapi_app():
             supabase.table("conversation_questions").update({"publication_status": "published", "reviewed_by": admin["id"], "reviewed_at": now, "updated_at": now}).eq("id", question["id"]).execute()
         placed, errors = 0, []
         for m in chosen:
+            if not perspective_speaker_check(supabase, m["kind"], m["id"]):
+                errors.append(f"Fix the speaker first for “{str(m.get('reason') or m['id'])[:60]}”")
+                continue
             field = "quote_id" if m["kind"] == "published" else "test_quote_id"
             existing = supabase.table("thread_match_suggestions").select("id,status").eq("question_id", question["id"]).eq(field, m["id"]).limit(1).execute().data or []
             if existing and existing[0]["status"] == "dismissed":
@@ -10892,8 +11080,7 @@ def fastapi_app():
 
     @web_app.post("/thread-matches/{match_id}/edit")
     async def edit_thread_match_endpoint(match_id: str, req: ThreadMatchEditRequest, admin=Depends(require_admin)):
-        """Correct a suggested perspective's words and exact YouTube moment before it joins a thread.
-        Timing goes through the audited alignment path as a manual verification by this editor."""
+        """Correct a suggested perspective's words and exact YouTube moment before it joins a thread."""
         supabase = service_client()
         rows = supabase.table("thread_match_suggestions").select("id,quote_id,test_quote_id,status").eq("id", match_id).limit(1).execute().data or []
         if not rows:
@@ -10901,32 +11088,43 @@ def fastapi_app():
         match = rows[0]
         if match["status"] != "suggested":
             raise HTTPException(status_code=422, detail="This suggestion has already been handled")
-        table, row_id, text_field = ("quotes", match["quote_id"], "text") if match.get("quote_id") else ("test_quotes", match["test_quote_id"], "quote_text")
-        before = (supabase.table(table).select("*").eq("id", row_id).single().execute()).data
-        text = " ".join(str(req.text or "").split())
-        if len(text.split()) < 4:
-            raise HTTPException(status_code=422, detail="The quote needs at least a few words")
-        if text != " ".join(str(before.get(text_field) or "").split()):
-            supabase.table(table).update({text_field: text, "updated_at": utcnow_iso()}).eq("id", row_id).execute()
-        youtube_id = str(req.youtube_id or "").strip()
-        if youtube_id or req.start is not None or req.end is not None:
-            youtube_id = (extract_youtube_id(youtube_id) or "") if "youtu" in youtube_id else youtube_id
-            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_id or ""):
-                raise HTTPException(status_code=422, detail="Enter the 11-character YouTube video ID or a YouTube link")
-            if req.start is None or req.end is None or req.start < 0 or req.end <= req.start or req.end - req.start > 600:
-                raise HTTPException(status_code=422, detail="Enter a start and end time, with the end after the start (10 minutes at most)")
-            if youtube_id != str(before.get("youtube_id") or ""):
-                supabase.table(table).update({"youtube_id": youtube_id}).eq("id", row_id).execute()
-            supabase.rpc("apply_youtube_alignment_result", {
-                "p_quote_table": table, "p_quote_id": str(row_id), "p_status": "manual_verified", "p_youtube_id": youtube_id,
-                "p_rss_start": before.get("rss_timestamp_start"), "p_rss_end": before.get("rss_timestamp_end"),
-                "p_youtube_start": req.start, "p_youtube_end": req.end, "p_confidence": None,
-                "p_method": "sme_manual_source_verification", "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
-                "p_details": {"reviewer_id": admin["id"], "context": "thread_match_edit", "match_id": match_id},
-                "p_processing_job_id": before.get("processing_job_id"),
-            }).execute()
-        print(f"AUDIT thread_match_edited match={match_id} table={table} row={row_id} by={admin['id']}")
+        kind, row_id = ("published", match["quote_id"]) if match.get("quote_id") else ("staged", match["test_quote_id"])
+        try:
+            apply_perspective_edit(supabase, kind, row_id, req.dict(), admin["id"], f"thread_match_edit:{match_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"success": True}
+
+    @web_app.post("/perspectives/edit")
+    async def edit_perspective_endpoint(req: PerspectiveEditRequest, admin=Depends(require_admin)):
+        """Correct any perspective (published or an approved take): words, speaker, episode details, YouTube moment."""
+        if req.kind not in {"published", "staged"}:
+            raise HTTPException(status_code=422, detail="Unknown perspective kind")
+        supabase = service_client()
+        try:
+            apply_perspective_edit(supabase, req.kind, req.id, req.dict(), admin["id"], "perspective_edit")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"success": True, "speaker_verified": perspective_speaker_check(supabase, req.kind, req.id)}
+
+    @web_app.post("/thread-proposals/{proposal_id}/refresh")
+    async def refresh_thread_proposal_endpoint(proposal_id: str, req: ThreadProposalRefreshRequest, admin=Depends(require_admin)):
+        """Save the edited theme and question, then re-read the perspectives against the new wording."""
+        supabase = service_client()
+        rows = supabase.table("thread_proposals").select("id,status,theme_id").eq("id", proposal_id).limit(1).execute().data or []
+        if not rows or rows[0]["status"] != "suggested":
+            raise HTTPException(status_code=422, detail="This proposal has already been handled")
+        clean = lambda v: " ".join(str(v or "").split())
+        wording = {k: clean(v) for k, v in (("theme_name", req.theme_name), ("theme_summary", req.theme_summary),
+                   ("question_text", req.question_text), ("question_summary", req.question_summary)) if clean(v)}
+        if rows[0].get("theme_id"):
+            wording.pop("theme_name", None); wording.pop("theme_summary", None)
+        if wording:
+            supabase.table("thread_proposals").update(wording).eq("id", proposal_id).execute()
+        _, job_id = _start_discovery("discover", None, admin)
+        call = await refresh_thread_proposal.spawn.aio(proposal_id=proposal_id, job_id=job_id)
+        supabase.table("processing_jobs").update({"modal_call_id": call.object_id, "updated_at": utcnow_iso()}).eq("id", job_id).execute()
+        return JSONResponse(status_code=202, content={"success": True, "job_id": job_id, "state": "queued"})
 
     @web_app.post("/thread-matches/{match_id}/dismiss")
     async def dismiss_thread_match_endpoint(match_id: str, admin=Depends(require_admin)):
