@@ -10407,6 +10407,24 @@ def fastapi_app():
         return {"success": True, "prompt_version": QUESTION_DRAFT_PROMPT_VERSION,
                 **{k: " ".join(str(result.get(k) or "").split()) for k in ("question_text", "question_summary", "connection_context")}}
 
+    @web_app.get("/moment")
+    async def moment_player_endpoint(v: str, start: int, end: int):
+        """Public, minimal YouTube player page for the iOS app. Embeds inside an app have no web origin, so YouTube
+        refuses them (error 153); this https page gives the embed a real referrer. Inputs are strictly validated."""
+        from fastapi.responses import HTMLResponse
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", v or "") or start < 0 or end <= start or end - start > 3600:
+            raise HTTPException(status_code=422, detail="Invalid moment")
+        src = f"https://www.youtube-nocookie.com/embed/{v}?autoplay=1&start={start}&end={end}&rel=0&modestbranding=1&playsinline=1"
+        html = ('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<meta name="referrer" content="strict-origin-when-cross-origin"><title>PodThreads moment</title>'
+                '<style>html,body{margin:0;height:100%;background:#000}iframe{position:fixed;inset:0;width:100%;height:100%;border:0}</style></head>'
+                f'<body><iframe src="{src}" title="Podcast moment" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe></body></html>')
+        return HTMLResponse(html, headers={
+            "Content-Security-Policy": "default-src 'none'; frame-src https://www.youtube-nocookie.com https://www.youtube.com; style-src 'unsafe-inline'; frame-ancestors capacitor://localhost https://podthreads.com",
+            "Cache-Control": "public, max-age=86400",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+        })
+
     @web_app.get("/threads")
     async def threads_endpoint(admin=Depends(require_admin)):
         """Published threads with their placement and pending-suggestion counts, for thread-first curation."""
