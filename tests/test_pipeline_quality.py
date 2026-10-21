@@ -3,6 +3,10 @@ import unittest
 from types import SimpleNamespace
 
 from modal_app.full_processor import (
+    THREAD_MATCH_SCHEMA,
+    build_thread_match_prompt,
+    filter_thread_matches,
+    thread_match_candidates,
     _caption_cache,
     _parse_timedtext_captions,
     apply_transcript_corrections,
@@ -1185,3 +1189,51 @@ class PublishPathTests(unittest.TestCase):
         for item in ("approve the take", "approve the context", "attach the transcript evidence",
                      "approve the theme, question and connections"):
             self.assertIn(item, blockers)
+
+
+class ThreadMatchingTests(unittest.TestCase):
+    batch = [
+        {"key": "P1", "kind": "published", "id": "q-1", "text": "Retail feeds are the moat.", "speaker_name": "A"},
+        {"key": "P2", "kind": "staged", "id": "t-2", "text": "Agents will buy direct.", "speaker_name": "B"},
+    ]
+
+    def test_only_in_batch_above_threshold_and_once(self):
+        result = {"matches": [
+            {"candidate": "P1", "fit_score": 0.82, "reason": "  Names who holds the  feed data. "},
+            {"candidate": "P1", "fit_score": 0.95, "reason": "duplicate"},
+            {"candidate": "P2", "fit_score": 0.4, "reason": "too weak"},
+            {"candidate": "P9", "fit_score": 0.99, "reason": "not offered"},
+            {"candidate": "[P2]", "fit_score": 1.4, "reason": "out of range"},
+            {"candidate": "P2", "fit_score": "x", "reason": "bad score"},
+        ]}
+        kept = filter_thread_matches(result, self.batch)
+        self.assertEqual([(m["id"], m["fit_score"], m["reason"]) for m in kept], [("q-1", 0.82, "Names who holds the feed data.")])
+        self.assertEqual(filter_thread_matches({}, self.batch), [])
+
+    def test_prompt_uses_local_labels_not_database_ids(self):
+        prompt = build_thread_match_prompt({"name": "Agentic Commerce", "summary": None},
+                                           {"question_text": "Who controls the data?"}, [], self.batch)
+        self.assertIn("[P1]", prompt)
+        self.assertNotIn("q-1", prompt)
+        self.assertIn("This thread is new", prompt)
+        self.assertEqual(THREAD_MATCH_SCHEMA["required"], ["matches"])
+
+    def test_candidates_skip_placed_suggested_and_already_mapped(self):
+        tables = {
+            "conversation_take_links": [{"quote_id": "placed"}],
+            "thread_match_suggestions": [{"quote_id": "dismissed", "test_quote_id": None}, {"quote_id": None, "test_quote_id": "t-old"}],
+            "reader_perspectives_v1": [{"id": "placed", "text": "x"}, {"id": "dismissed", "text": "x"}, {"id": "fresh", "text": "Fresh words."}, {"id": "blank", "text": " "}],
+            "test_quotes": [{"id": "t-old", "quote_text": "y"}, {"id": "t-mapped", "quote_text": "y", "mapping_review_status": "approved"}, {"id": "t-new", "quote_text": "New take."}],
+        }
+
+        class Query:
+            def __init__(self, name): self.name = name
+            def select(self, *_): return self
+            def eq(self, *_): return self
+            def order(self, *_ , **__): return self
+            def range(self, *_): return self
+            def execute(self): return SimpleNamespace(data=tables[self.name])
+
+        supabase = SimpleNamespace(table=Query)
+        found = thread_match_candidates(supabase, "question")
+        self.assertEqual([(c["kind"], c["id"], c["key"]) for c in found], [("published", "fresh", "P1"), ("staged", "t-new", "P2")])

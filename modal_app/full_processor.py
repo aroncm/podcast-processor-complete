@@ -5213,6 +5213,193 @@ def merge_tentative_conversation_candidates(conversation_taxonomy, candidates, l
     return json.dumps(graph, ensure_ascii=False)
 
 
+THREAD_MATCH_PROMPT_VERSION = "thread-first-matching-v1"
+THREAD_MATCH_MIN_SCORE = 0.6
+THREAD_MATCH_BATCH = 30
+THREAD_MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "matches": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate": {"type": "string"},
+                    "fit_score": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["candidate", "fit_score", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["matches"],
+    "additionalProperties": False,
+}
+
+
+def _attribution(row):
+    who = ", ".join(str(v) for v in (row.get("speaker_name"), row.get("speaker_title"), row.get("speaker_company")) if v)
+    where = ", ".join(str(v) for v in (row.get("podcast_name"), row.get("episode_date")) if v)
+    return "; ".join(part for part in (who, where) if part)
+
+
+def build_thread_match_prompt(theme, question, members, batch):
+    """One batch of candidates against one published thread. Candidate keys are local labels, never database IDs."""
+    calibration = "\n".join(
+        f'- "{m.get("text")}" ({_attribution(m)})' for m in members[:8]
+    ) or "- None yet. This thread is new."
+    candidates = "\n".join(
+        f'[{c["key"]}] "{c.get("text")}" ({_attribution(c)})' for c in batch
+    )
+    return f"""
+Published thread
+Theme: {theme.get("name")}
+Theme scope: {theme.get("summary") or "Not stated"}
+Question: {question.get("question_text")}
+
+Perspectives already in this thread, for calibration:
+{calibration}
+
+Candidate perspectives:
+{candidates}
+
+Return only the candidates that belong in this thread. A candidate belongs when the speaker's words
+speak to this specific question: they answer it, give evidence or a mechanism that bears on it, describe
+a concrete example of it, or complicate it. Sharing keywords, a company name, or the broad theme is not
+enough. Most candidates will not belong; returning none is a correct answer.
+
+fit_score: 0.9 or higher when the words directly answer the question; about 0.75 for a clear, substantive
+contribution; about 0.6 when relevant but partial. Do not return anything below 0.6.
+
+reason: one plain sentence of at most 25 words for the editor, saying what the words contribute to the
+question. No praise, no hype, no "this quote", no restating the question.
+"""
+
+
+THREAD_MATCH_SYSTEM_PROMPT = """
+You are PodThreads' senior adtech editor. Editors have published a thread: a theme and one open question.
+You read candidate perspectives from podcast conversations and point out the few that genuinely belong in
+that thread. You are strict. You never invent context and you never rewrite the speaker's words.
+"""
+
+
+def filter_thread_matches(result, batch):
+    """Keep only well-formed, in-batch, above-threshold matches; one per candidate."""
+    by_key = {c["key"]: c for c in batch}
+    kept, seen = [], set()
+    for match in (result or {}).get("matches") or []:
+        key = str(match.get("candidate") or "").strip().strip("[]")
+        reason = " ".join(str(match.get("reason") or "").split())
+        try:
+            score = float(match.get("fit_score"))
+        except (TypeError, ValueError):
+            continue
+        if key not in by_key or key in seen or not reason or not (THREAD_MATCH_MIN_SCORE <= score <= 1):
+            continue
+        seen.add(key)
+        kept.append({**by_key[key], "fit_score": round(score, 3), "reason": reason[:400]})
+    return kept
+
+
+def _select_all(query_builder, page=500):
+    rows, start = [], 0
+    while True:
+        chunk = query_builder().range(start, start + page - 1).execute().data or []
+        rows.extend(chunk)
+        if len(chunk) < page:
+            return rows
+        start += page
+
+
+def thread_match_candidates(supabase, question_id):
+    """Published perspectives not yet in the thread, plus approved takes awaiting publication without an approved
+    mapping. Anything already suggested for this thread (including dismissed) is never offered again."""
+    placed = {r["quote_id"] for r in _select_all(lambda: supabase.table("conversation_take_links").select("quote_id").eq("question_id", question_id))}
+    prior = _select_all(lambda: supabase.table("thread_match_suggestions").select("quote_id,test_quote_id").eq("question_id", question_id))
+    prior_published = {r["quote_id"] for r in prior if r.get("quote_id")}
+    prior_staged = {r["test_quote_id"] for r in prior if r.get("test_quote_id")}
+    published = _select_all(lambda: supabase.table("reader_perspectives_v1").select(
+        "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date").order("id"))
+    staged = _select_all(lambda: supabase.table("test_quotes").select(
+        "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,mapping_review_status")
+        .eq("approval_status", "approved").order("id"))
+    candidates = []
+    for row in published:
+        if row["id"] in placed or row["id"] in prior_published or not str(row.get("text") or "").strip():
+            continue
+        candidates.append({"kind": "published", "id": row["id"], "text": row["text"], "speaker_name": row.get("speaker_name"),
+                           "speaker_title": row.get("speaker_title"), "speaker_company": row.get("speaker_company"),
+                           "podcast_name": row.get("podcast_name"), "episode_date": row.get("episode_date")})
+    for row in staged:
+        if row["id"] in prior_staged or row.get("mapping_review_status") == "approved" or not str(row.get("quote_text") or "").strip():
+            continue
+        candidates.append({"kind": "staged", "id": row["id"], "text": row["quote_text"], "speaker_name": row.get("speaker_name"),
+                           "speaker_title": row.get("speaker_title"), "speaker_company": row.get("speaker_company"),
+                           "podcast_name": row.get("podcast_name"), "episode_date": str(row.get("date_published") or "")[:10] or None})
+    for index, candidate in enumerate(candidates, start=1):
+        candidate["key"] = f"P{index}"
+    return candidates
+
+
+@app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
+def find_thread_matches(question_id: str, job_id: str = None):
+    """Suggest perspectives for one published thread. Suggestions are private until an editor accepts them."""
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import OpenAI
+    from supabase import create_client
+
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    try:
+        update_processing_job(supabase, job_id, "claimed", started_at=utcnow_iso())
+        question = (supabase.table("conversation_questions").select("id,theme_id,question_text,summary,publication_status")
+                    .eq("id", question_id).single().execute()).data
+        theme = (supabase.table("conversation_themes").select("id,name,summary,publication_status")
+                 .eq("id", question["theme_id"]).single().execute()).data
+        if question.get("publication_status") != "published" or theme.get("publication_status") != "published":
+            raise ValueError("Only published threads can be matched")
+        member_ids = [r["quote_id"] for r in (supabase.table("conversation_take_links").select("quote_id")
+                      .eq("question_id", question_id).limit(20).execute().data or [])]
+        members = (supabase.table("reader_perspectives_v1").select("text,speaker_name,speaker_title,speaker_company,podcast_name,episode_date")
+                   .in_("id", member_ids).execute().data or []) if member_ids else []
+        candidates = thread_match_candidates(supabase, question_id)
+        batches = [candidates[i:i + THREAD_MATCH_BATCH] for i in range(0, len(candidates), THREAD_MATCH_BATCH)]
+        update_processing_job(supabase, job_id, "mapping", progress={"candidates": len(candidates), "batches": len(batches)})
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+        effort = os.environ.get("OPENAI_THREAD_MATCH_REASONING", "medium")
+
+        def run(batch):
+            result = call_openai_structured(
+                client, model=model, system_prompt=THREAD_MATCH_SYSTEM_PROMPT,
+                user_prompt=build_thread_match_prompt(theme, question, members, batch),
+                schema_name="thread_matches", schema=THREAD_MATCH_SCHEMA, reasoning_effort=effort,
+                max_output_tokens=4000,
+            )
+            return filter_thread_matches(result, batch)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            matches = [m for found in pool.map(run, batches) for m in found]
+        inserted = 0
+        for match in matches:
+            row = {"theme_id": theme["id"], "question_id": question_id, "fit_score": match["fit_score"], "reason": match["reason"],
+                   "model": model, "prompt_version": THREAD_MATCH_PROMPT_VERSION, "processing_job_id": job_id,
+                   "quote_id": match["id"] if match["kind"] == "published" else None,
+                   "test_quote_id": match["id"] if match["kind"] == "staged" else None}
+            try:
+                supabase.table("thread_match_suggestions").insert(row).execute()
+                inserted += 1
+            except Exception as exc:
+                print(f"thread match skipped ({match['id']}): {exc}")
+        summary = {"candidates": len(candidates), "suggested": inserted}
+        update_processing_job(supabase, job_id, "succeeded", progress=summary, result=summary, completed_at=utcnow_iso())
+        return {"success": True, **summary}
+    except Exception as exc:
+        update_processing_job(supabase, job_id, "failed", error_code="thread_matching_failed",
+                              error_message=str(exc)[:500], completed_at=utcnow_iso())
+        raise
+
+
 def propose_historical_conversation_mapping(
     quote,
     source_evidence,
@@ -8995,6 +9182,9 @@ def fastapi_app():
     class HistoricalMappingPublishRequest(BaseModel):
         mapping_review_id: str
 
+    class ThreadPlacementRemoveRequest(BaseModel):
+        quote_id: str
+
     def service_client():
         return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
@@ -9995,6 +10185,89 @@ def fastapi_app():
             return {"success": True, "quote_id": result.data}
         except Exception as exc:
             return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
+
+    @web_app.get("/threads")
+    async def threads_endpoint(admin=Depends(require_admin)):
+        """Published threads with their placement and pending-suggestion counts, for thread-first curation."""
+        supabase = service_client()
+        themes = {t["id"]: t for t in (supabase.table("conversation_themes").select("id,name,summary")
+                  .eq("publication_status", "published").execute().data or [])}
+        questions = [q for q in (supabase.table("conversation_questions").select("id,theme_id,question_text,summary,updated_at")
+                     .eq("publication_status", "published").execute().data or []) if q["theme_id"] in themes]
+        links = _select_all(lambda: supabase.table("reader_placements_v1").select("question_id"))
+        pending = _select_all(lambda: supabase.table("thread_match_suggestions").select("question_id").eq("status", "suggested"))
+        count = lambda rows, qid: sum(1 for r in rows if r["question_id"] == qid)
+        return {"success": True, "threads": [{
+            "question_id": q["id"], "question_text": q["question_text"], "theme_id": q["theme_id"],
+            "theme_name": themes[q["theme_id"]]["name"], "perspectives": count(links, q["id"]),
+            "pending_suggestions": count(pending, q["id"]),
+        } for q in sorted(questions, key=lambda q: (themes[q["theme_id"]]["name"].casefold(), q["question_text"].casefold()))]}
+
+    @web_app.post("/threads/{question_id}/find-matches")
+    async def find_thread_matches_endpoint(question_id: str, admin=Depends(require_admin)):
+        supabase = service_client()
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"thread-matching:{question_id}:{uuid.uuid4()}",
+            "job_type": "thread_matching",
+            "source": "admin",
+            "requested_by": admin["id"],
+            "parameters": {"question_id": question_id, "prompt_version": THREAD_MATCH_PROMPT_VERSION},
+        }).execute()
+        job_id = inserted.data[0]["id"]
+        function_call = await find_thread_matches.spawn.aio(question_id=question_id, job_id=job_id)
+        supabase.table("processing_jobs").update({"modal_call_id": function_call.object_id, "updated_at": utcnow_iso()}).eq("id", job_id).execute()
+        return JSONResponse(status_code=202, content={"success": True, "job_id": job_id, "state": "queued", "status_url": f"/jobs/{job_id}"})
+
+    @web_app.get("/threads/{question_id}/matches")
+    async def thread_matches_endpoint(question_id: str, admin=Depends(require_admin)):
+        """Pending suggestions with the words and attribution an editor needs, plus who is already in the thread."""
+        supabase = service_client()
+        suggestions = (supabase.table("thread_match_suggestions").select("id,quote_id,test_quote_id,fit_score,reason,created_at")
+                       .eq("question_id", question_id).eq("status", "suggested").order("fit_score", desc=True).execute().data or [])
+        pub_ids = [s["quote_id"] for s in suggestions if s.get("quote_id")]
+        staged_ids = [s["test_quote_id"] for s in suggestions if s.get("test_quote_id")]
+        pub = {r["id"]: r for r in (supabase.table("reader_perspectives_v1").select(
+            "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date").in_("id", pub_ids).execute().data or [])} if pub_ids else {}
+        staged = {r["id"]: r for r in (supabase.table("test_quotes").select(
+            "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published").in_("id", staged_ids).execute().data or [])} if staged_ids else {}
+        rows = []
+        for s in suggestions:
+            if s.get("quote_id") and s["quote_id"] in pub:
+                r = pub[s["quote_id"]]
+                rows.append({**s, "kind": "published", "text": r["text"], "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
+                             "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_title"), "episode_date": r.get("episode_date")})
+            elif s.get("test_quote_id") and s["test_quote_id"] in staged:
+                r = staged[s["test_quote_id"]]
+                rows.append({**s, "kind": "staged", "text": r["quote_text"], "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
+                             "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_name"),
+                             "episode_date": str(r.get("date_published") or "")[:10] or None})
+        placed_ids = [r["quote_id"] for r in (supabase.table("reader_placements_v1").select("quote_id").eq("question_id", question_id).execute().data or [])]
+        placed = (supabase.table("reader_perspectives_v1").select("id,text,speaker_name,speaker_company,podcast_name,episode_date")
+                  .in_("id", placed_ids).execute().data or []) if placed_ids else []
+        return {"success": True, "suggestions": rows, "placed": placed}
+
+    @web_app.post("/thread-matches/{match_id}/accept")
+    async def accept_thread_match_endpoint(match_id: str, admin=Depends(require_admin)):
+        try:
+            result = service_client().rpc("accept_thread_match", {"p_match_id": match_id, "p_reviewer_id": admin["id"]}).execute()
+            return {"success": True, "id": result.data}
+        except Exception as exc:
+            return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
+
+    @web_app.post("/thread-matches/{match_id}/dismiss")
+    async def dismiss_thread_match_endpoint(match_id: str, admin=Depends(require_admin)):
+        service_client().table("thread_match_suggestions").update({
+            "status": "dismissed", "reviewed_by": admin["id"], "reviewed_at": utcnow_iso(),
+        }).eq("id", match_id).eq("status", "suggested").execute()
+        return {"success": True}
+
+    @web_app.post("/threads/{question_id}/remove-placement")
+    async def remove_thread_placement_endpoint(question_id: str, req: ThreadPlacementRemoveRequest, admin=Depends(require_admin)):
+        """Take one perspective out of a thread. The perspective itself stays published."""
+        supabase = service_client()
+        supabase.table("conversation_take_links").delete().eq("question_id", question_id).eq("quote_id", req.quote_id).execute()
+        print(f"AUDIT thread_placement_removed question={question_id} quote={req.quote_id} by={admin['id']}")
+        return {"success": True}
 
     @web_app.post("/create-clip")
     async def create_clip_endpoint(req: ClipRequest, admin=Depends(require_admin)):
