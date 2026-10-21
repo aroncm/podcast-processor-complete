@@ -11122,6 +11122,40 @@ def fastapi_app():
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"success": True}
 
+    @web_app.get("/perspectives/source")
+    async def perspective_source_endpoint(kind: str, id: str, admin=Depends(require_admin)):
+        """Everything stored about where a perspective came from, verified or not, so an editor can see and hear the
+        moment before fixing it: YouTube ID and times, the episode audio at the moment, the transcript and the
+        directory person the quote is linked to."""
+        if kind not in {"published", "staged"}:
+            raise HTTPException(status_code=422, detail="Unknown perspective kind")
+        supabase = service_client()
+        table = "quotes" if kind == "published" else "test_quotes"
+        row = (supabase.table(table).select("*").eq("id", id).limit(1).execute().data or [None])[0]
+        if not row:
+            raise HTTPException(status_code=404, detail="Perspective not found")
+        youtube_id = row.get("youtube_id") if re.fullmatch(r"[A-Za-z0-9_-]{11}", str(row.get("youtube_id") or "")) else None
+        yt_start = row.get("youtube_timestamp_start") if row.get("youtube_timestamp_start") is not None else (row.get("timestamp_start") if youtube_id else None)
+        yt_end = row.get("youtube_timestamp_end") if row.get("youtube_timestamp_end") is not None else (row.get("timestamp_end") if youtube_id else None)
+        audio = None
+        start = row.get("rss_timestamp_start") if row.get("rss_timestamp_start") is not None else row.get("timestamp_start")
+        end = row.get("rss_timestamp_end") if row.get("rss_timestamp_end") is not None else row.get("timestamp_end")
+        source_url = row.get("episode_audio_url")
+        if not source_url and row.get("audio_clip_id"):
+            clip = (supabase.table("audio_clips").select("source_url").eq("id", row["audio_clip_id"]).limit(1).execute().data or [{}])[0]
+            source_url = clip.get("source_url")
+        if not source_url and row.get("episode_id"):
+            ep = (supabase.table("episodes").select("source_audio_url").eq("id", row["episode_id"]).limit(1).execute().data or [{}])[0]
+            source_url = ep.get("source_audio_url")
+        if isinstance(source_url, str) and source_url.startswith("https://") and start is not None and end is not None and end > start:
+            audio = {"url": source_url, "start": float(start), "end": float(end)}
+        person = None
+        if row.get("guest_id"):
+            person = (supabase.table("guests").select("id,name,title,company").eq("id", row["guest_id"]).limit(1).execute().data or [None])[0]
+        return {"success": True, "youtube_id": youtube_id, "youtube_start": yt_start, "youtube_end": yt_end,
+                "youtube_verified": row.get("youtube_alignment_status") in ("verified", "manual_verified"),
+                "audio": audio, "transcript": row.get("source_transcript_excerpt") or None, "linked_person": person}
+
     @web_app.post("/perspectives/edit")
     async def edit_perspective_endpoint(req: PerspectiveEditRequest, admin=Depends(require_admin)):
         """Correct any perspective (published or an approved take): words, speaker, episode details, YouTube moment."""
