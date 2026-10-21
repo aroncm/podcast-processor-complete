@@ -5578,7 +5578,7 @@ def find_thread_matches(question_id: str, job_id: str = None):
 
 
 THREAD_DISCOVERY_PROMPT_VERSION = "thread-discovery-v1"
-THREAD_DISCOVERY_MAX_CANDIDATES = 400
+THREAD_DISCOVERY_MAX_CANDIDATES = 1200
 _PROPOSAL_MEMBER = {
     "type": "object",
     "properties": {"candidate": {"type": "string"}, "fit_score": {"type": "number"}, "reason": {"type": "string"}},
@@ -5701,6 +5701,28 @@ def clean_proposal_members(members, by_key, used):
         c = by_key[key]
         kept.append({"kind": c["kind"], "id": c["id"], "fit_score": round(score, 3), "reason": reason[:400]})
     return kept
+
+
+def thread_pool_stats(supabase, theme_id=None):
+    """What the AI reads, and what it cannot read yet, for Discover (whole library) or one theme."""
+    published = _select_all(lambda: supabase.table("reader_perspectives_v1").select("id,guest_id,speaker_name").order("id"))
+    placements = _select_all(lambda: supabase.table("reader_placements_v1").select("quote_id,theme_id"))
+    placed = {p["quote_id"] for p in placements if theme_id is None or p["theme_id"] == theme_id}
+    waiting = [p for p in published if p["id"] not in placed]
+    count = lambda q: q.limit(1).execute().count or 0
+    approved = count(supabase.table("test_quotes").select("id", count="exact").eq("approval_status", "approved"))
+    approved_mapped = count(supabase.table("test_quotes").select("id", count="exact").eq("approval_status", "approved").eq("mapping_review_status", "approved"))
+    return {
+        "published_total": len(published),
+        "published_placed": len(published) - len(waiting),
+        "published_waiting": len(waiting),
+        "published_waiting_unverified": sum(1 for p in waiting if not speaker_is_verified(p.get("speaker_name"), p.get("guest_id"))),
+        "approved_unpublished": approved,
+        "approved_unpublished_unmapped": approved - approved_mapped,
+        "approved_unpublished_mapped": approved_mapped,
+        "awaiting_review": count(supabase.table("test_quotes").select("id", count="exact").eq("approval_status", "pending")),
+        "max_per_run": THREAD_DISCOVERY_MAX_CANDIDATES,
+    }
 
 
 def discovery_candidates(supabase, theme_id=None):
@@ -10948,6 +10970,11 @@ def fastapi_app():
         }).execute()
         job_id = inserted.data[0]["id"]
         return supabase, job_id
+
+    @web_app.get("/threads/pool")
+    async def thread_pool_endpoint(theme_id: str | None = None, admin=Depends(require_admin)):
+        """Counts behind Discover and theme scans: what the AI reads and what is not ready yet."""
+        return {"success": True, **thread_pool_stats(service_client(), theme_id)}
 
     @web_app.post("/thread-discovery")
     async def thread_discovery_endpoint(admin=Depends(require_admin)):
