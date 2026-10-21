@@ -9362,6 +9362,12 @@ def fastapi_app():
     class ThreadPlacementRemoveRequest(BaseModel):
         quote_id: str
 
+    class ThreadMatchEditRequest(BaseModel):
+        text: str
+        youtube_id: str | None = None
+        start: float | None = None
+        end: float | None = None
+
     class QuestionDraftRequest(BaseModel):
         quote_id: str
         theme_name: str
@@ -10468,6 +10474,44 @@ def fastapi_app():
             return {"success": True, "id": result.data}
         except Exception as exc:
             return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
+
+    @web_app.post("/thread-matches/{match_id}/edit")
+    async def edit_thread_match_endpoint(match_id: str, req: ThreadMatchEditRequest, admin=Depends(require_admin)):
+        """Correct a suggested perspective's words and exact YouTube moment before it joins a thread.
+        Timing goes through the audited alignment path as a manual verification by this editor."""
+        supabase = service_client()
+        rows = supabase.table("thread_match_suggestions").select("id,quote_id,test_quote_id,status").eq("id", match_id).limit(1).execute().data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        match = rows[0]
+        if match["status"] != "suggested":
+            raise HTTPException(status_code=422, detail="This suggestion has already been handled")
+        table, row_id, text_field = ("quotes", match["quote_id"], "text") if match.get("quote_id") else ("test_quotes", match["test_quote_id"], "quote_text")
+        before = (supabase.table(table).select("*").eq("id", row_id).single().execute()).data
+        text = " ".join(str(req.text or "").split())
+        if len(text.split()) < 4:
+            raise HTTPException(status_code=422, detail="The quote needs at least a few words")
+        if text != " ".join(str(before.get(text_field) or "").split()):
+            supabase.table(table).update({text_field: text, "updated_at": utcnow_iso()}).eq("id", row_id).execute()
+        youtube_id = str(req.youtube_id or "").strip()
+        if youtube_id or req.start is not None or req.end is not None:
+            youtube_id = (extract_youtube_id(youtube_id) or "") if "youtu" in youtube_id else youtube_id
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", youtube_id or ""):
+                raise HTTPException(status_code=422, detail="Enter the 11-character YouTube video ID or a YouTube link")
+            if req.start is None or req.end is None or req.start < 0 or req.end <= req.start or req.end - req.start > 600:
+                raise HTTPException(status_code=422, detail="Enter a start and end time, with the end after the start (10 minutes at most)")
+            if youtube_id != str(before.get("youtube_id") or ""):
+                supabase.table(table).update({"youtube_id": youtube_id}).eq("id", row_id).execute()
+            supabase.rpc("apply_youtube_alignment_result", {
+                "p_quote_table": table, "p_quote_id": str(row_id), "p_status": "manual_verified", "p_youtube_id": youtube_id,
+                "p_rss_start": before.get("rss_timestamp_start"), "p_rss_end": before.get("rss_timestamp_end"),
+                "p_youtube_start": req.start, "p_youtube_end": req.end, "p_confidence": None,
+                "p_method": "sme_manual_source_verification", "p_alignment_version": YOUTUBE_ALIGNMENT_VERSION,
+                "p_details": {"reviewer_id": admin["id"], "context": "thread_match_edit", "match_id": match_id},
+                "p_processing_job_id": before.get("processing_job_id"),
+            }).execute()
+        print(f"AUDIT thread_match_edited match={match_id} table={table} row={row_id} by={admin['id']}")
+        return {"success": True}
 
     @web_app.post("/thread-matches/{match_id}/dismiss")
     async def dismiss_thread_match_endpoint(match_id: str, admin=Depends(require_admin)):
