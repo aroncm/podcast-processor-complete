@@ -4,6 +4,9 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     THREAD_MATCH_SCHEMA,
+    feed_artwork_url,
+    itunes_artwork_url,
+    square_crop_box,
     build_thread_match_prompt,
     filter_thread_matches,
     thread_match_candidates,
@@ -1237,3 +1240,21 @@ class ThreadMatchingTests(unittest.TestCase):
         supabase = SimpleNamespace(table=Query)
         found = thread_match_candidates(supabase, "question")
         self.assertEqual([(c["kind"], c["id"], c["key"]) for c in found], [("published", "fresh", "P1"), ("staged", "t-new", "P2")])
+
+
+class PodcastArtworkTests(unittest.TestCase):
+    def test_feed_artwork_prefers_https_itunes_image(self):
+        parsed = SimpleNamespace(feed={"image": {"href": "https://cdn.example/show.jpg"}})
+        self.assertEqual(feed_artwork_url(parsed), "https://cdn.example/show.jpg")
+        self.assertIsNone(feed_artwork_url(SimpleNamespace(feed={"image": {"href": "http://insecure/show.jpg"}})))
+        self.assertIsNone(feed_artwork_url(SimpleNamespace(feed={})))
+
+    def test_apple_fallback_needs_exact_name_and_upsizes(self):
+        rows = [{"collectionName": "Marketecture Clips", "artworkUrl600": "https://a/x/600x600bb.jpg"},
+                {"collectionName": "marketecture", "artworkUrl600": "https://a/y/600x600bb.jpg"}]
+        self.assertEqual(itunes_artwork_url(rows, "Marketecture"), "https://a/y/1400x1400bb.jpg")
+        self.assertIsNone(itunes_artwork_url(rows[:1], "Marketecture"))
+
+    def test_square_crop_is_centered(self):
+        self.assertEqual(square_crop_box(1600, 1400), (100, 0, 1500, 1400))
+        self.assertEqual(square_crop_box(466, 470), (0, 2, 466, 468))

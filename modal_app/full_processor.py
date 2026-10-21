@@ -5213,6 +5213,104 @@ def merge_tentative_conversation_candidates(conversation_taxonomy, candidates, l
     return json.dumps(graph, ensure_ascii=False)
 
 
+ARTWORK_BUCKET = "podcast-artwork"
+ARTWORK_SIZE = 800
+artwork_image = modal.Image.debian_slim().pip_install(
+    "supabase==2.31.0", "feedparser==6.0.14", "requests==2.34.2", "pillow==11.3.0",
+)
+
+
+def feed_artwork_url(parsed_feed):
+    """The show's own square artwork from its RSS feed: itunes:image first, then the channel image."""
+    feed = getattr(parsed_feed, "feed", None) or {}
+    image = feed.get("image") or {}
+    for candidate in (image.get("href"), feed.get("itunes_image", {}).get("href") if isinstance(feed.get("itunes_image"), dict) else None, image.get("url")):
+        if isinstance(candidate, str) and candidate.startswith("https://"):
+            return candidate
+    return None
+
+
+def itunes_artwork_url(results, podcast_name):
+    """Apple Podcasts fallback: only an exact (case-insensitive) show-name match, at its largest size."""
+    wanted = " ".join(str(podcast_name or "").split()).casefold()
+    for row in results or []:
+        if " ".join(str(row.get("collectionName") or "").split()).casefold() == wanted:
+            url = row.get("artworkUrl600") or row.get("artworkUrl100")
+            if isinstance(url, str) and url.startswith("https://"):
+                return re.sub(r"/\d+x\d+bb\.(jpg|png|webp)$", "/1400x1400bb.jpg", url)
+    return None
+
+
+def square_crop_box(width, height):
+    """Centered square crop so artwork is never stretched."""
+    side = min(width, height)
+    left, top = (width - side) // 2, (height - side) // 2
+    return (left, top, left + side, top + side)
+
+
+@app.function(image=artwork_image, secrets=[my_secret], timeout=900)
+def refresh_podcast_artwork(dry_run: bool = True):
+    """Replace low-resolution or expiring podcast artwork with the show's own square artwork at 800x800,
+    stored in a public bucket so the URL never expires. Returns before/after for every show."""
+    import io
+    import feedparser
+    import requests
+    from PIL import Image
+    from supabase import create_client
+
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    podcasts = supabase.table("podcasts").select("id,name,image_url").execute().data or []
+    feeds = {" ".join(str(f.get("name") or "").split()).casefold(): f.get("rss_url")
+             for f in (supabase.table("test_podcast_feeds").select("name,rss_url").execute().data or [])}
+    if not dry_run:
+        try:
+            supabase.storage.create_bucket(ARTWORK_BUCKET, options={"public": True})
+        except Exception as exc:
+            print(f"bucket exists or could not be created: {exc}")
+    report = []
+    for podcast in podcasts:
+        name = podcast.get("name") or ""
+        entry = {"podcast_id": podcast["id"], "name": name, "before": podcast.get("image_url")}
+        try:
+            source = None
+            rss = feeds.get(" ".join(name.split()).casefold())
+            if rss:
+                source = feed_artwork_url(feedparser.parse(rss))
+                entry["source_kind"] = "rss"
+            if not source:
+                search = requests.get("https://itunes.apple.com/search", params={"term": name, "media": "podcast", "limit": 10}, timeout=20).json()
+                source = itunes_artwork_url(search.get("results"), name)
+                entry["source_kind"] = "apple_podcasts"
+            if not source:
+                entry["status"] = "no_artwork_found"
+                report.append(entry)
+                continue
+            raw = requests.get(source, timeout=30, headers={"User-Agent": "PodThreads artwork refresh"}).content
+            art = Image.open(io.BytesIO(raw))
+            entry["source"], entry["source_size"] = source, list(art.size)
+            art = art.convert("RGB").crop(square_crop_box(*art.size))
+            if art.size[0] < 400:
+                entry["status"] = "source_too_small"
+                report.append(entry)
+                continue
+            art = art.resize((ARTWORK_SIZE, ARTWORK_SIZE), Image.LANCZOS)
+            buffer = io.BytesIO()
+            art.save(buffer, format="JPEG", quality=88, optimize=True, progressive=True)
+            digest = hashlib.sha256(buffer.getvalue()).hexdigest()[:10]
+            path = f"{re.sub(r'[^a-z0-9]+', '-', str(podcast['id']).lower()).strip('-')}-{digest}.jpg"
+            public_url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/storage/v1/object/public/{ARTWORK_BUCKET}/{path}"
+            entry["after"] = public_url
+            if not dry_run:
+                supabase.storage.from_(ARTWORK_BUCKET).upload(path, buffer.getvalue(), {"content-type": "image/jpeg", "upsert": "true", "cache-control": "31536000"})
+                supabase.table("podcasts").update({"image_url": public_url}).eq("id", podcast["id"]).execute()
+            entry["status"] = "updated" if not dry_run else "would_update"
+        except Exception as exc:
+            entry["status"] = f"error: {exc}"[:300]
+        report.append(entry)
+        print(json.dumps({k: v for k, v in entry.items() if k != "before"}))
+    return report
+
+
 THREAD_MATCH_PROMPT_VERSION = "thread-first-matching-v1"
 THREAD_MATCH_MIN_SCORE = 0.6
 THREAD_MATCH_BATCH = 30
