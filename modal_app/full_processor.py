@@ -10448,20 +10448,23 @@ def fastapi_app():
         pub_ids = [s["quote_id"] for s in suggestions if s.get("quote_id")]
         staged_ids = [s["test_quote_id"] for s in suggestions if s.get("test_quote_id")]
         pub = {r["id"]: r for r in (supabase.table("reader_perspectives_v1").select(
-            "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date").in_("id", pub_ids).execute().data or [])} if pub_ids else {}
+            "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end").in_("id", pub_ids).execute().data or [])} if pub_ids else {}
         staged = {r["id"]: r for r in (supabase.table("test_quotes").select(
-            "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published").in_("id", staged_ids).execute().data or [])} if staged_ids else {}
+            "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,timestamp_start,timestamp_end,youtube_alignment_status").in_("id", staged_ids).execute().data or [])} if staged_ids else {}
         rows = []
         for s in suggestions:
             if s.get("quote_id") and s["quote_id"] in pub:
                 r = pub[s["quote_id"]]
                 rows.append({**s, "kind": "published", "text": r["text"], "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
-                             "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_title"), "episode_date": r.get("episode_date")})
+                             "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_title"), "episode_date": r.get("episode_date"),
+                             "youtube_id": r.get("youtube_id"), "youtube_start": r.get("youtube_start"), "youtube_end": r.get("youtube_end"), "moment_verified": r.get("youtube_start") is not None})
             elif s.get("test_quote_id") and s["test_quote_id"] in staged:
                 r = staged[s["test_quote_id"]]
                 rows.append({**s, "kind": "staged", "text": r["quote_text"], "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
                              "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_name"),
-                             "episode_date": str(r.get("date_published") or "")[:10] or None})
+                             "episode_date": str(r.get("date_published") or "")[:10] or None,
+                             "youtube_id": r.get("youtube_id"), "youtube_start": r.get("timestamp_start"), "youtube_end": r.get("timestamp_end"),
+                             "moment_verified": r.get("youtube_alignment_status") in ("verified", "manual_verified")})
         placed_ids = [r["quote_id"] for r in (supabase.table("reader_placements_v1").select("quote_id").eq("question_id", question_id).execute().data or [])]
         placed = (supabase.table("reader_perspectives_v1").select("id,text,speaker_name,speaker_company,podcast_name,episode_date")
                   .in_("id", placed_ids).execute().data or []) if placed_ids else []
