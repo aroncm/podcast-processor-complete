@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     THREAD_MATCH_SCHEMA,
+    bound_entity_evidence,
+    describe_unreviewable_connections,
     QUESTION_DRAFT_SCHEMA,
     build_question_draft_prompt,
     feed_artwork_url,
@@ -1269,3 +1271,23 @@ class QuestionDraftTests(unittest.TestCase):
         self.assertIn("- Who controls the data?", prompt)
         self.assertIn("Agents buy direct.", prompt)
         self.assertEqual(QUESTION_DRAFT_SCHEMA["required"], ["question_text", "question_summary", "connection_context"])
+
+
+class ConnectionEvidenceTests(unittest.TestCase):
+    def test_out_of_span_transcript_evidence_becomes_a_labelled_editorial_connection(self):
+        entities = [
+            {"name": "Visa", "relationship": "Company discussed", "evidence_type": "direct_transcript", "evidence": "Asks whether Visa could support it.", "segment_ids": [987, 988]},
+            {"name": "Ari Paparo", "relationship": "Speaker", "evidence_type": "speaker_identity", "evidence": "Guest metadata.", "segment_ids": []},
+            {"name": "Inside", "relationship": "Company discussed", "evidence_type": "direct_transcript", "evidence": "Named.", "segment_ids": [554]},
+        ]
+        bounded, changed = bound_entity_evidence(entities, 553, 558)
+        self.assertEqual(changed, ["Visa"])
+        self.assertEqual(bounded[0]["evidence_type"], "editorial_connection")
+        self.assertEqual(bounded[0]["segment_ids"], [])
+        self.assertEqual(bounded[0]["evidence"], "Elsewhere in the episode (lines 987-988): Asks whether Visa could support it.")
+        self.assertEqual(bounded[1:], entities[1:])
+        self.assertTrue(conversation_mapping_is_reviewable({"theme_name": "t", "theme_summary": "s", "question_text": "q", "question_summary": "qs",
+            "connection_context": "c", "related_people": [], "related_companies": bounded}, 553, 558))
+
+    def test_problems_are_named_for_the_editor(self):
+        self.assertEqual(describe_unreviewable_connections([{"name": "Visa", "relationship": "", "evidence": ""}]), ["Visa: add the relationship and evidence"])

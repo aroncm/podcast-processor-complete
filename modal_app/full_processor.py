@@ -4216,6 +4216,45 @@ def context_evidence_is_source_bounded(evidence_items, start_segment, end_segmen
     return True
 
 
+def bound_entity_evidence(entities, start_segment, end_segment):
+    """Transcript evidence must sit inside the take's source span. A connection that cites lines elsewhere in the
+    episode is kept, but recorded as an editorial connection with a note saying where in the episode it came from."""
+    bounded, changed = [], []
+    for entity in entities or []:
+        if not isinstance(entity, dict):
+            bounded.append(entity)
+            continue
+        segments = [int(s) for s in (entity.get("segment_ids") or []) if str(s).lstrip("-").isdigit()]
+        outside = entity.get("evidence_type") == "direct_transcript" and (
+            not segments or int(start_segment) < 0 or any(s < int(start_segment) or s > int(end_segment) for s in segments)
+        )
+        if outside:
+            where = f"lines {min(segments)}-{max(segments)}" if segments else "an unrecorded line"
+            evidence = str(entity.get("evidence") or "").strip()
+            bounded.append({**entity, "evidence_type": "editorial_connection", "segment_ids": [],
+                            "evidence": f"Elsewhere in the episode ({where}): {evidence}" if evidence else f"Mentioned elsewhere in the episode ({where})."})
+            changed.append(str(entity.get("name") or "a connection"))
+        else:
+            bounded.append(entity)
+    return bounded, changed
+
+
+def describe_unreviewable_connections(entities):
+    """Name each connection that still cannot be approved, and why, for the editor."""
+    problems = []
+    for entity in entities or []:
+        name = str((entity or {}).get("name") or "").strip() or "An unnamed connection"
+        if not isinstance(entity, dict):
+            problems.append(f"{name}: not a valid connection")
+            continue
+        missing = [label for field, label in (("name", "name"), ("relationship", "relationship"), ("evidence", "evidence")) if not str(entity.get(field) or "").strip()]
+        if missing:
+            problems.append(f"{name}: add the {' and '.join(missing)}")
+        elif entity.get("evidence_type") not in {"direct_transcript", "episode_metadata", "speaker_identity", "editorial_connection"}:
+            problems.append(f"{name}: choose an evidence type")
+    return problems
+
+
 def conversation_mapping_is_reviewable(selection, start_segment, end_segment):
     """Reject malformed connection proposals without rejecting the underlying take."""
     required_text = (
@@ -10993,23 +11032,27 @@ def fastapi_app():
                         status_code=422,
                         detail="Connection context needs one substantive connective sentence",
                     )
+                span_start = before.get("source_start_segment") if before.get("source_start_segment") is not None else -1
+                span_end = before.get("source_end_segment") if before.get("source_end_segment") is not None else -1
+                people, moved_people = bound_entity_evidence(updates.get("proposed_people", before.get("proposed_people")) or [], span_start, span_end)
+                companies, moved_companies = bound_entity_evidence(updates.get("proposed_companies", before.get("proposed_companies")) or [], span_start, span_end)
+                if moved_people or moved_companies:
+                    updates.update({"proposed_people": people, "proposed_companies": companies})
                 reviewable_mapping = {
                     "theme_name": mapping_values["theme"],
                     "theme_summary": mapping_values["theme_summary"],
                     "question_text": mapping_values["question"],
                     "question_summary": mapping_values["question_summary"],
                     "connection_context": mapping_values["connection_context"],
-                    "related_people": updates.get("proposed_people", before.get("proposed_people")) or [],
-                    "related_companies": updates.get("proposed_companies", before.get("proposed_companies")) or [],
+                    "related_people": people,
+                    "related_companies": companies,
                 }
-                if not conversation_mapping_is_reviewable(
-                    reviewable_mapping,
-                    before.get("source_start_segment") if before.get("source_start_segment") is not None else -1,
-                    before.get("source_end_segment") if before.get("source_end_segment") is not None else -1,
-                ):
+                if not conversation_mapping_is_reviewable(reviewable_mapping, span_start, span_end):
+                    problems = describe_unreviewable_connections(people + companies)
                     raise HTTPException(
                         status_code=422,
-                        detail="Connections require complete labels and reviewable evidence inside the recorded source boundary",
+                        detail=("Fix these connections before approving: " + "; ".join(problems) + ".") if problems
+                        else "A connection could not be approved. Remove it and add it again from the People or Companies list.",
                     )
                 updates.update({
                     "mapping_review_status": "approved",
