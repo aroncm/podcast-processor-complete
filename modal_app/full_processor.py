@@ -5213,6 +5213,46 @@ def merge_tentative_conversation_candidates(conversation_taxonomy, candidates, l
     return json.dumps(graph, ensure_ascii=False)
 
 
+QUESTION_DRAFT_PROMPT_VERSION = "editor-theme-question-draft-v1"
+QUESTION_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question_text": {"type": "string"},
+        "question_summary": {"type": "string"},
+        "connection_context": {"type": "string"},
+    },
+    "required": ["question_text", "question_summary", "connection_context"],
+    "additionalProperties": False,
+}
+
+
+def build_question_draft_prompt(take, theme_name, theme_definition, existing_questions):
+    """Draft one open Question inside an editor-chosen Theme for this take."""
+    existing = "\n".join(f"- {q}" for q in existing_questions[:30]) or "- None yet."
+    return f"""
+Take (verbatim, do not rewrite): {take.get("quote_text")}
+Speaker: {take.get("speaker_name") or "Unknown"}, {take.get("speaker_title") or ""} {take.get("speaker_company") or ""}
+Podcast: {take.get("podcast_name") or "Unknown"}; Episode: {take.get("episode_name") or "Unknown"}
+Source transcript around the take:
+{(take.get("source_transcript_excerpt") or "Not available")[:4000]}
+
+The editor has placed this take under the Theme "{theme_name}".
+Theme definition: {theme_definition or "Not stated"}
+
+Questions already in this Theme (do not duplicate; if one already fits, still write a distinct question only if it is genuinely different):
+{existing}
+
+Write:
+1. question_text: one open industry question inside this Theme that the take helps answer. A live operating,
+   market-structure, measurement, incentive or policy question that several industry participants could answer
+   differently. Under 20 words, ends with a question mark, no jargon the take does not support.
+2. question_summary: one or two plain sentences framing the question for readers. No hype.
+3. connection_context: 35 to 70 words for the editor on how this take bears on the question, using only what the
+   source supports. Do not paraphrase the take, praise it, or use phrases like "underscores", "key takeaway",
+   "rapidly evolving landscape" or "game changer".
+"""
+
+
 ARTWORK_BUCKET = "podcast-artwork"
 ARTWORK_SIZE = 800
 artwork_image = modal.Image.debian_slim().pip_install(
@@ -9283,6 +9323,11 @@ def fastapi_app():
     class ThreadPlacementRemoveRequest(BaseModel):
         quote_id: str
 
+    class QuestionDraftRequest(BaseModel):
+        quote_id: str
+        theme_name: str
+        theme_definition: str | None = None
+
     def service_client():
         return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
@@ -10283,6 +10328,39 @@ def fastapi_app():
             return {"success": True, "quote_id": result.data}
         except Exception as exc:
             return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
+
+    @web_app.post("/draft-question")
+    async def draft_question_endpoint(req: QuestionDraftRequest, admin=Depends(require_admin)):
+        """AI draft of a Question for an editor-chosen Theme. Returns text only; nothing is saved until the editor saves."""
+        from openai import OpenAI
+        theme_name = " ".join(str(req.theme_name or "").split())
+        if not theme_name:
+            raise HTTPException(status_code=422, detail="Choose or create the Theme first")
+        supabase = service_client()
+        take = (supabase.table("test_quotes").select(
+            "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,source_transcript_excerpt")
+            .eq("id", req.quote_id).single().execute()).data
+        if not take:
+            raise HTTPException(status_code=404, detail="Take not found")
+        themes = supabase.table("conversation_themes").select("id").ilike("name", theme_name).execute().data or []
+        existing = [q["question_text"] for q in (supabase.table("conversation_questions").select("question_text")
+                    .in_("theme_id", [t["id"] for t in themes]).execute().data or [])] if themes else []
+        staged = supabase.table("test_quotes").select("proposed_question_text").ilike("proposed_theme_name", theme_name).limit(60).execute().data or []
+        existing += [r["proposed_question_text"] for r in staged if r.get("proposed_question_text")]
+        existing = list(dict.fromkeys(e.strip() for e in existing if e and e.strip()))
+        try:
+            result = call_openai_structured(
+                OpenAI(api_key=os.environ["OPENAI_API_KEY"]),
+                model=os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+                system_prompt="You are PodThreads' senior adtech editor. You frame open industry questions that podcast takes help answer. Plain, precise, no hype.",
+                user_prompt=build_question_draft_prompt(take, theme_name, req.theme_definition, existing),
+                schema_name="question_draft", schema=QUESTION_DRAFT_SCHEMA,
+                reasoning_effort=os.environ.get("OPENAI_QUESTION_DRAFT_REASONING", "medium"), max_output_tokens=3000,
+            )
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={"success": False, "error": f"The AI draft failed: {exc}"[:300]})
+        return {"success": True, "prompt_version": QUESTION_DRAFT_PROMPT_VERSION,
+                **{k: " ".join(str(result.get(k) or "").split()) for k in ("question_text", "question_summary", "connection_context")}}
 
     @web_app.get("/threads")
     async def threads_endpoint(admin=Depends(require_admin)):

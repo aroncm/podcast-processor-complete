@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     THREAD_MATCH_SCHEMA,
+    QUESTION_DRAFT_SCHEMA,
+    build_question_draft_prompt,
     feed_artwork_url,
     itunes_artwork_url,
     square_crop_box,
@@ -1258,3 +1260,12 @@ class PodcastArtworkTests(unittest.TestCase):
     def test_square_crop_is_centered(self):
         self.assertEqual(square_crop_box(1600, 1400), (100, 0, 1500, 1400))
         self.assertEqual(square_crop_box(466, 470), (0, 2, 466, 468))
+
+
+class QuestionDraftTests(unittest.TestCase):
+    def test_prompt_carries_editor_theme_and_existing_questions(self):
+        prompt = build_question_draft_prompt({"quote_text": "Agents buy direct."}, "Agentic Commerce", "AI-mediated shopping.", ["Who controls the data?"])
+        self.assertIn('Theme "Agentic Commerce"', prompt)
+        self.assertIn("- Who controls the data?", prompt)
+        self.assertIn("Agents buy direct.", prompt)
+        self.assertEqual(QUESTION_DRAFT_SCHEMA["required"], ["question_text", "question_summary", "connection_context"])
