@@ -4,6 +4,12 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     THREAD_MATCH_SCHEMA,
+    DISCOVERY_SCHEMA,
+    THEME_SCAN_SCHEMA,
+    build_discovery_prompt,
+    build_theme_scan_prompt,
+    clean_proposal_members,
+    _slugify,
     bound_entity_evidence,
     describe_unreviewable_connections,
     QUESTION_DRAFT_SCHEMA,
@@ -1291,3 +1297,31 @@ class ConnectionEvidenceTests(unittest.TestCase):
 
     def test_problems_are_named_for_the_editor(self):
         self.assertEqual(describe_unreviewable_connections([{"name": "Visa", "relationship": "", "evidence": ""}]), ["Visa: add the relationship and evidence"])
+
+
+class ThreadDiscoveryTests(unittest.TestCase):
+    by_key = {"P1": {"kind": "published", "id": "q-1"}, "P2": {"kind": "staged", "id": "t-2"}, "P3": {"kind": "published", "id": "q-3"}}
+
+    def test_members_are_real_unused_and_above_threshold(self):
+        used = {"P3"}
+        kept = clean_proposal_members([
+            {"candidate": "P1", "fit_score": 0.8, "reason": " Names  the data owner. "},
+            {"candidate": "P1", "fit_score": 0.9, "reason": "again"},
+            {"candidate": "P2", "fit_score": 0.5, "reason": "weak"},
+            {"candidate": "P3", "fit_score": 0.9, "reason": "already used elsewhere"},
+            {"candidate": "P9", "fit_score": 0.9, "reason": "invented"},
+        ], self.by_key, used)
+        self.assertEqual(kept, [{"kind": "published", "id": "q-1", "fit_score": 0.8, "reason": "Names the data owner."}])
+        self.assertEqual(used, {"P1", "P3"})
+
+    def test_prompts_carry_vocabulary_and_never_database_ids(self):
+        cands = [{"key": "P1", "id": "q-secret", "text": "Agents buy direct.", "speaker_name": "A"}]
+        d = build_discovery_prompt([{"id": "t1", "name": "Agentic Commerce", "summary": "AI shopping."}], {"t1": ["Who controls the data?"]}, cands)
+        self.assertIn("Agentic Commerce", d); self.assertIn("· Who controls the data?", d); self.assertNotIn("q-secret", d)
+        t = build_theme_scan_prompt({"name": "Agentic Commerce"}, [{"question_text": "Who controls the data?"}], cands)
+        self.assertIn("[Q1] Who controls the data?", t); self.assertNotIn("q-secret", t)
+        self.assertIn("proposals", DISCOVERY_SCHEMA["required"]); self.assertEqual(THEME_SCAN_SCHEMA["required"], ["existing", "new_questions"])
+
+    def test_slug_is_stable_and_safe(self):
+        self.assertEqual(_slugify("Who controls  the data?"), _slugify("who controls the data?"))
+        self.assertRegex(_slugify("Who controls the data?"), r"^who-controls-the-data-[0-9a-f]{8}$")

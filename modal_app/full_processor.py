@@ -5577,6 +5577,251 @@ def find_thread_matches(question_id: str, job_id: str = None):
         raise
 
 
+THREAD_DISCOVERY_PROMPT_VERSION = "thread-discovery-v1"
+THREAD_DISCOVERY_MAX_CANDIDATES = 400
+_PROPOSAL_MEMBER = {
+    "type": "object",
+    "properties": {"candidate": {"type": "string"}, "fit_score": {"type": "number"}, "reason": {"type": "string"}},
+    "required": ["candidate", "fit_score", "reason"], "additionalProperties": False,
+}
+DISCOVERY_SCHEMA = {
+    "type": "object",
+    "properties": {"proposals": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "theme_name": {"type": "string"}, "theme_summary": {"type": "string"},
+            "inclusion_criteria": {"type": "array", "items": {"type": "string"}},
+            "exclusion_criteria": {"type": "array", "items": {"type": "string"}},
+            "question_text": {"type": "string"}, "question_summary": {"type": "string"},
+            "rationale": {"type": "string"}, "members": {"type": "array", "items": _PROPOSAL_MEMBER},
+        },
+        "required": ["theme_name", "theme_summary", "inclusion_criteria", "exclusion_criteria", "question_text",
+                     "question_summary", "rationale", "members"],
+        "additionalProperties": False,
+    }}},
+    "required": ["proposals"], "additionalProperties": False,
+}
+THEME_SCAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "existing": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}, "candidate": {"type": "string"}, "fit_score": {"type": "number"}, "reason": {"type": "string"}},
+            "required": ["question", "candidate", "fit_score", "reason"], "additionalProperties": False,
+        }},
+        "new_questions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"question_text": {"type": "string"}, "question_summary": {"type": "string"}, "rationale": {"type": "string"},
+                           "members": {"type": "array", "items": _PROPOSAL_MEMBER}},
+            "required": ["question_text", "question_summary", "rationale", "members"], "additionalProperties": False,
+        }},
+    },
+    "required": ["existing", "new_questions"], "additionalProperties": False,
+}
+DISCOVERY_SYSTEM_PROMPT = """
+You are PodThreads' senior adtech editor. PodThreads follows the industry conversation: durable themes, the open
+questions inside them, and the perspectives of people who work in adtech. You group perspectives only where the
+speakers genuinely speak to the same open question. You are strict, plain-spoken and never invent context.
+"""
+_DISCOVERY_RULES = """
+Writing rules for every theme, question and reason:
+- A theme is a durable industry subject (not a category label). A question is one open operating, market-structure,
+  measurement, incentive or policy question several practitioners could answer differently. Under 20 words, ends with "?".
+- Summaries are one or two plain sentences. Reasons are one plain sentence of at most 25 words for the editor.
+- No stance or debate framing (no "agree", "challenge", "versus", "hot take"), no hype, no "underscores", "key takeaway",
+  "rapidly evolving landscape" or "game changer".
+- fit_score: 0.9+ the words directly answer the question; about 0.75 a clear contribution; about 0.6 relevant but partial.
+  Never include anything below 0.6.
+"""
+
+
+def _candidate_lines(candidates):
+    def clip(text):
+        words = str(text or "").split()
+        return " ".join(words[:120]) + (" …" if len(words) > 120 else "")
+    return "\n".join(f'[{c["key"]}] "{clip(c.get("text"))}" ({_attribution(c)})' for c in candidates)
+
+
+def build_discovery_prompt(themes, questions_by_theme, candidates):
+    """Propose new threads from perspectives that are not in any thread yet."""
+    vocabulary = "\n".join(
+        f'- {t["name"]}: {t.get("summary") or ""}' + "".join(f'\n    · {q}' for q in questions_by_theme.get(t["id"], []))
+        for t in themes
+    ) or "- None yet."
+    return f"""
+Published themes, with their published questions (do not re-propose an existing question):
+{vocabulary}
+
+Perspectives not yet in any thread:
+{_candidate_lines(candidates)}
+
+Propose up to 8 new threads. Each thread is a theme, one open question, and the perspectives that speak to it.
+- Reuse an existing theme name exactly when the subject fits; otherwise propose a new theme with inclusion and
+  exclusion criteria (one short line each, two or three lines).
+- Each thread needs at least 2 perspectives, ideally from different speakers. Prefer fewer, stronger threads.
+- A perspective may appear in at most one proposal.
+{_DISCOVERY_RULES}
+"""
+
+
+def build_theme_scan_prompt(theme, questions, candidates):
+    """Read perspectives against one theme: fit an existing question, or group into a proposed new question."""
+    listed = "\n".join(f"[Q{i}] {q['question_text']}" for i, q in enumerate(questions, start=1)) or "- None yet."
+    return f"""
+Theme: {theme.get("name")}
+Theme scope: {theme.get("summary") or "Not stated"}
+
+Its published questions:
+{listed}
+
+Perspectives not yet in this theme:
+{_candidate_lines(candidates)}
+
+1. existing: perspectives that speak to one of the questions above (use its Q label).
+2. new_questions: open questions inside this theme that none of the questions above cover, each with at least 2
+   perspectives that speak to it. Up to 5.
+Most perspectives will fit neither; leaving them out is correct. A perspective may appear once in total.
+{_DISCOVERY_RULES}
+"""
+
+
+def clean_proposal_members(members, by_key, used):
+    """Keep well-formed, unused, above-threshold members, keyed back to real rows."""
+    kept = []
+    for member in members or []:
+        key = str(member.get("candidate") or "").strip().strip("[]")
+        reason = " ".join(str(member.get("reason") or "").split())
+        try:
+            score = float(member.get("fit_score"))
+        except (TypeError, ValueError):
+            continue
+        if key not in by_key or key in used or not reason or not (THREAD_MATCH_MIN_SCORE <= score <= 1):
+            continue
+        used.add(key)
+        c = by_key[key]
+        kept.append({"kind": c["kind"], "id": c["id"], "fit_score": round(score, 3), "reason": reason[:400]})
+    return kept
+
+
+def discovery_candidates(supabase, theme_id=None):
+    """Perspectives (and approved, unpublished takes without an approved mapping) not yet in any thread, or, for a
+    theme scan, not yet in that theme. Newest first, capped."""
+    links = _select_all(lambda: supabase.table("conversation_take_links").select("quote_id,theme_id"))
+    placed = {l["quote_id"] for l in links if theme_id is None or l["theme_id"] == theme_id}
+    published = _select_all(lambda: supabase.table("reader_perspectives_v1").select(
+        "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_date,published_at").order("id"))
+    staged = _select_all(lambda: supabase.table("test_quotes").select(
+        "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,date_published,mapping_review_status,created_at")
+        .eq("approval_status", "approved").order("id"))
+    candidates = [{"kind": "published", "id": r["id"], "text": r["text"], "speaker_name": r.get("speaker_name"),
+                   "speaker_title": r.get("speaker_title"), "speaker_company": r.get("speaker_company"),
+                   "podcast_name": r.get("podcast_name"), "episode_date": r.get("episode_date"), "_t": r.get("published_at") or ""}
+                  for r in published if r["id"] not in placed and str(r.get("text") or "").strip()]
+    candidates += [{"kind": "staged", "id": r["id"], "text": r["quote_text"], "speaker_name": r.get("speaker_name"),
+                    "speaker_title": r.get("speaker_title"), "speaker_company": r.get("speaker_company"),
+                    "podcast_name": r.get("podcast_name"), "episode_date": str(r.get("date_published") or "")[:10] or None,
+                    "_t": r.get("created_at") or ""}
+                   for r in staged if r.get("mapping_review_status") != "approved" and str(r.get("quote_text") or "").strip()]
+    candidates.sort(key=lambda c: str(c["_t"]), reverse=True)
+    candidates = candidates[:THREAD_DISCOVERY_MAX_CANDIDATES]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate["key"] = f"P{index}"
+        candidate.pop("_t", None)
+    return candidates
+
+
+@app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
+def find_thread_proposals(scope: str, theme_id: str = None, job_id: str = None):
+    """scope 'discover': propose new threads from unthreaded perspectives. scope 'theme': read perspectives against one
+    theme; fits to existing questions become thread suggestions, the rest become proposed new questions."""
+    from openai import OpenAI
+    from supabase import create_client
+
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    try:
+        update_processing_job(supabase, job_id, "claimed", started_at=utcnow_iso())
+        themes = supabase.table("conversation_themes").select("id,name,summary").eq("publication_status", "published").execute().data or []
+        questions = supabase.table("conversation_questions").select("id,theme_id,question_text,summary").eq("publication_status", "published").execute().data or []
+        candidates = discovery_candidates(supabase, theme_id if scope == "theme" else None)
+        by_key = {c["key"]: c for c in candidates}
+        update_processing_job(supabase, job_id, "mapping", progress={"candidates": len(candidates)})
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+        effort = os.environ.get("OPENAI_THREAD_DISCOVERY_REASONING", "high")
+        used, proposals, suggestions = set(), [], 0
+        base = {"model": model, "prompt_version": THREAD_DISCOVERY_PROMPT_VERSION, "processing_job_id": job_id, "status": "suggested"}
+        if scope == "discover":
+            by_theme = {}
+            for q in questions:
+                by_theme.setdefault(q["theme_id"], []).append(q["question_text"])
+            result = call_openai_structured(client, model=model, system_prompt=DISCOVERY_SYSTEM_PROMPT,
+                user_prompt=build_discovery_prompt(themes, by_theme, candidates), schema_name="thread_discovery",
+                schema=DISCOVERY_SCHEMA, reasoning_effort=effort, max_output_tokens=12000)
+            theme_by_name = {t["name"].casefold(): t for t in themes}
+            for p in result.get("proposals") or []:
+                members = clean_proposal_members(p.get("members"), by_key, used)
+                name = " ".join(str(p.get("theme_name") or "").split())
+                question = " ".join(str(p.get("question_text") or "").split())
+                if len(members) < 2 or not name or not question:
+                    continue
+                existing = theme_by_name.get(name.casefold())
+                proposals.append({**base, "scope": "discover", "theme_id": existing["id"] if existing else None,
+                    "theme_name": existing["name"] if existing else name,
+                    "theme_summary": (existing or {}).get("summary") or " ".join(str(p.get("theme_summary") or "").split()),
+                    "inclusion_criteria": [s.strip() for s in p.get("inclusion_criteria") or [] if s.strip()][:4],
+                    "exclusion_criteria": [s.strip() for s in p.get("exclusion_criteria") or [] if s.strip()][:4],
+                    "question_text": question, "question_summary": " ".join(str(p.get("question_summary") or "").split()),
+                    "rationale": " ".join(str(p.get("rationale") or "").split())[:600], "members": members})
+        else:
+            theme = next((t for t in themes if t["id"] == theme_id), None)
+            if not theme:
+                raise ValueError("Only published themes can be scanned")
+            theme_questions = [q for q in questions if q["theme_id"] == theme_id]
+            result = call_openai_structured(client, model=model, system_prompt=DISCOVERY_SYSTEM_PROMPT,
+                user_prompt=build_theme_scan_prompt(theme, theme_questions, candidates), schema_name="theme_scan",
+                schema=THEME_SCAN_SCHEMA, reasoning_effort=effort, max_output_tokens=12000)
+            prior = {(r["question_id"], r.get("quote_id") or r.get("test_quote_id"))
+                     for r in _select_all(lambda: supabase.table("thread_match_suggestions").select("question_id,quote_id,test_quote_id").eq("theme_id", theme_id))}
+            for match in result.get("existing") or []:
+                label = str(match.get("question") or "").strip().strip("[]").upper()
+                index = int(label[1:]) - 1 if label.startswith("Q") and label[1:].isdigit() else -1
+                if not 0 <= index < len(theme_questions):
+                    continue
+                kept = clean_proposal_members([match], by_key, used)
+                if not kept or (theme_questions[index]["id"], kept[0]["id"]) in prior:
+                    continue
+                m = kept[0]
+                try:
+                    supabase.table("thread_match_suggestions").insert({
+                        "theme_id": theme_id, "question_id": theme_questions[index]["id"], "fit_score": m["fit_score"], "reason": m["reason"],
+                        "quote_id": m["id"] if m["kind"] == "published" else None, "test_quote_id": m["id"] if m["kind"] == "staged" else None,
+                        "model": model, "prompt_version": THREAD_DISCOVERY_PROMPT_VERSION, "processing_job_id": job_id}).execute()
+                    suggestions += 1
+                except Exception as exc:
+                    print(f"theme scan suggestion skipped: {exc}")
+            for p in result.get("new_questions") or []:
+                members = clean_proposal_members(p.get("members"), by_key, used)
+                question = " ".join(str(p.get("question_text") or "").split())
+                if len(members) < 2 or not question:
+                    continue
+                proposals.append({**base, "scope": "theme", "theme_id": theme_id, "theme_name": theme["name"], "theme_summary": theme.get("summary"),
+                    "question_text": question, "question_summary": " ".join(str(p.get("question_summary") or "").split()),
+                    "rationale": " ".join(str(p.get("rationale") or "").split())[:600], "members": members})
+        if proposals:
+            supabase.table("thread_proposals").insert(proposals).execute()
+        summary = {"candidates": len(candidates), "proposals": len(proposals), "suggestions": suggestions}
+        update_processing_job(supabase, job_id, "succeeded", progress=summary, result=summary, completed_at=utcnow_iso())
+        return {"success": True, **summary}
+    except Exception as exc:
+        update_processing_job(supabase, job_id, "failed", error_code="thread_discovery_failed", error_message=str(exc)[:500], completed_at=utcnow_iso())
+        raise
+
+
+def _slugify(text):
+    base = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")[:80]
+    return f"{base}-{hashlib.md5(' '.join(str(text or '').split()).lower().encode()).hexdigest()[:8]}"
+
+
 def propose_historical_conversation_mapping(
     quote,
     source_evidence,
@@ -9362,6 +9607,13 @@ def fastapi_app():
     class ThreadPlacementRemoveRequest(BaseModel):
         quote_id: str
 
+    class ThreadProposalAcceptRequest(BaseModel):
+        theme_name: str | None = None
+        theme_summary: str | None = None
+        question_text: str | None = None
+        question_summary: str | None = None
+        member_ids: list[str]
+
     class ThreadMatchEditRequest(BaseModel):
         text: str
         youtube_id: str | None = None
@@ -10436,7 +10688,17 @@ def fastapi_app():
         links = _select_all(lambda: supabase.table("reader_placements_v1").select("question_id"))
         pending = _select_all(lambda: supabase.table("thread_match_suggestions").select("question_id").eq("status", "suggested"))
         count = lambda rows, qid: sum(1 for r in rows if r["question_id"] == qid)
-        return {"success": True, "threads": [{
+        try:
+            proposals = _select_all(lambda: supabase.table("thread_proposals").select("theme_id,scope").eq("status", "suggested"))
+        except Exception:
+            proposals = []  # before the thread_proposals migration runs
+        theme_rows = [{"theme_id": t["id"], "name": t["name"], "summary": t.get("summary"),
+                       "threads": sum(1 for q in questions if q["theme_id"] == t["id"]),
+                       "pending_proposals": sum(1 for p in proposals if p.get("theme_id") == t["id"] and p["scope"] == "theme")}
+                      for t in sorted(themes.values(), key=lambda t: t["name"].casefold())]
+        return {"success": True, "themes": theme_rows,
+                "pending_discoveries": sum(1 for p in proposals if p["scope"] == "discover"),
+                "threads": [{
             "question_id": q["id"], "question_text": q["question_text"], "theme_id": q["theme_id"],
             "theme_name": themes[q["theme_id"]]["name"], "perspectives": count(links, q["id"]),
             "pending_suggestions": count(pending, q["id"]),
@@ -10495,6 +10757,138 @@ def fastapi_app():
             return {"success": True, "id": result.data}
         except Exception as exc:
             return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
+
+    def _start_discovery(scope, theme_id, admin):
+        supabase = service_client()
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"thread-discovery:{scope}:{theme_id or 'all'}:{uuid.uuid4()}",
+            "job_type": "thread_discovery", "source": "admin", "requested_by": admin["id"],
+            "parameters": {"scope": scope, "theme_id": theme_id, "prompt_version": THREAD_DISCOVERY_PROMPT_VERSION},
+        }).execute()
+        job_id = inserted.data[0]["id"]
+        return supabase, job_id
+
+    @web_app.post("/thread-discovery")
+    async def thread_discovery_endpoint(admin=Depends(require_admin)):
+        """Propose new threads (theme, question and perspectives) from perspectives that are not in any thread."""
+        supabase, job_id = _start_discovery("discover", None, admin)
+        call = await find_thread_proposals.spawn.aio(scope="discover", job_id=job_id)
+        supabase.table("processing_jobs").update({"modal_call_id": call.object_id, "updated_at": utcnow_iso()}).eq("id", job_id).execute()
+        return JSONResponse(status_code=202, content={"success": True, "job_id": job_id, "state": "queued"})
+
+    @web_app.post("/themes/{theme_id}/find-matches")
+    async def theme_find_matches_endpoint(theme_id: str, admin=Depends(require_admin)):
+        """Read perspectives against one theme: fits become thread suggestions; the rest become proposed new questions."""
+        supabase, job_id = _start_discovery("theme", theme_id, admin)
+        call = await find_thread_proposals.spawn.aio(scope="theme", theme_id=theme_id, job_id=job_id)
+        supabase.table("processing_jobs").update({"modal_call_id": call.object_id, "updated_at": utcnow_iso()}).eq("id", job_id).execute()
+        return JSONResponse(status_code=202, content={"success": True, "job_id": job_id, "state": "queued"})
+
+    @web_app.get("/thread-proposals")
+    async def thread_proposals_endpoint(scope: str = "discover", theme_id: str | None = None, admin=Depends(require_admin)):
+        supabase = service_client()
+        query = supabase.table("thread_proposals").select("*").eq("status", "suggested").eq("scope", scope)
+        if theme_id:
+            query = query.eq("theme_id", theme_id)
+        rows = query.order("created_at", desc=True).limit(40).execute().data or []
+        pub_ids = list({m["id"] for r in rows for m in r.get("members") or [] if m.get("kind") == "published"})
+        staged_ids = list({m["id"] for r in rows for m in r.get("members") or [] if m.get("kind") == "staged"})
+        pub = {r["id"]: r for r in (supabase.table("reader_perspectives_v1").select(
+            "id,text,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end")
+            .in_("id", pub_ids).execute().data or [])} if pub_ids else {}
+        staged = {r["id"]: r for r in (supabase.table("test_quotes").select(
+            "id,quote_text,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published")
+            .in_("id", staged_ids).execute().data or [])} if staged_ids else {}
+        for row in rows:
+            hydrated = []
+            for m in row.get("members") or []:
+                src = pub.get(m["id"]) if m.get("kind") == "published" else staged.get(m["id"])
+                if not src:
+                    continue
+                hydrated.append({**m, "text": src.get("text") or src.get("quote_text"), "speaker_name": src.get("speaker_name"),
+                                 "speaker_title": src.get("speaker_title"), "speaker_company": src.get("speaker_company"),
+                                 "podcast_name": src.get("podcast_name"), "episode_title": src.get("episode_title") or src.get("episode_name"),
+                                 "episode_date": src.get("episode_date") or str(src.get("date_published") or "")[:10] or None})
+            row["members"] = hydrated
+        return {"success": True, "proposals": [r for r in rows if len(r["members"]) >= 1]}
+
+    @web_app.post("/thread-proposals/{proposal_id}/accept")
+    async def accept_thread_proposal_endpoint(proposal_id: str, req: ThreadProposalAcceptRequest, admin=Depends(require_admin)):
+        """Publish a proposed thread: create or reuse the theme, create or reuse the question, then add the chosen
+        perspectives through the same audited path as any accepted match."""
+        supabase = service_client()
+        rows = supabase.table("thread_proposals").select("*").eq("id", proposal_id).limit(1).execute().data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        prop = rows[0]
+        if prop["status"] != "suggested":
+            raise HTTPException(status_code=422, detail="This proposal has already been handled")
+        clean = lambda v: " ".join(str(v or "").split())
+        theme_name = clean(req.theme_name) or prop["theme_name"]
+        theme_summary = clean(req.theme_summary) or clean(prop.get("theme_summary"))
+        question_text = clean(req.question_text) or prop["question_text"]
+        question_summary = clean(req.question_summary) or clean(prop.get("question_summary")) or question_text
+        members = {m["id"]: m for m in prop.get("members") or []}
+        chosen = [members[i] for i in req.member_ids if i in members]
+        if not chosen:
+            raise HTTPException(status_code=422, detail="Choose at least one perspective for this thread")
+        if not question_text.endswith("?"):
+            raise HTTPException(status_code=422, detail="Write the question as a question, ending with a question mark")
+        now = utcnow_iso()
+        themes = supabase.table("conversation_themes").select("id,name,publication_status").execute().data or []
+        theme = next((t for t in themes if t["id"] == prop.get("theme_id")), None) or next((t for t in themes if t["name"].casefold() == theme_name.casefold()), None)
+        if theme and theme["publication_status"] == "archived":
+            raise HTTPException(status_code=422, detail=f'The theme "{theme["name"]}" is archived; restore it or rename this one')
+        if not theme:
+            registry = supabase.table("adtech_theme_registry").select("id,canonical_name,status").limit(1000).execute().data or []
+            if not any(normalize_directory_value(r.get("canonical_name")) == normalize_directory_value(theme_name) for r in registry):
+                try:
+                    record = prepare_theme_registry_record(registry, theme_name, theme_summary,
+                        prop.get("inclusion_criteria") or [theme_summary],
+                        prop.get("exclusion_criteria") or ["Incidental mentions without a substantive connection to this theme."], activate=True)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                record.update({"reviewed_by": admin["id"], "reviewed_at": now,
+                               "metadata": {"created_by_admin_api": True, "created_from_thread_proposal": proposal_id, "created_active": True}})
+                supabase.table("adtech_theme_registry").insert(record).execute()
+            theme = supabase.table("conversation_themes").insert({"slug": _slugify(theme_name), "name": theme_name, "summary": theme_summary,
+                "publication_status": "published", "reviewed_by": admin["id"], "reviewed_at": now}).execute().data[0]
+        elif theme["publication_status"] != "published":
+            supabase.table("conversation_themes").update({"publication_status": "published", "reviewed_by": admin["id"], "reviewed_at": now, "updated_at": now}).eq("id", theme["id"]).execute()
+        theme_questions = supabase.table("conversation_questions").select("id,question_text,publication_status").eq("theme_id", theme["id"]).execute().data or []
+        question = next((q for q in theme_questions if q["question_text"].casefold() == question_text.casefold()), None)
+        if question and question["publication_status"] == "archived":
+            raise HTTPException(status_code=422, detail="That question is archived; restore it or reword this one")
+        if not question:
+            question = supabase.table("conversation_questions").insert({"theme_id": theme["id"], "slug": _slugify(question_text),
+                "question_text": question_text, "summary": question_summary, "publication_status": "published",
+                "reviewed_by": admin["id"], "reviewed_at": now}).execute().data[0]
+        elif question["publication_status"] != "published":
+            supabase.table("conversation_questions").update({"publication_status": "published", "reviewed_by": admin["id"], "reviewed_at": now, "updated_at": now}).eq("id", question["id"]).execute()
+        placed, errors = 0, []
+        for m in chosen:
+            field = "quote_id" if m["kind"] == "published" else "test_quote_id"
+            existing = supabase.table("thread_match_suggestions").select("id,status").eq("question_id", question["id"]).eq(field, m["id"]).limit(1).execute().data or []
+            if existing and existing[0]["status"] == "dismissed":
+                supabase.table("thread_match_suggestions").update({"status": "suggested"}).eq("id", existing[0]["id"]).execute()
+            match_id = existing[0]["id"] if existing else supabase.table("thread_match_suggestions").insert({
+                "theme_id": theme["id"], "question_id": question["id"], field: m["id"], "fit_score": m.get("fit_score") or 0.75,
+                "reason": m.get("reason") or "Proposed with this thread.", "model": prop.get("model"),
+                "prompt_version": prop.get("prompt_version")}).execute().data[0]["id"]
+            try:
+                supabase.rpc("accept_thread_match", {"p_match_id": match_id, "p_reviewer_id": admin["id"]}).execute()
+                placed += 1
+            except Exception as exc:
+                errors.append(str(exc)[:200])
+        supabase.table("thread_proposals").update({"status": "accepted", "result_question_id": question["id"], "reviewed_by": admin["id"],
+            "reviewed_at": now}).eq("id", proposal_id).execute()
+        print(f"AUDIT thread_proposal_accepted proposal={proposal_id} question={question['id']} placed={placed} by={admin['id']}")
+        return {"success": True, "question_id": question["id"], "theme_id": theme["id"], "placed": placed, "errors": errors}
+
+    @web_app.post("/thread-proposals/{proposal_id}/dismiss")
+    async def dismiss_thread_proposal_endpoint(proposal_id: str, admin=Depends(require_admin)):
+        service_client().table("thread_proposals").update({"status": "dismissed", "reviewed_by": admin["id"], "reviewed_at": utcnow_iso()}).eq("id", proposal_id).eq("status", "suggested").execute()
+        return {"success": True}
 
     @web_app.post("/thread-matches/{match_id}/edit")
     async def edit_thread_match_endpoint(match_id: str, req: ThreadMatchEditRequest, admin=Depends(require_admin)):
