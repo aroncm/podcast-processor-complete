@@ -9800,6 +9800,11 @@ def fastapi_app():
         start: float | None = None
         end: float | None = None
 
+    class DirectoryPersonUpdateRequest(BaseModel):
+        title: str | None = None
+        company: str | None = None
+        linkedin_url: str | None = None
+
     class ThreadProposalRefreshRequest(BaseModel):
         theme_name: str | None = None
         theme_summary: str | None = None
@@ -11121,6 +11126,35 @@ def fastapi_app():
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"success": True}
+
+    @web_app.post("/directory/people/{guest_id}")
+    async def update_directory_person_endpoint(guest_id: str, req: DirectoryPersonUpdateRequest, admin=Depends(require_admin)):
+        """Correct a directory person's title, company and LinkedIn. Published perspectives read these from the directory,
+        so the change appears everywhere; approved takes that keep their own copy are updated too."""
+        supabase = service_client()
+        found = supabase.table("guests").select("id,name,title,company,linkedin_url").eq("id", guest_id).limit(1).execute().data or []
+        if not found:
+            raise HTTPException(status_code=404, detail="Person not found")
+        clean = lambda v: " ".join(str(v or "").split())
+        updates = {}
+        if req.title is not None:
+            updates["title"] = clean(req.title) or None
+        if req.company is not None:
+            updates["company"] = clean(req.company) or None
+        if req.linkedin_url is not None:
+            url = clean(req.linkedin_url)
+            if url and not re.match(r"^https://([a-z]+\.)?linkedin\.com/", url, re.I):
+                raise HTTPException(status_code=422, detail="Enter a LinkedIn profile link starting with https://www.linkedin.com/")
+            updates["linkedin_url"] = url or None
+        if not updates:
+            return {"success": True, "person": found[0]}
+        person = supabase.table("guests").update(updates).eq("id", guest_id).execute().data[0]
+        staged = {k: v or "" for k, v in (("speaker_title", updates.get("title", found[0].get("title"))),
+                                         ("speaker_company", updates.get("company", found[0].get("company"))),
+                                         ("speaker_linkedin", updates.get("linkedin_url", found[0].get("linkedin_url"))))}
+        supabase.table("test_quotes").update(staged).eq("guest_id", guest_id).in_("approval_status", ["pending", "approved"]).execute()
+        print(f"AUDIT directory_person_updated guest={guest_id} fields={sorted(updates)} by={admin['id']}")
+        return {"success": True, "person": {k: person.get(k) for k in ("id", "name", "title", "company", "linkedin_url")}}
 
     @web_app.get("/perspectives/source")
     async def perspective_source_endpoint(kind: str, id: str, admin=Depends(require_admin)):
