@@ -6104,6 +6104,142 @@ def backfill_thread_entities():
     return link_thread_entities.local(pairs)
 
 
+THEME_COMPANIES_PROMPT_VERSION = "theme-companies-v1"
+THEME_COMPANY_SCHEMA = {
+    "type": "object",
+    "properties": {"companies": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "source": {"type": "string", "enum": ["quote", "transcript_excerpt", "episode_title", "episode_description", "full_transcript"]},
+                       "evidence": {"type": "string"}},
+        "required": ["name", "source", "evidence"], "additionalProperties": False}}},
+    "required": ["companies"], "additionalProperties": False,
+}
+
+
+def _strip_html(text):
+    return " ".join(re.sub(r"<[^>]+>", " ", str(text or "")).replace("&amp;", "&").replace("&nbsp;", " ").split())
+
+
+def build_theme_company_prompt(theme, episode, sources, exclude):
+    blocks = "\n\n".join(f"[{k}]\n{v}" for k, v in sources.items() if v)
+    return f"""
+Theme: {theme.get("name")}
+Theme scope: {theme.get("summary") or "Not stated"}
+Episode: {episode}
+
+Source material, labelled by source:
+{blocks}
+
+List the companies (or the companies behind named products and platforms) that this material discusses in connection
+with the theme. Use each company's usual name. For each: the source label it came from, and the exact words that name it.
+Leave out: sponsors and ad reads, the podcast or its network, and these speakers' own companies ({", ".join(sorted(e for e in exclude if e)) or "none"}).
+Only companies actually named; never infer a company from a topic. Return an empty list when none qualify.
+"""
+
+
+def clean_theme_companies(result, sources):
+    """Keep companies whose evidence really appears in the labelled source it cites."""
+    kept = []
+    for item in (result or {}).get("companies") or []:
+        name = " ".join(str(item.get("name") or "").split())
+        source = str(item.get("source") or "")
+        evidence = " ".join(str(item.get("evidence") or "").split())
+        if not name or len(name) > 80 or not evidence or source not in sources or evidence.casefold() not in " ".join(str(sources[source] or "").split()).casefold():
+            continue
+        kept.append({"name": name, "source": source, "text": evidence[:300]})
+    return kept
+
+
+@app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
+def suggest_theme_companies(theme_id: str, job_id: str = None):
+    """Suggest companies connected to one theme, from its perspectives, their transcript, the source episodes' titles and
+    publisher descriptions, and full transcripts where stored. Each suggestion keeps its evidence; editors approve."""
+    import feedparser
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import OpenAI
+    from supabase import create_client
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    try:
+        update_processing_job(supabase, job_id, "claimed", started_at=utcnow_iso())
+        theme = supabase.table("conversation_themes").select("id,name,summary").eq("id", theme_id).single().execute().data
+        quote_ids = sorted({r["quote_id"] for r in _select_all(lambda: supabase.table("conversation_take_links").select("quote_id").eq("theme_id", theme_id))})
+        quotes = supabase.table("quotes").select("id,text,source_transcript_excerpt,episode_id,guest_id").in_("id", quote_ids).execute().data or [] if quote_ids else []
+        guest_ids = list({q["guest_id"] for q in quotes if q.get("guest_id")})
+        exclude = {g["company"] for g in (supabase.table("guests").select("company").in_("id", guest_ids).execute().data or []) if g.get("company")} if guest_ids else set()
+        episode_ids = list({q["episode_id"] for q in quotes if q.get("episode_id")})
+        episodes = {e["id"]: e for e in (supabase.table("episodes").select("id,title,podcast_id").in_("id", episode_ids).execute().data or [])} if episode_ids else {}
+        podcasts = {p["id"]: p["name"] for p in (supabase.table("podcasts").select("id,name").execute().data or [])}
+        feeds = {normalize_directory_value(f["name"]): f["rss_url"] for f in (supabase.table("test_podcast_feeds").select("name,rss_url").execute().data or []) if f.get("rss_url")}
+        descriptions = {}
+        for pid in {e.get("podcast_id") for e in episodes.values()}:
+            url = feeds.get(normalize_directory_value(podcasts.get(pid)))
+            if not url:
+                continue
+            try:
+                for entry in feedparser.parse(url).entries:
+                    descriptions[(pid, normalize_directory_value(entry.get("title")))] = _strip_html(entry.get("summary") or entry.get("description"))[:4000]
+            except Exception as exc:
+                print(f"feed unavailable for {pid}: {exc}")
+        artifacts = {}
+        for a in _select_all(lambda: supabase.table("episode_processing_artifacts").select("podcast_name,episode_name,transcript_text")):
+            if a.get("transcript_text"):
+                artifacts[(normalize_directory_value(a["podcast_name"]), normalize_directory_value(a["episode_name"]))] = " ".join(a["transcript_text"].split()[:12000])
+        work = []
+        for eid, ep in episodes.items():
+            podcast = podcasts.get(ep.get("podcast_id")) or ""
+            ep_quotes = [q for q in quotes if q.get("episode_id") == eid]
+            sources = {"quote": "\n".join(f'"{q["text"]}"' for q in ep_quotes),
+                       "transcript_excerpt": "\n".join(q.get("source_transcript_excerpt") or "" for q in ep_quotes).strip(),
+                       "episode_title": ep.get("title") or "",
+                       "episode_description": descriptions.get((ep.get("podcast_id"), normalize_directory_value(ep.get("title"))), ""),
+                       "full_transcript": artifacts.get((normalize_directory_value(podcast), normalize_directory_value(ep.get("title"))), "")}
+            work.append((f"{podcast}: {ep.get('title')}", sources))
+        update_processing_job(supabase, job_id, "mapping", progress={"episodes": len(work)})
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
+
+        def run(item):
+            label, sources = item
+            try:
+                result = call_openai_structured(client, model=model, system_prompt="You identify companies discussed in podcast material. You never infer.",
+                    user_prompt=build_theme_company_prompt(theme, label, sources, exclude), schema_name="theme_companies",
+                    schema=THEME_COMPANY_SCHEMA, reasoning_effort=os.environ.get("OPENAI_ENTITY_REASONING", "low"), max_output_tokens=3000)
+                return [{**c, "episode": label} for c in clean_theme_companies(result, sources)]
+            except Exception as exc:
+                print(f"theme company extraction failed for {label}: {exc}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            found = [c for batch in pool.map(run, work) for c in batch]
+        grouped = {}
+        for c in found:
+            if any(normalize_directory_value(c["name"]) == normalize_directory_value(e) for e in exclude):
+                continue
+            g = grouped.setdefault(normalize_directory_value(c["name"]), {"name": c["name"], "evidence": []})
+            g["evidence"].append({k: c[k] for k in ("source", "episode", "text")})
+        existing = {r["entity_id"]: r for r in _select_all(lambda: supabase.table("theme_companies").select("id,entity_id,status").eq("theme_id", theme_id))}
+        suggested = 0
+        for g in grouped.values():
+            entity_id = _ensure_entity(supabase, "company", g["name"])
+            if not entity_id:
+                continue
+            row = {"mention_count": len(g["evidence"]), "evidence": g["evidence"][:8], "model": model, "prompt_version": THEME_COMPANIES_PROMPT_VERSION,
+                   "processing_job_id": job_id, "updated_at": utcnow_iso()}
+            if entity_id in existing:
+                if existing[entity_id]["status"] == "suggested":
+                    supabase.table("theme_companies").update(row).eq("id", existing[entity_id]["id"]).execute()
+                continue
+            supabase.table("theme_companies").insert({**row, "theme_id": theme_id, "entity_id": entity_id, "status": "suggested"}).execute()
+            suggested += 1
+        summary = {"episodes": len(work), "companies": len(grouped), "suggested": suggested,
+                   "with_description": sum(1 for _, s in work if s["episode_description"]), "with_full_transcript": sum(1 for _, s in work if s["full_transcript"])}
+        update_processing_job(supabase, job_id, "succeeded", progress=summary, result=summary, completed_at=utcnow_iso())
+        return {"success": True, **summary}
+    except Exception as exc:
+        update_processing_job(supabase, job_id, "failed", error_code="theme_companies_failed", error_message=str(exc)[:500], completed_at=utcnow_iso())
+        raise
+
+
 def propose_historical_conversation_mapping(
     quote,
     source_evidence,
@@ -11095,6 +11231,32 @@ def fastapi_app():
     async def thread_pool_endpoint(theme_id: str | None = None, admin=Depends(require_admin)):
         """Counts behind Discover and theme scans: what the AI reads and what is not ready yet."""
         return {"success": True, **thread_pool_stats(service_client(), theme_id)}
+
+    @web_app.post("/themes/{theme_id}/find-companies")
+    async def theme_find_companies_endpoint(theme_id: str, admin=Depends(require_admin)):
+        supabase = service_client()
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"theme-companies:{theme_id}:{uuid.uuid4()}", "job_type": "theme_companies", "source": "admin",
+            "requested_by": admin["id"], "parameters": {"theme_id": theme_id, "prompt_version": THEME_COMPANIES_PROMPT_VERSION}}).execute()
+        job_id = inserted.data[0]["id"]
+        call = await suggest_theme_companies.spawn.aio(theme_id=theme_id, job_id=job_id)
+        supabase.table("processing_jobs").update({"modal_call_id": call.object_id, "updated_at": utcnow_iso()}).eq("id", job_id).execute()
+        return JSONResponse(status_code=202, content={"success": True, "job_id": job_id, "state": "queued"})
+
+    @web_app.get("/themes/{theme_id}/companies")
+    async def theme_companies_endpoint(theme_id: str, admin=Depends(require_admin)):
+        supabase = service_client()
+        rows = supabase.table("theme_companies").select("id,entity_id,status,mention_count,evidence").eq("theme_id", theme_id).neq("status", "dismissed").order("mention_count", desc=True).execute().data or []
+        names = {e["id"]: e["name"] for e in (supabase.table("conversation_entities").select("id,name").in_("id", [r["entity_id"] for r in rows]).execute().data or [])} if rows else {}
+        return {"success": True, "companies": [{**r, "name": names.get(r["entity_id"], "Unknown company")} for r in rows]}
+
+    @web_app.post("/theme-companies/{row_id}/{action}")
+    async def theme_company_action_endpoint(row_id: str, action: str, admin=Depends(require_admin)):
+        status = {"approve": "approved", "dismiss": "dismissed", "remove": "dismissed"}.get(action)
+        if not status:
+            raise HTTPException(status_code=422, detail="Unknown action")
+        service_client().table("theme_companies").update({"status": status, "reviewed_by": admin["id"], "reviewed_at": utcnow_iso(), "updated_at": utcnow_iso()}).eq("id", row_id).execute()
+        return {"success": True}
 
     @web_app.post("/thread-discovery")
     async def thread_discovery_endpoint(admin=Depends(require_admin)):

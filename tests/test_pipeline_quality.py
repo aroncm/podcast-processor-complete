@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     THREAD_MATCH_SCHEMA,
+    clean_theme_companies,
+    build_theme_company_prompt,
     build_company_mention_prompt,
     clean_company_mentions,
     speaker_is_verified,
@@ -1350,3 +1352,18 @@ class CompanyMentionTests(unittest.TestCase):
 
     def test_prompt_excludes_the_speakers_own_company(self):
         self.assertIn("Do not list: LUMA Partners", build_company_mention_prompt("x", "", {"LUMA Partners"}))
+
+
+class ThemeCompanyTests(unittest.TestCase):
+    def test_evidence_must_appear_in_the_source_it_cites(self):
+        sources = {"episode_description": "Scope3 COO Anne Coghlan on the AdCP launch", "quote": "Agents buy direct."}
+        kept = clean_theme_companies({"companies": [
+            {"name": "Scope3", "source": "episode_description", "evidence": "Scope3 COO"},
+            {"name": "Scope3", "source": "quote", "evidence": "Scope3"},
+            {"name": "OpenAI", "source": "full_transcript", "evidence": "OpenAI"},
+        ]}, sources)
+        self.assertEqual(kept, [{"name": "Scope3", "source": "episode_description", "text": "Scope3 COO"}])
+
+    def test_prompt_names_theme_and_exclusions(self):
+        p = build_theme_company_prompt({"name": "Agentic Commerce"}, "Open Market: Ep 1", {"quote": "x", "full_transcript": ""}, {"Aperiam"})
+        self.assertIn("Theme: Agentic Commerce", p); self.assertIn("Aperiam", p); self.assertIn("[quote]", p); self.assertNotIn("[full_transcript]", p)
