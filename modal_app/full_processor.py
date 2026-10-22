@@ -6269,6 +6269,275 @@ def suggest_theme_companies(theme_id: str, job_id: str = None):
         raise
 
 
+# ---------------------------------------------------------------- the backlog: fast review, episode speakers, triage
+# Oct 22, 2026. Approving the Take is all a quote needs to enter the thread pool; Industry Context and the mapping are
+# done in Threads now. These helpers let an editor clear the pending backlog quote by quote, fix speakers once per
+# episode, and set aside fragments, without bypassing the take checks in missing_take_verification_fields.
+FRAGMENT_WORDS = 15
+READY_MIN_QUALITY = 0.9
+BACKLOG_SCORE_PROMPT_VERSION = "backlog-score-v1"
+ROSTER_PROMPT_VERSION = "episode-roster-v1"
+REJECT_REASONS = {"fragment": "Fragment", "off_topic": "Off-topic", "duplicate": "Duplicate",
+                  "wrong_speaker": "Wrong speaker", "low_value": "Low value"}
+REVIEW_QUEUE_FIELDS = (
+    "id,quote_text,speaker_name,speaker_label,speaker_title,speaker_company,speaker_linkedin,guest_id,podcast_name,"
+    "episode_name,episode_guid,date_published,youtube_id,youtube_alignment_status,youtube_timestamp_start,"
+    "youtube_timestamp_end,yt_timestamp_confidence,rss_timestamp_start,rss_timestamp_end,timestamp_start,timestamp_end,"
+    "quality_score,ranking_reason,quote_word_count,approval_status,created_at,directory_resolution"
+)
+
+
+def quote_words(text):
+    return len(str(text or "").split())
+
+
+def is_fragment(row):
+    return quote_words((row or {}).get("quote_text")) < FRAGMENT_WORDS
+
+
+def timing_verified(row):
+    return (row or {}).get("youtube_alignment_status") in {"verified", "manual_verified"}
+
+
+def speaker_linked(row):
+    row = row or {}
+    return bool(row.get("guest_id")) and all(str(row.get(k) or "").strip() for k in ("speaker_name", "speaker_title", "speaker_company"))
+
+
+def is_ready(row):
+    """Linked speaker, verified timing, a top score and not a fragment: safe to approve from a skim list."""
+    q = (row or {}).get("quality_score")
+    return (speaker_linked(row) and timing_verified(row) and isinstance(q, (int, float)) and q >= READY_MIN_QUALITY
+            and not is_fragment(row) and not missing_take_verification_fields(row))
+
+
+def review_queue_order(rows):
+    """Best first: fragments last, verified timing first, then by score (unscored after scored), oldest first on ties."""
+    def key(r):
+        q = r.get("quality_score")
+        return (is_fragment(r), not timing_verified(r), q is None, -(q or 0), r.get("created_at") or "")
+    return sorted(rows, key=key)
+
+
+def review_queue_item(row):
+    return {**{k: row.get(k) for k in REVIEW_QUEUE_FIELDS.split(",")},
+            "word_count": quote_words(row.get("quote_text")), "fragment": is_fragment(row),
+            "timing_verified": timing_verified(row), "speaker_linked": speaker_linked(row),
+            "blockers": missing_take_verification_fields(row), "ready": is_ready(row)}
+
+
+def speaker_group_key(row):
+    """One speaker slot in an episode: the diarization label when there is one, else the name as written."""
+    label = normalize_directory_value((row or {}).get("speaker_label"))
+    return f"label:{label}" if label else f"name:{normalize_directory_value((row or {}).get('speaker_name'))}"
+
+
+def speaker_needs_attention(row):
+    return not speaker_linked(row) or normalize_directory_value(row.get("speaker_name")) in PLACEHOLDER_SPEAKERS or \
+        bool(re.match(r"^(speaker|guest|host)\s*\d*$", normalize_directory_value(row.get("speaker_name")) or ""))
+
+
+def episode_speaker_groups(rows):
+    """The episode's speaker slots with how many pending quotes each covers and whether any needs a directory link."""
+    groups = {}
+    for r in rows:
+        g = groups.setdefault(speaker_group_key(r), {"key": speaker_group_key(r), "speaker_label": r.get("speaker_label"),
+                                                    "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
+                                                    "speaker_company": r.get("speaker_company"), "guest_id": r.get("guest_id"),
+                                                    "count": 0, "needs_attention": False, "samples": []})
+        g["count"] += 1
+        g["needs_attention"] = g["needs_attention"] or speaker_needs_attention(r)
+        if len(g["samples"]) < 2: g["samples"].append(str(r.get("quote_text") or "")[:240])
+    return sorted(groups.values(), key=lambda g: (-g["count"], g["key"]))
+
+
+def roster_person_fields(person, before=None):
+    """The quote fields an episode roster row writes, with the audit of where the match came from."""
+    resolution = dict((before or {}).get("directory_resolution") or {})
+    resolution.update({"speaker_status": "matched", "speaker_source": "episode_roster", "speaker_resolved_at": utcnow_iso()})
+    return {"guest_id": person["id"], "speaker_name": person.get("name"), "speaker_title": person.get("title") or "",
+            "speaker_company": person.get("company") or "", "speaker_linkedin": person.get("linkedin_url") or None,
+            "directory_resolution": resolution}
+
+
+ROSTER_SCHEMA = {
+    "type": "object",
+    "properties": {"speakers": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"key": {"type": "string"}, "name": {"type": "string"}, "title": {"type": "string"},
+                       "company": {"type": "string"}, "evidence": {"type": "string"},
+                       "confidence": {"type": "string", "enum": ["high", "medium", "low"]}},
+        "required": ["key", "name", "title", "company", "evidence", "confidence"], "additionalProperties": False}}},
+    "required": ["speakers"], "additionalProperties": False,
+}
+
+
+def build_roster_prompt(podcast, episode, description, groups, directory_hint):
+    slots = [{"key": g["key"], "label": g.get("speaker_label"), "current_name": g.get("speaker_name"),
+              "current_title": g.get("speaker_title"), "current_company": g.get("speaker_company"), "quotes": g["samples"]}
+             for g in groups]
+    return f"""
+Podcast: {podcast}
+Episode: {episode}
+Publisher description: {description or "Not available"}
+
+Directory people who may appear (name, title, company): {json.dumps(directory_hint, ensure_ascii=False)}
+
+Speaker slots in this episode (a diarization label or a name as transcribed, with sample quotes):
+{json.dumps(slots, ensure_ascii=False)}
+
+For each slot, say who is speaking: full name, current title and company. Use the episode title, the description,
+what the quotes say and the regular hosts of this show. Prefer a directory person when the name matches. When you cannot
+tell, leave name empty and say why in evidence. Never invent a person. Evidence quotes the words that support it.
+Return one entry per slot, with the slot's key unchanged.
+"""
+
+
+def clean_roster(result, groups, people):
+    """Keep one proposal per known slot; attach the directory person when the proposed name matches one."""
+    by_name = {normalize_directory_value(p.get("name")): p for p in people if p.get("name")}
+    keys = {g["key"] for g in groups}
+    out = {}
+    for item in (result or {}).get("speakers") or []:
+        key = item.get("key")
+        if key not in keys or key in out:
+            continue
+        name = " ".join(str(item.get("name") or "").split())
+        match = by_name.get(normalize_directory_value(name)) if name else None
+        out[key] = {"key": key, "name": name, "title": " ".join(str(item.get("title") or "").split()),
+                    "company": " ".join(str(item.get("company") or "").split()),
+                    "evidence": str(item.get("evidence") or "")[:400], "confidence": item.get("confidence") or "low",
+                    "guest_id": match["id"] if match else None,
+                    "directory": {k: match.get(k) for k in ("id", "name", "title", "company")} if match else None}
+    return [out.get(g["key"]) or {"key": g["key"], "name": "", "title": "", "company": "", "evidence": "No proposal.",
+                                  "confidence": "low", "guest_id": None, "directory": None} for g in groups]
+
+
+BACKLOG_SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {"scores": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"candidate_index": {"type": "integer"}, "quality_score": {"type": "number"},
+                       "ranking_reason": {"type": "string"}},
+        "required": ["candidate_index", "quality_score", "ranking_reason"], "additionalProperties": False}}},
+    "required": ["scores"], "additionalProperties": False,
+}
+
+
+def build_backlog_score_prompt(podcast, episode, rows):
+    """The ranking step's editorial standard (rank_quote_candidates), asked to score every take instead of choosing five."""
+    cands = [{"candidate_index": i, "quote": r.get("quote_text"), "speaker": r.get("speaker_name"),
+              "word_count": quote_words(r.get("quote_text"))} for i, r in enumerate(rows)]
+    return f"""
+Podcast: {podcast}
+Episode: {episode}
+
+Score every take from 0 to 1 against this editorial standard:
+1. The quote should challenge, surprise, or deeply illuminate. It must be specific and memorable rather than merely
+   competent commentary.
+2. The take changes an AdTech operator's understanding of a decision, incentive, tradeoff, prediction, market structure,
+   or causal mechanism.
+3. It must be understandable as a standalone spoken moment. Score fragments and pronoun-dependent excerpts low.
+4. 20-80 words; 30-50 is the preferred package.
+5. Score generic advice, common knowledge, motivational language, sales pitches, vague futurism and claims portable to
+   any industry low.
+6. Reserve 0.90+ for unusually specific, memorable insight.
+
+Return one score per candidate, with a one-sentence reason.
+
+CANDIDATES:
+{json.dumps(cands, ensure_ascii=False)}
+"""
+
+
+def clean_backlog_scores(result, rows):
+    out = {}
+    for item in (result or {}).get("scores") or []:
+        i = item.get("candidate_index")
+        if isinstance(i, int) and 0 <= i < len(rows) and rows[i]["id"] not in out:
+            out[rows[i]["id"]] = (max(0.0, min(1.0, float(item.get("quality_score") or 0))), str(item.get("ranking_reason") or "")[:500])
+    return out
+
+
+_FEED_DESCRIPTIONS = {}
+def episode_description(supabase, podcast_name, episode_name):
+    """The publisher's description of an episode from its RSS feed, matched by title. Cached per container."""
+    import feedparser
+    pkey = normalize_directory_value(podcast_name)
+    if pkey not in _FEED_DESCRIPTIONS:
+        feeds = {normalize_directory_value(f["name"]): f["rss_url"] for f in (supabase.table("test_podcast_feeds").select("name,rss_url").execute().data or []) if f.get("rss_url")}
+        entries = {}
+        if feeds.get(pkey):
+            try:
+                for entry in feedparser.parse(feeds[pkey]).entries:
+                    entries[normalize_directory_value(entry.get("title"))] = _strip_html(entry.get("summary") or entry.get("description"))[:3000]
+            except Exception as exc:
+                print("feed unavailable", podcast_name, exc)
+        _FEED_DESCRIPTIONS[pkey] = entries
+    return _FEED_DESCRIPTIONS[pkey].get(normalize_directory_value(episode_name), "")
+
+
+def _retry(fn, tries=4):
+    """A Supabase call that survives a dropped HTTP/2 connection (the first scoring run stopped on one, Oct 22)."""
+    import time
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == tries - 1: raise
+            print("retrying after", type(exc).__name__, str(exc)[:80]); time.sleep(1.5 * (attempt + 1))
+
+
+def pending_backlog(supabase, fields=REVIEW_QUEUE_FIELDS):
+    return _select_all(lambda: supabase.table("test_quotes").select(fields).eq("approval_status", "pending"))
+
+
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+def score_backlog_quality(limit: int = 400, job_id: str = None, model: str = None):
+    """Give unscored pending takes a quality_score with the ranking standard, one episode per call. Resumable: only
+    rows without a score are read, so a rerun picks up where the last one stopped."""
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import OpenAI
+    from supabase import create_client
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    model = model or os.environ.get("OPENAI_BACKLOG_SCORE_MODEL", "gpt-5.4-mini")
+    try:
+        update_processing_job(supabase, job_id, "claimed", started_at=utcnow_iso())
+        rows = [r for r in _retry(lambda: pending_backlog(supabase, "id,quote_text,speaker_name,podcast_name,episode_name,quality_score"))
+                if r.get("quality_score") is None][:max(1, min(int(limit), 2000))]
+        episodes = {}
+        for r in rows: episodes.setdefault((r.get("podcast_name") or "", r.get("episode_name") or ""), []).append(r)
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+        def run(item):
+            (podcast, episode), batch = item
+            try:
+                result = call_openai_structured(client, model=model, system_prompt="You are PodThreads' senior quote editor. Score each spoken take against the standard.",
+                    user_prompt=build_backlog_score_prompt(podcast, episode, batch), schema_name="backlog_scores",
+                    schema=BACKLOG_SCORE_SCHEMA, reasoning_effort="low", max_output_tokens=4000)
+                scores = clean_backlog_scores(result, batch)
+            except Exception as exc:
+                print("score failed", podcast, episode, str(exc)[:120]); return 0
+            done = 0
+            for qid, (score, reason) in scores.items():
+                try:
+                    _retry(lambda: supabase.table("test_quotes").update({"quality_score": score, "ranking_reason": reason, "ranking_model": model,
+                        "ranking_prompt_version": BACKLOG_SCORE_PROMPT_VERSION}).eq("id", qid).eq("approval_status", "pending").execute())
+                    done += 1
+                except Exception as exc:
+                    print("score write failed", qid, str(exc)[:80])
+            return done
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            scored = sum(pool.map(run, episodes.items()))
+        summary = {"read": len(rows), "episodes": len(episodes), "scored": scored, "model": model}
+        update_processing_job(supabase, job_id, "succeeded", progress=summary, result=summary, completed_at=utcnow_iso())
+        return summary
+    except Exception as exc:
+        update_processing_job(supabase, job_id, "failed", error_code="backlog_score_failed", error_message=str(exc)[:500], completed_at=utcnow_iso())
+        raise
+
+
 def propose_historical_conversation_mapping(
     quote,
     source_evidence,
@@ -11306,6 +11575,174 @@ def fastapi_app():
             raise HTTPException(status_code=422, detail="Unknown action")
         service_client().table("theme_companies").update({"status": status, "reviewed_by": admin["id"], "reviewed_at": utcnow_iso(), "updated_at": utcnow_iso()}).eq("id", row_id).execute()
         return {"success": True}
+
+    class BacklogBulkRequest(BaseModel):
+        action: str
+        quote_ids: list[str]
+        reason_code: str | None = None
+
+    class RosterProposeRequest(BaseModel):
+        podcast_name: str
+        episode_name: str
+
+    class RosterApplyRow(BaseModel):
+        key: str
+        guest_id: str | None = None
+        name: str | None = None
+        title: str | None = None
+        company: str | None = None
+
+    class RosterApplyRequest(BaseModel):
+        podcast_name: str
+        episode_name: str
+        rows: list[RosterApplyRow]
+
+    def _log_decision(supabase, admin, before, after, decision, reason_code=None, reason_detail=None, extra=None):
+        fields = ("approval_status", "rejection_reason", "speaker_name", "guest_id", "speaker_title", "speaker_company",
+                  "speaker_linkedin", "directory_resolution", "context_review_status", "mapping_review_status")
+        return supabase.table("curation_decisions").insert({
+            "quote_id": before["id"], "reviewer_id": admin["id"], "decision": decision,
+            "original_quote_text": before.get("quote_text"), "edited_quote_text": after.get("quote_text", before.get("quote_text")),
+            "reason_code": reason_code, "reason_detail": reason_detail,
+            "metadata": {"before": {k: before.get(k) for k in fields}, "after": {k: after.get(k, before.get(k)) for k in fields}, **(extra or {})},
+        }).execute()
+
+    @web_app.get("/review-queue")
+    async def review_queue_endpoint(podcast: str = "", verified_only: bool = False, linked_only: bool = False,
+                                    limit: int = 40, admin=Depends(require_admin)):
+        supabase = service_client()
+        rows = pending_backlog(supabase)
+        podcasts = sorted({r.get("podcast_name") for r in rows if r.get("podcast_name")})
+        shown = [r for r in rows if (not podcast or r.get("podcast_name") == podcast)
+                 and (not verified_only or timing_verified(r)) and (not linked_only or speaker_linked(r))]
+        ordered = review_queue_order(shown)
+        from zoneinfo import ZoneInfo
+        start_of_day = datetime.now(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+        done = supabase.table("curation_decisions").select("id", count="exact").eq("reviewer_id", admin["id"]).in_("decision", ["approve", "reject"]).gte("created_at", start_of_day).limit(1).execute()
+        episodes_needing = {(r.get("podcast_name"), r.get("episode_name")) for r in rows if speaker_needs_attention(r)}
+        return {"success": True, "items": [review_queue_item(r) for r in ordered[:max(1, min(int(limit), 200))]],
+                "counts": {"pending": len(rows), "shown": len(shown), "fragments": sum(1 for r in rows if is_fragment(r)),
+                           "ready": sum(1 for r in rows if is_ready(r)), "unscored": sum(1 for r in rows if r.get("quality_score") is None),
+                           "timing_verified": sum(1 for r in rows if timing_verified(r)), "speaker_linked": sum(1 for r in rows if speaker_linked(r)),
+                           "episodes_needing_speakers": len(episodes_needing), "done_today": done.count or 0},
+                "podcasts": podcasts, "reject_reasons": REJECT_REASONS}
+
+    @web_app.get("/review-queue/triage")
+    async def review_queue_triage_endpoint(kind: str, admin=Depends(require_admin)):
+        if kind not in {"ready", "fragments"}:
+            raise HTTPException(status_code=422, detail="kind must be ready or fragments")
+        rows = pending_backlog(service_client())
+        pick = [r for r in rows if (is_ready(r) if kind == "ready" else is_fragment(r))]
+        pick.sort(key=lambda r: (-(r.get("quality_score") or 0), quote_words(r.get("quote_text"))))
+        return {"success": True, "items": [review_queue_item(r) for r in pick]}
+
+    @web_app.post("/review-queue/bulk")
+    async def review_queue_bulk_endpoint(req: BacklogBulkRequest, admin=Depends(require_admin)):
+        """Approve (Take only, the same checks as /review-quote) or reject a set of pending quotes in one action."""
+        if req.action not in {"approve", "reject"}:
+            raise HTTPException(status_code=422, detail="action must be approve or reject")
+        if req.action == "reject" and req.reason_code not in REJECT_REASONS:
+            raise HTTPException(status_code=422, detail="Pick a rejection reason")
+        if not req.quote_ids or len(req.quote_ids) > 300:
+            raise HTTPException(status_code=422, detail="Send between 1 and 300 quotes")
+        supabase = service_client()
+        rows = {r["id"]: r for r in (supabase.table("test_quotes").select("*").in_("id", req.quote_ids).execute().data or [])}
+        done, failed = [], []
+        for qid in req.quote_ids:
+            before = rows.get(qid)
+            if not before or before.get("approval_status") != "pending":
+                failed.append({"id": qid, "reason": "No longer pending"}); continue
+            if req.action == "approve":
+                missing = missing_take_verification_fields(before)
+                if missing:
+                    failed.append({"id": qid, "reason": "Verify " + ", ".join(missing)}); continue
+                updates = {"approval_status": "approved", "rejection_reason": None}
+            else:
+                updates = {"approval_status": "rejected", "rejection_reason": REJECT_REASONS[req.reason_code]}
+            updates["updated_at"] = utcnow_iso()
+            supabase.table("test_quotes").update(updates).eq("id", qid).eq("approval_status", "pending").execute()
+            _log_decision(supabase, admin, before, {**before, **updates}, req.action, reason_code=req.reason_code,
+                          reason_detail=REJECT_REASONS.get(req.reason_code or ""), extra={"surface": "backlog_bulk"})
+            done.append(qid)
+        return {"success": True, "done": done, "failed": failed}
+
+    @web_app.post("/review-queue/score")
+    async def review_queue_score_endpoint(limit: int = 400, admin=Depends(require_admin)):
+        supabase = service_client()
+        inserted = supabase.table("processing_jobs").insert({
+            "idempotency_key": f"backlog-score:{uuid.uuid4()}", "job_type": "data_repair", "source": "admin", "requested_by": admin["id"],
+            "parameters": {"repair_type": "backlog_quality_score", "limit": limit, "prompt_version": BACKLOG_SCORE_PROMPT_VERSION}}).execute()
+        job_id = inserted.data[0]["id"]
+        call = await score_backlog_quality.spawn.aio(limit=limit, job_id=job_id)
+        supabase.table("processing_jobs").update({"modal_call_id": call.object_id, "updated_at": utcnow_iso()}).eq("id", job_id).execute()
+        return JSONResponse(status_code=202, content={"success": True, "job_id": job_id, "state": "queued"})
+
+    @web_app.get("/episode-speakers")
+    async def episode_speakers_endpoint(admin=Depends(require_admin)):
+        rows = pending_backlog(service_client())
+        episodes = {}
+        for r in rows:
+            episodes.setdefault((r.get("podcast_name") or "", r.get("episode_name") or ""), []).append(r)
+        out = []
+        for (podcast, episode), items in episodes.items():
+            groups = episode_speaker_groups(items)
+            needing = [g for g in groups if g["needs_attention"]]
+            if needing:
+                out.append({"podcast_name": podcast, "episode_name": episode, "date_published": items[0].get("date_published"),
+                            "pending": len(items), "quotes_needing": sum(g["count"] for g in needing), "groups": groups})
+        out.sort(key=lambda e: -e["quotes_needing"])
+        return {"success": True, "episodes": out}
+
+    @web_app.post("/episode-speakers/propose")
+    async def episode_speakers_propose_endpoint(req: RosterProposeRequest, admin=Depends(require_admin)):
+        import asyncio
+        from openai import OpenAI
+        supabase = service_client()
+        items = [r for r in pending_backlog(supabase) if r.get("podcast_name") == req.podcast_name and r.get("episode_name") == req.episode_name]
+        if not items:
+            raise HTTPException(status_code=404, detail="No pending quotes for that episode")
+        groups = episode_speaker_groups(items)
+        description = episode_description(supabase, req.podcast_name, req.episode_name)
+        people = supabase.table("guests").select("id,name,title,company,linkedin_url").limit(3000).execute().data or []
+        haystack = normalize_directory_value(f"{req.episode_name} {description} " + " ".join(str(g.get('speaker_name') or '') for g in groups))
+        hint = [[p["name"], p.get("title"), p.get("company")] for p in people if p.get("name") and normalize_directory_value(p["name"]) in haystack][:40]
+        result = await asyncio.to_thread(lambda: call_openai_structured(
+            OpenAI(api_key=os.environ["OPENAI_API_KEY"]), model=os.environ.get("OPENAI_ROSTER_MODEL", "gpt-5.4-mini"),
+            system_prompt="You identify the speakers of a podcast episode from its metadata and transcript. You never invent people.",
+            user_prompt=build_roster_prompt(req.podcast_name, req.episode_name, description, groups, hint),
+            schema_name="episode_roster", schema=ROSTER_SCHEMA, reasoning_effort="low", max_output_tokens=3000))
+        return {"success": True, "groups": groups, "proposals": clean_roster(result, groups, people), "description": description[:600]}
+
+    @web_app.post("/episode-speakers/apply")
+    async def episode_speakers_apply_endpoint(req: RosterApplyRequest, admin=Depends(require_admin)):
+        """Write each confirmed speaker to every pending quote in the episode that has that speaker slot."""
+        supabase = service_client()
+        items = [r for r in _select_all(lambda: supabase.table("test_quotes").select("*").eq("approval_status", "pending")
+                 .eq("podcast_name", req.podcast_name).eq("episode_name", req.episode_name))]
+        updated, errors = 0, []
+        for row in req.rows:
+            if row.guest_id:
+                person = (supabase.table("guests").select("id,name,title,company,linkedin_url").eq("id", row.guest_id).limit(1).execute().data or [None])[0]
+                if not person:
+                    errors.append(f"{row.key}: that directory person no longer exists"); continue
+            else:
+                name, title, company = (row.name or "").strip(), (row.title or "").strip(), (row.company or "").strip()
+                if len(name.split()) < 2 or not title or not company:
+                    errors.append(f"{row.key}: a new person needs a full name, title and company"); continue
+                try:
+                    person = ensure_directory_person(supabase, name, title, company)
+                except ValueError as exc:
+                    errors.append(f"{row.key}: {exc}"); continue
+            for before in [r for r in items if speaker_group_key(r) == row.key]:
+                updates = roster_person_fields(person, before)
+                updates["directory_resolution"]["speaker_resolved_by"] = admin["id"]
+                updates.update(editorial_gate_invalidations(before, updates))
+                updates["updated_at"] = utcnow_iso()
+                supabase.table("test_quotes").update(updates).eq("id", before["id"]).execute()
+                _log_decision(supabase, admin, before, {**before, **updates}, "edit", reason_detail="Episode speakers",
+                              extra={"surface": "episode_roster", "prompt_version": ROSTER_PROMPT_VERSION})
+                updated += 1
+        return {"success": True, "updated": updated, "errors": errors}
 
     @web_app.post("/thread-discovery")
     async def thread_discovery_endpoint(admin=Depends(require_admin)):

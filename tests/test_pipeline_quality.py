@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 from modal_app.full_processor import (
+    is_fragment, is_ready, review_queue_order, speaker_group_key, episode_speaker_groups, clean_roster,
+    clean_backlog_scores, build_backlog_score_prompt, roster_person_fields, review_queue_item,
     delete_account_data,
     ACCOUNT_OWNED_TABLES,
     THREAD_MATCH_SCHEMA,
@@ -1415,3 +1417,62 @@ class AccountDeletionTests(unittest.TestCase):
     def test_requires_a_user_id(self):
         with self.assertRaises(ValueError):
             delete_account_data(_FakeSupabase(), "")
+
+
+def _row(**kw):
+    base = {"id": "q", "quote_text": " ".join(["word"] * 30), "speaker_name": "Ari Paparo", "speaker_title": "CEO",
+            "speaker_company": "Marketecture", "guest_id": "ari", "youtube_id": "abcdefghijk",
+            "youtube_alignment_status": "verified", "quality_score": 0.93, "created_at": "2026-01-01"}
+    base.update(kw); return base
+
+
+class BacklogTriageTests(unittest.TestCase):
+    def test_fragments_and_ready(self):
+        self.assertTrue(is_fragment(_row(quote_text="Too short to stand alone.")))
+        self.assertTrue(is_ready(_row()))
+        self.assertFalse(is_ready(_row(guest_id=None)), "an unlinked speaker is not ready")
+        self.assertFalse(is_ready(_row(youtube_alignment_status="legacy_unverified")), "unverified timing is not ready")
+        self.assertFalse(is_ready(_row(quality_score=0.89)))
+        self.assertFalse(is_ready(_row(quality_score=None)))
+        item = review_queue_item(_row(guest_id=None))
+        self.assertIn("speaker directory match", item["blockers"])
+
+    def test_queue_order_best_first_fragments_last(self):
+        rows = [_row(id="frag", quote_text="short one", quality_score=0.99), _row(id="unverified", youtube_alignment_status="legacy_unverified", quality_score=0.99),
+                _row(id="low", quality_score=0.5), _row(id="high", quality_score=0.95), _row(id="unscored", quality_score=None)]
+        self.assertEqual([r["id"] for r in review_queue_order(rows)], ["high", "low", "unscored", "unverified", "frag"])
+
+
+class EpisodeRosterTests(unittest.TestCase):
+    def test_groups_by_label_then_name(self):
+        rows = [_row(id="a", speaker_label="SPEAKER_01", speaker_name="Speaker 1", guest_id=None),
+                _row(id="b", speaker_label="speaker_01", speaker_name="Speaker 1", guest_id=None),
+                _row(id="c", speaker_label=None, speaker_name="Ari Paparo")]
+        groups = episode_speaker_groups(rows)
+        self.assertEqual([(g["key"], g["count"], g["needs_attention"]) for g in groups],
+                         [("label:speaker_01", 2, True), ("name:ari paparo", 1, False)])
+        self.assertEqual(speaker_group_key(rows[0]), speaker_group_key(rows[1]))
+
+    def test_clean_roster_keeps_known_slots_and_links_directory(self):
+        groups = [{"key": "label:speaker_01"}, {"key": "label:speaker_02"}]
+        people = [{"id": "ari", "name": "Ari Paparo", "title": "CEO", "company": "Marketecture"}]
+        out = clean_roster({"speakers": [{"key": "label:speaker_01", "name": "ari  paparo", "title": "CEO", "company": "Marketecture", "evidence": "host", "confidence": "high"},
+                                         {"key": "label:nope", "name": "X Y", "title": "", "company": "", "evidence": "", "confidence": "low"}]}, groups, people)
+        self.assertEqual(out[0]["guest_id"], "ari")
+        self.assertEqual(out[1]["name"], "", "a slot with no proposal stays empty, never invented")
+
+    def test_roster_fields_audit(self):
+        f = roster_person_fields({"id": "ari", "name": "Ari Paparo", "title": "CEO", "company": "Marketecture"}, {"directory_resolution": {"category_status": "matched"}})
+        self.assertEqual((f["guest_id"], f["speaker_name"]), ("ari", "Ari Paparo"))
+        self.assertEqual(f["directory_resolution"]["speaker_source"], "episode_roster")
+        self.assertEqual(f["directory_resolution"]["category_status"], "matched")
+
+
+class BacklogScoreTests(unittest.TestCase):
+    def test_scores_bounded_and_matched_by_index(self):
+        rows = [{"id": "a", "quote_text": "x"}, {"id": "b", "quote_text": "y"}]
+        out = clean_backlog_scores({"scores": [{"candidate_index": 0, "quality_score": 1.4, "ranking_reason": "r"},
+                                               {"candidate_index": 5, "quality_score": 0.5, "ranking_reason": "r"},
+                                               {"candidate_index": 1, "quality_score": -1, "ranking_reason": "r"}]}, rows)
+        self.assertEqual(out, {"a": (1.0, "r"), "b": (0.0, "r")})
+        self.assertIn("Score every take", build_backlog_score_prompt("P", "E", rows))
