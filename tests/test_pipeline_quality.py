@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 from modal_app.full_processor import (
     THREAD_MATCH_SCHEMA,
+    build_company_mention_prompt,
+    clean_company_mentions,
     speaker_is_verified,
     DISCOVERY_SCHEMA,
     THEME_SCAN_SCHEMA,
@@ -1333,3 +1335,18 @@ class SpeakerVerificationTests(unittest.TestCase):
         self.assertTrue(speaker_is_verified("Ari Paparo", "ari-paparo"))
         for name, gid in (("Unknown", "x"), ("Name", "x"), ("Ari Paparo", None), ("  ", "x"), ("Speaker", "x")):
             self.assertFalse(speaker_is_verified(name, gid), (name, gid))
+
+
+class CompanyMentionTests(unittest.TestCase):
+    def test_only_companies_actually_named_in_the_words_are_kept(self):
+        quote = "Google has a product called Performance Max, which is 100% opaque."
+        kept = clean_company_mentions({"companies": [
+            {"name": "Google", "evidence": "Google has a product called Performance Max"},
+            {"name": "Meta", "evidence": "Advantage+"},
+            {"name": "google", "evidence": "Google"},
+            {"name": "", "evidence": "Performance Max"},
+        ]}, quote, "")
+        self.assertEqual(kept, [{"name": "Google", "evidence": "Google has a product called Performance Max"}])
+
+    def test_prompt_excludes_the_speakers_own_company(self):
+        self.assertIn("Do not list: LUMA Partners", build_company_mention_prompt("x", "", {"LUMA Partners"}))

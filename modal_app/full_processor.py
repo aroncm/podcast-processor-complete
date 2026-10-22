@@ -5993,6 +5993,117 @@ def refresh_thread_proposal(proposal_id: str, job_id: str = None):
         raise
 
 
+ENTITY_LINK_PROMPT_VERSION = "thread-entity-links-v1"
+COMPANY_MENTION_SCHEMA = {
+    "type": "object",
+    "properties": {"companies": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "evidence": {"type": "string"}},
+        "required": ["name", "evidence"], "additionalProperties": False}}},
+    "required": ["companies"], "additionalProperties": False,
+}
+
+
+def build_company_mention_prompt(quote_text, transcript, exclude):
+    return f"""
+Quote: "{quote_text}"
+Transcript around the quote (may be empty): {(transcript or "")[:3000]}
+
+List the companies (or the companies behind named products and platforms) that the speaker explicitly names in the
+quote or the transcript. Use the company's usual name (for example "Google" for Performance Max, "OpenAI" for ChatGPT).
+evidence is the exact words that name it. Only names that are actually said; never infer a company from a topic.
+Do not list: {", ".join(sorted(e for e in exclude if e)) or "nothing excluded"}. Return an empty list when none are named.
+"""
+
+
+def clean_company_mentions(result, quote_text, transcript):
+    """Keep mentions whose evidence really appears in the quote or transcript; one per company."""
+    source = f"{quote_text or ''} {transcript or ''}".casefold()
+    seen, kept = set(), []
+    for item in (result or {}).get("companies") or []:
+        name = " ".join(str(item.get("name") or "").split())
+        evidence = " ".join(str(item.get("evidence") or "").split())
+        if not name or len(name) > 80 or not evidence or evidence.casefold() not in source or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        kept.append({"name": name, "evidence": evidence[:300]})
+    return kept[:8]
+
+
+def _ensure_entity(supabase, entity_type, name, guest_id=None):
+    rows = supabase.table("conversation_entities").select("id,name,publication_status,guest_id").eq("entity_type", entity_type).limit(5000).execute().data or []
+    found = next((r for r in rows if (guest_id and r.get("guest_id") == guest_id) or normalize_directory_value(r["name"]) == normalize_directory_value(name)), None)
+    if found:
+        if found["publication_status"] in ("proposed", "approved"):
+            supabase.table("conversation_entities").update({"publication_status": "published", "updated_at": utcnow_iso()}).eq("id", found["id"]).execute()
+        return None if found["publication_status"] == "archived" else found["id"]
+    row = {"entity_type": entity_type, "slug": _slugify(f"{entity_type}:{name}").replace(f"{entity_type}-", "", 1), "name": name,
+           "guest_id": guest_id if entity_type == "person" else None, "publication_status": "published", "reviewed_at": utcnow_iso(),
+           "metadata": {"created_by": ENTITY_LINK_PROMPT_VERSION}}
+    return supabase.table("conversation_entities").insert(row).execute().data[0]["id"]
+
+
+def _link_entity(supabase, entity_id, theme_id, quote_id, role, evidence_type, evidence):
+    if not entity_id:
+        return 0
+    try:
+        supabase.table("conversation_entity_links").insert({"entity_id": entity_id, "theme_id": theme_id, "quote_id": quote_id,
+            "role_label": role, "evidence_type": evidence_type, "evidence": evidence, "source_segment_ids": []}).execute()
+        return 1
+    except Exception:
+        return 0  # already linked
+
+
+@app.function(image=image, secrets=[my_secret], timeout=900)
+def link_thread_entities(pairs: list):
+    """For each (quote_id, theme_id) placement: link the speaker, the speaker's company, and the companies the speaker
+    names in the quote. Runs in the background after a perspective joins a thread; safe to re-run."""
+    from openai import OpenAI
+    from supabase import create_client
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    added = 0
+    for quote_id, theme_id in pairs:
+        try:
+            q = (supabase.table("quotes").select("id,text,guest_id,speaker,source_transcript_excerpt,episode_id").eq("id", quote_id).limit(1).execute().data or [None])[0]
+            if not q:
+                continue
+            person = (supabase.table("guests").select("id,name,company").eq("id", q["guest_id"]).limit(1).execute().data or [None])[0] if q.get("guest_id") else None
+            exclude = set()
+            if person and speaker_is_verified(person["name"], person["id"]):
+                added += _link_entity(supabase, _ensure_entity(supabase, "person", person["name"], person["id"]), theme_id, quote_id,
+                                      "Speaker", "speaker_identity", "Verified speaker in the PodThreads directory.")
+                if person.get("company"):
+                    exclude.add(person["company"])
+                    added += _link_entity(supabase, _ensure_entity(supabase, "company", person["company"]), theme_id, quote_id,
+                                          "Speaker affiliation", "speaker_identity", f"{person['name']}'s company in the directory.")
+            result = call_openai_structured(client, model=os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+                system_prompt="You list the companies a speaker explicitly names. You never infer.",
+                user_prompt=build_company_mention_prompt(q["text"], q.get("source_transcript_excerpt"), exclude),
+                schema_name="company_mentions", schema=COMPANY_MENTION_SCHEMA,
+                reasoning_effort=os.environ.get("OPENAI_ENTITY_REASONING", "low"), max_output_tokens=1500)
+            for c in clean_company_mentions(result, q["text"], q.get("source_transcript_excerpt")):
+                if any(normalize_directory_value(c["name"]) == normalize_directory_value(e) for e in exclude):
+                    continue
+                added += _link_entity(supabase, _ensure_entity(supabase, "company", c["name"]), theme_id, quote_id,
+                                      "Company discussed", "direct_transcript", c["evidence"])
+        except Exception as exc:
+            print(f"entity linking failed for {quote_id}: {exc}")
+    print(f"AUDIT thread_entities_linked pairs={len(pairs)} added={added}")
+    return {"pairs": len(pairs), "added": added}
+
+
+@app.function(image=image, secrets=[my_secret], timeout=1800)
+def backfill_thread_entities():
+    """Link people and companies for every published placement that has none yet."""
+    from supabase import create_client
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    placements = _select_all(lambda: supabase.table("conversation_take_links").select("quote_id,theme_id"))
+    linked = {(r["quote_id"], r["theme_id"]) for r in _select_all(lambda: supabase.table("conversation_entity_links").select("quote_id,theme_id"))}
+    pairs = sorted({(p["quote_id"], p["theme_id"]) for p in placements} - linked)
+    return link_thread_entities.local(pairs)
+
+
 def propose_historical_conversation_mapping(
     quote,
     source_evidence,
@@ -10962,6 +11073,10 @@ def fastapi_app():
                 return JSONResponse(status_code=422, content={"success": False, "error": "Fix the speaker first: link this perspective to a real person in the directory (Edit)."})
         try:
             result = service_client().rpc("accept_thread_match", {"p_match_id": match_id, "p_reviewer_id": admin["id"]}).execute()
+            if rows and rows[0].get("quote_id"):
+                match = supabase.table("thread_match_suggestions").select("theme_id").eq("id", match_id).limit(1).execute().data or []
+                if match:
+                    await link_thread_entities.spawn.aio([[rows[0]["quote_id"], match[0]["theme_id"]]])
             return {"success": True, "id": result.data}
         except Exception as exc:
             return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
@@ -11082,7 +11197,7 @@ def fastapi_app():
                 "reviewed_by": admin["id"], "reviewed_at": now}).execute().data[0]
         elif question["publication_status"] != "published":
             supabase.table("conversation_questions").update({"publication_status": "published", "reviewed_by": admin["id"], "reviewed_at": now, "updated_at": now}).eq("id", question["id"]).execute()
-        placed, errors = 0, []
+        placed, errors, entity_pairs = 0, [], []
         for m in chosen:
             if not perspective_speaker_check(supabase, m["kind"], m["id"]):
                 errors.append(f"Fix the speaker first for “{str(m.get('reason') or m['id'])[:60]}”")
@@ -11098,8 +11213,12 @@ def fastapi_app():
             try:
                 supabase.rpc("accept_thread_match", {"p_match_id": match_id, "p_reviewer_id": admin["id"]}).execute()
                 placed += 1
+                if m["kind"] == "published":
+                    entity_pairs.append([m["id"], theme["id"]])
             except Exception as exc:
                 errors.append(str(exc)[:200])
+        if entity_pairs:
+            await link_thread_entities.spawn.aio(entity_pairs)
         supabase.table("thread_proposals").update({"status": "accepted", "result_question_id": question["id"], "reviewed_by": admin["id"],
             "reviewed_at": now}).eq("id", proposal_id).execute()
         print(f"AUDIT thread_proposal_accepted proposal={proposal_id} question={question['id']} placed={placed} by={admin['id']}")
