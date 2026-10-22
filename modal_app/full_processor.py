@@ -5857,7 +5857,7 @@ def ensure_directory_person(supabase, name, title, company, linkedin=None):
     name = " ".join(str(name or "").split()); title = " ".join(str(title or "").split()); company = " ".join(str(company or "").split())
     if normalize_directory_value(name) in PLACEHOLDER_SPEAKERS or len(name.split()) < 2:
         raise ValueError("Enter the speaker's full name")
-    people = supabase.table("guests").select("id,name,title,company").limit(5000).execute().data or []
+    people = supabase.table("guests").select("id,name,title,company,linkedin_url").limit(5000).execute().data or []
     person = next((p for p in people if normalize_directory_value(p.get("name")) == normalize_directory_value(name)), None)
     if person:
         return person
@@ -5891,8 +5891,13 @@ def apply_perspective_edit(supabase, kind, row_id, edits, admin_id, context):
             raise ValueError("That person is not in the directory")
         person = found[0]
     elif edits.get("new_speaker_name"):
+        linkedin = clean_linkedin_url(edits.get("new_speaker_linkedin"))
         person = ensure_directory_person(supabase, edits.get("new_speaker_name"), edits.get("new_speaker_title"),
-                                         edits.get("new_speaker_company"), edits.get("new_speaker_linkedin"))
+                                         edits.get("new_speaker_company"), linkedin)
+        if linkedin and person.get("linkedin_url") != linkedin:
+            # the name matched someone already in the directory: keep the link on that person
+            supabase.table("guests").update({"linkedin_url": linkedin}).eq("id", person["id"]).execute()
+            person = {**person, "linkedin_url": linkedin}
     if person:
         if kind == "published":
             updates.update({"guest_id": person["id"], "speaker": person["name"], "guest_name": person["name"]})
