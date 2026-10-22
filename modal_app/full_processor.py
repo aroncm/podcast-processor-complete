@@ -6351,6 +6351,16 @@ def episode_speaker_groups(rows):
     return sorted(groups.values(), key=lambda g: (-g["count"], g["key"]))
 
 
+def clean_linkedin_url(value):
+    """A LinkedIn profile link, or None when blank. Anything else is refused, the same rule as the directory editor."""
+    url = " ".join(str(value or "").split())
+    if not url:
+        return None
+    if not re.match(r"^https://([a-z]+\.)?linkedin\.com/", url, re.I):
+        raise ValueError("Enter a LinkedIn profile link starting with https://www.linkedin.com/")
+    return url
+
+
 def roster_person_fields(person, before=None):
     """The quote fields an episode roster row writes, with the audit of where the match came from."""
     resolution = dict((before or {}).get("directory_resolution") or {})
@@ -11591,6 +11601,7 @@ def fastapi_app():
         name: str | None = None
         title: str | None = None
         company: str | None = None
+        linkedin_url: str | None = None
 
     class RosterApplyRequest(BaseModel):
         podcast_name: str
@@ -11721,6 +11732,10 @@ def fastapi_app():
                  .eq("podcast_name", req.podcast_name).eq("episode_name", req.episode_name))]
         updated, errors = 0, []
         for row in req.rows:
+            try:
+                linkedin = clean_linkedin_url(row.linkedin_url)
+            except ValueError as exc:
+                errors.append(f"{row.key}: {exc}"); continue
             if row.guest_id:
                 person = (supabase.table("guests").select("id,name,title,company,linkedin_url").eq("id", row.guest_id).limit(1).execute().data or [None])[0]
                 if not person:
@@ -11730,9 +11745,13 @@ def fastapi_app():
                 if len(name.split()) < 2 or not title or not company:
                     errors.append(f"{row.key}: a new person needs a full name, title and company"); continue
                 try:
-                    person = ensure_directory_person(supabase, name, title, company)
+                    person = ensure_directory_person(supabase, name, title, company, linkedin)
                 except ValueError as exc:
                     errors.append(f"{row.key}: {exc}"); continue
+            if linkedin and person.get("linkedin_url") != linkedin:
+                # the directory is the one place a person's LinkedIn lives; every perspective reads it from there
+                supabase.table("guests").update({"linkedin_url": linkedin}).eq("id", person["id"]).execute()
+                person = {**person, "linkedin_url": linkedin}
             for before in [r for r in items if speaker_group_key(r) == row.key]:
                 updates = roster_person_fields(person, before)
                 updates["directory_resolution"]["speaker_resolved_by"] = admin["id"]

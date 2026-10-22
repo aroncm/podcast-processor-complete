@@ -8,6 +8,7 @@ from modal_app.full_processor import (
     delete_account_data,
     ACCOUNT_OWNED_TABLES,
     THREAD_MATCH_SCHEMA,
+    clean_linkedin_url,
     clean_theme_companies,
     build_theme_company_prompt,
     build_company_mention_prompt,
@@ -1476,3 +1477,15 @@ class BacklogScoreTests(unittest.TestCase):
                                                {"candidate_index": 1, "quality_score": -1, "ranking_reason": "r"}]}, rows)
         self.assertEqual(out, {"a": (1.0, "r"), "b": (0.0, "r")})
         self.assertIn("Score every take", build_backlog_score_prompt("P", "E", rows))
+
+
+class LinkedInUrlTests(unittest.TestCase):
+    def test_blank_is_none_and_profile_links_pass(self):
+        self.assertIsNone(clean_linkedin_url("  "))
+        self.assertEqual(clean_linkedin_url(" https://www.linkedin.com/in/someone "), "https://www.linkedin.com/in/someone")
+
+    def test_other_links_are_refused(self):
+        with self.assertRaises(ValueError):
+            clean_linkedin_url("linkedin.com/in/someone")
+        with self.assertRaises(ValueError):
+            clean_linkedin_url("https://example.com/in/someone")
