@@ -6104,6 +6104,35 @@ def backfill_thread_entities():
     return link_thread_entities.local(pairs)
 
 
+# Account deletion (Apple 5.1.1(v)). A reader's own rows go; editorial audit columns that name them are cleared, never the
+# content they reviewed. audio_clips.user_id has no ON DELETE rule, so it must be cleared before the auth user can go.
+ACCOUNT_OWNED_TABLES = (("bookmarks", "user_id"), ("quote_supports", "user_id"), ("user_quote_views", "user_id"),
+                        ("reader_theme_follows", "user_id"), ("reader_question_follows", "user_id"), ("profiles", "id"))
+ACCOUNT_CLEARED_COLUMNS = (("audio_clips", "user_id"), ("quotes", "context_reviewed_by"), ("test_quotes", "context_reviewed_by"),
+                           ("test_quotes", "mapping_reviewed_by"))
+
+
+def delete_account_data(supabase, user_id: str) -> dict:
+    """Delete one reader's account: their own rows, then the auth user. Returns what was removed, table by table."""
+    if not user_id:
+        raise ValueError("user id required")
+    removed = {}
+    for table, column in ACCOUNT_OWNED_TABLES:
+        try:
+            rows = supabase.table(table).delete().eq(column, user_id).execute().data or []
+            removed[table] = len(rows)
+        except Exception as exc:          # a table this deployment does not have is not a reason to keep the account
+            print(f"account delete: {table} skipped: {str(exc)[:120]}")
+            removed[table] = None
+    for table, column in ACCOUNT_CLEARED_COLUMNS:
+        try:
+            supabase.table(table).update({column: None}).eq(column, user_id).execute()
+        except Exception as exc:
+            print(f"account delete: clearing {table}.{column} skipped: {str(exc)[:120]}")
+    supabase.auth.admin.delete_user(user_id)
+    return removed
+
+
 THEME_COMPANIES_PROMPT_VERSION = "theme-companies-v1"
 THEME_COMPANY_SCHEMA = {
     "type": "object",
@@ -9875,7 +9904,9 @@ def fastapi_app():
         ).split(",")
         if value.strip()
     ]
-    
+    # The iOS app (Capacitor 6) calls from capacitor://localhost: readers delete their account from there (Apple 5.1.1(v)).
+    allowed_origins += [o for o in ("capacitor://localhost",) if o not in allowed_origins]
+
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
@@ -10097,6 +10128,24 @@ def fastapi_app():
                 detail="Administrator role required",
             )
         return {"id": str(user.id), "email": getattr(user, "email", None)}
+
+    @web_app.post("/account/delete")
+    async def account_delete_endpoint(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+        """A signed-in reader deletes their own account. The user comes from the access token, never the request body."""
+        if not credentials or credentials.scheme.lower() != "bearer":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in to delete your account",
+                                headers={"WWW-Authenticate": "Bearer"})
+        supabase = service_client()
+        try:
+            user = supabase.auth.get_user(credentials.credentials).user
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Your sign-in has expired. Sign in again to delete your account.",
+                                headers={"WWW-Authenticate": "Bearer"})
+        if ((getattr(user, "app_metadata", None) or {}).get("role")) == "admin":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Editorial admin accounts can't be deleted from the app. Remove the admin role first.")
+        removed = delete_account_data(supabase, str(user.id))
+        return {"success": True, "removed": removed}
 
     @web_app.get("/health")
     async def health_endpoint():

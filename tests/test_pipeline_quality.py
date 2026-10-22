@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 from modal_app.full_processor import (
+    delete_account_data,
+    ACCOUNT_OWNED_TABLES,
     THREAD_MATCH_SCHEMA,
     clean_theme_companies,
     build_theme_company_prompt,
@@ -1367,3 +1369,49 @@ class ThemeCompanyTests(unittest.TestCase):
     def test_prompt_names_theme_and_exclusions(self):
         p = build_theme_company_prompt({"name": "Agentic Commerce"}, "Open Market: Ep 1", {"quote": "x", "full_transcript": ""}, {"Aperiam"})
         self.assertIn("Theme: Agentic Commerce", p); self.assertIn("Aperiam", p); self.assertIn("[quote]", p); self.assertNotIn("[full_transcript]", p)
+
+
+class _FakeQuery:
+    def __init__(self, db, table, op, payload=None):
+        self.db, self.table, self.op, self.payload = db, table, op, payload
+    def eq(self, column, value):
+        self.column, self.value = column, value
+        return self
+    def execute(self):
+        if self.table == "missing_table":
+            raise RuntimeError("relation does not exist")
+        self.db.calls.append((self.op, self.table, self.column, self.value, self.payload))
+        return SimpleNamespace(data=[{"x": 1}] if self.op == "delete" else [])
+
+
+class _FakeTable:
+    def __init__(self, db, table):
+        self.db, self.table = db, table
+    def delete(self):
+        return _FakeQuery(self.db, self.table, "delete")
+    def update(self, payload):
+        return _FakeQuery(self.db, self.table, "update", payload)
+
+
+class _FakeSupabase:
+    def __init__(self):
+        self.calls = []
+        self.auth = SimpleNamespace(admin=SimpleNamespace(delete_user=lambda uid: self.calls.append(("auth_delete", uid))))
+    def table(self, name):
+        return _FakeTable(self, name)
+
+
+class AccountDeletionTests(unittest.TestCase):
+    def test_deletes_owned_rows_clears_audit_columns_then_the_auth_user(self):
+        db = _FakeSupabase()
+        removed = delete_account_data(db, "user-1")
+        deleted = {c[1] for c in db.calls if c[0] == "delete"}
+        self.assertEqual(deleted, {t for t, _ in ACCOUNT_OWNED_TABLES})
+        self.assertTrue(all(c[3] == "user-1" for c in db.calls if c[0] in ("delete", "update")))
+        self.assertIn(("update", "audio_clips", "user_id", "user-1", {"user_id": None}), db.calls)
+        self.assertEqual(db.calls[-1], ("auth_delete", "user-1"), "the auth user goes last, after every blocking row")
+        self.assertEqual(removed["bookmarks"], 1)
+
+    def test_requires_a_user_id(self):
+        with self.assertRaises(ValueError):
+            delete_account_data(_FakeSupabase(), "")
