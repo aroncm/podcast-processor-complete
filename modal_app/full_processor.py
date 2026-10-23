@@ -6316,6 +6316,49 @@ def is_ready(row):
             and not is_fragment(row) and not missing_take_verification_fields(row))
 
 
+DUPLICATE_OVERLAP = 0.6   # share of the shorter quote's five-word phrases that also appear in the other
+
+
+def _quote_shingles(text):
+    words = re.sub(r"[^a-z0-9 ]", " ", str(text or "").lower()).split()
+    return {" ".join(words[i:i + 5]) for i in range(max(1, len(words) - 4))} if words else set()
+
+
+def duplicate_groups(rows):
+    """Quotes from the same episode that say the same thing: exact copies, or a shorter quote whose phrasing is mostly
+    inside a longer one. Returns groups of 2+ rows, each with the copy to keep first: one already approved or
+    published, otherwise the higher score, then the longer text, then verified timing, then the older row."""
+    by_ep = {}
+    for r in rows:
+        by_ep.setdefault((r.get("podcast_name"), r.get("episode_name")), []).append(r)
+    parent, linked = {}, set()
+    def find(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x]); x = parent[x]
+        return x
+    for rs in by_ep.values():
+        sh = [(r["id"], _quote_shingles(r.get("quote_text"))) for r in rs]
+        for i in range(len(sh)):
+            for j in range(i + 1, len(sh)):
+                a, sa = sh[i]; b, sb = sh[j]
+                if sa and sb and len(sa & sb) / min(len(sa), len(sb)) >= DUPLICATE_OVERLAP:
+                    parent[find(a)] = find(b); linked.update((a, b))
+    groups = {}
+    for r in rows:
+        if r["id"] in linked:
+            groups.setdefault(find(r["id"]), []).append(r)
+    def keep_key(r):
+        q = r.get("quality_score")
+        return (r.get("approval_status") not in {"approved", "promoted"}, -(q if isinstance(q, (int, float)) else -1),
+                -quote_words(r.get("quote_text")), not timing_verified(r), r.get("created_at") or "")
+    return [sorted(g, key=keep_key) for g in groups.values() if len(g) > 1]
+
+
+def duplicate_extras(groups):
+    """Each pending quote that is not the keeper of its group, with the quote it duplicates."""
+    return {r["id"]: g[0] for g in groups for r in g[1:] if r.get("approval_status") == "pending"}
+
+
 def review_queue_order(rows):
     """Best first: fragments last, verified timing first, then by score (unscored after scored), oldest first on ties."""
     def key(r):
@@ -6505,6 +6548,13 @@ def _retry(fn, tries=4):
 
 def pending_backlog(supabase, fields=REVIEW_QUEUE_FIELDS):
     return _select_all(lambda: supabase.table("test_quotes").select(fields).eq("approval_status", "pending"))
+
+
+def backlog_duplicates(supabase, pending):
+    """Duplicate groups among pending quotes and the approved or published takes they may repeat."""
+    kept = _select_all(lambda: supabase.table("test_quotes").select(REVIEW_QUEUE_FIELDS).in_("approval_status", ["approved", "promoted"]))
+    groups = [g for g in duplicate_groups(pending + kept) if any(r.get("approval_status") == "pending" for r in g[1:])]
+    return groups, duplicate_extras(groups)
 
 
 @app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
@@ -11628,6 +11678,7 @@ def fastapi_app():
                                     limit: int = 40, admin=Depends(require_admin)):
         supabase = service_client()
         rows = pending_backlog(supabase)
+        _, extras = backlog_duplicates(supabase, rows)
         podcasts = sorted({r.get("podcast_name") for r in rows if r.get("podcast_name")})
         shown = [r for r in rows if (not podcast or r.get("podcast_name") == podcast)
                  and (not verified_only or timing_verified(r)) and (not linked_only or speaker_linked(r))]
@@ -11636,11 +11687,16 @@ def fastapi_app():
         start_of_day = datetime.now(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
         done = supabase.table("curation_decisions").select("id", count="exact").eq("reviewer_id", admin["id"]).in_("decision", ["approve", "reject"]).gte("created_at", start_of_day).limit(1).execute()
         episodes_needing = {(r.get("podcast_name"), r.get("episode_name")) for r in rows if speaker_needs_attention(r)}
-        return {"success": True, "items": [review_queue_item(r) for r in ordered[:max(1, min(int(limit), 200))]],
+        def with_dup(r):
+            item = review_queue_item(r); twin = extras.get(r["id"])
+            item["duplicate_of"] = {"id": twin["id"], "quote_text": twin.get("quote_text"), "approval_status": twin.get("approval_status")} if twin else None
+            return item
+        return {"success": True, "items": [with_dup(r) for r in ordered[:max(1, min(int(limit), 200))]],
                 "counts": {"pending": len(rows), "shown": len(shown), "fragments": sum(1 for r in rows if is_fragment(r)),
                            "ready": sum(1 for r in rows if is_ready(r)), "unscored": sum(1 for r in rows if r.get("quality_score") is None),
                            "timing_verified": sum(1 for r in rows if timing_verified(r)), "speaker_linked": sum(1 for r in rows if speaker_linked(r)),
-                           "episodes_needing_speakers": len(episodes_needing), "done_today": done.count or 0},
+                           "episodes_needing_speakers": len(episodes_needing), "done_today": done.count or 0,
+                           "duplicates": len(extras)},
                 "podcasts": podcasts, "reject_reasons": REJECT_REASONS}
 
     @web_app.get("/review-queue/triage")
@@ -11651,6 +11707,15 @@ def fastapi_app():
         pick = [r for r in rows if (is_ready(r) if kind == "ready" else is_fragment(r))]
         pick.sort(key=lambda r: (-(r.get("quality_score") or 0), quote_words(r.get("quote_text"))))
         return {"success": True, "items": [review_queue_item(r) for r in pick]}
+
+    @web_app.get("/review-queue/duplicates")
+    async def review_queue_duplicates_endpoint(admin=Depends(require_admin)):
+        """Each group of duplicate quotes, the suggested keeper first. Only pending copies can be rejected."""
+        supabase = service_client()
+        groups, extras = backlog_duplicates(supabase, pending_backlog(supabase))
+        out = [[{**review_queue_item(r), "approval_status": r.get("approval_status")} for r in g] for g in groups]
+        out.sort(key=lambda g: (g[0].get("podcast_name") or "", g[0].get("episode_name") or ""))
+        return {"success": True, "groups": out, "extras": len(extras)}
 
     @web_app.post("/review-queue/bulk")
     async def review_queue_bulk_endpoint(req: BacklogBulkRequest, admin=Depends(require_admin)):

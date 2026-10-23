@@ -8,6 +8,8 @@ from modal_app.full_processor import (
     delete_account_data,
     ACCOUNT_OWNED_TABLES,
     THREAD_MATCH_SCHEMA,
+    duplicate_groups,
+    duplicate_extras,
     clean_linkedin_url,
     clean_theme_companies,
     build_theme_company_prompt,
@@ -1489,3 +1491,24 @@ class LinkedInUrlTests(unittest.TestCase):
             clean_linkedin_url("linkedin.com/in/someone")
         with self.assertRaises(ValueError):
             clean_linkedin_url("https://example.com/in/someone")
+
+
+class DuplicateQuoteTests(unittest.TestCase):
+    def _row(self, i, text, status="pending", q=0.9, ep="Ep 1"):
+        return {"id": i, "quote_text": text, "approval_status": status, "quality_score": q, "podcast_name": "Show", "episode_name": ep,
+                "youtube_alignment_status": "verified", "created_at": f"2026-01-0{i[-1]}"}
+
+    def test_overlapping_quotes_in_one_episode_group_and_the_approved_copy_is_kept(self):
+        long = "If CTV is the most important sector of advertising and it consolidates then every vendor downstream feels it"
+        rows = [self._row("q1", long), self._row("q2", long.replace("feels it", "will feel it"), status="approved", q=0.8),
+                self._row("q3", "A completely different point about retail media networks and their measurement problems today"),
+                self._row("q4", long, ep="Ep 2")]
+        groups = duplicate_groups(rows)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0]["id"], "q2", "an approved copy is the one to keep")
+        self.assertEqual(set(duplicate_extras(groups)), {"q1"}, "only pending copies are offered for rejection; another episode is not a duplicate")
+
+    def test_without_an_approved_copy_the_higher_score_is_kept(self):
+        t = "Agents will buy media directly from publishers once the protocols settle and the trust problem gets solved"
+        groups = duplicate_groups([self._row("q1", t, q=0.7), self._row("q2", t + " in practice", q=0.95)])
+        self.assertEqual(groups[0][0]["id"], "q2")
