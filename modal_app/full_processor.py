@@ -6385,6 +6385,14 @@ def speaker_needs_attention(row):
         bool(re.match(r"^(speaker|guest|host)\s*\d*$", normalize_directory_value(row.get("speaker_name")) or ""))
 
 
+def sample_moment(row):
+    """Where a sample quote is in the episode's YouTube video, so the editor can hear who says it. None without a video."""
+    if not row.get("youtube_id"):
+        return None
+    start = next((row.get(k) for k in ("youtube_timestamp_start", "timestamp_start", "rss_timestamp_start") if row.get(k) is not None), 0)
+    return {"youtube_id": row["youtube_id"], "start": max(0, float(start)), "verified": timing_verified(row)}
+
+
 def episode_speaker_groups(rows):
     """The episode's speaker slots with how many pending quotes each covers and whether any needs a directory link."""
     groups = {}
@@ -6392,10 +6400,12 @@ def episode_speaker_groups(rows):
         g = groups.setdefault(speaker_group_key(r), {"key": speaker_group_key(r), "speaker_label": r.get("speaker_label"),
                                                     "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
                                                     "speaker_company": r.get("speaker_company"), "guest_id": r.get("guest_id"),
-                                                    "count": 0, "needs_attention": False, "samples": []})
+                                                    "count": 0, "needs_attention": False, "samples": [], "moments": []})
         g["count"] += 1
         g["needs_attention"] = g["needs_attention"] or speaker_needs_attention(r)
-        if len(g["samples"]) < 2: g["samples"].append(str(r.get("quote_text") or "")[:240])
+        if len(g["samples"]) < 2:
+            g["samples"].append(str(r.get("quote_text") or "")[:240])
+            g["moments"].append(sample_moment(r))
     return sorted(groups.values(), key=lambda g: (-g["count"], g["key"]))
 
 

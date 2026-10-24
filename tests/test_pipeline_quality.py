@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from modal_app.full_processor import (
-    is_fragment, is_ready, review_queue_order, speaker_group_key, episode_speaker_groups, clean_roster,
+    is_fragment, is_ready, review_queue_order, speaker_group_key, episode_speaker_groups, sample_moment, clean_roster,
     clean_backlog_scores, build_backlog_score_prompt, roster_person_fields, review_queue_item,
     delete_account_data,
     ACCOUNT_OWNED_TABLES,
@@ -1455,6 +1455,12 @@ class EpisodeRosterTests(unittest.TestCase):
         self.assertEqual([(g["key"], g["count"], g["needs_attention"]) for g in groups],
                          [("label:speaker_01", 2, True), ("name:ari paparo", 1, False)])
         self.assertEqual(speaker_group_key(rows[0]), speaker_group_key(rows[1]))
+        self.assertEqual(len(groups[0]["moments"]), len(groups[0]["samples"]), "one moment per sample quote")
+
+    def test_sample_moment_uses_youtube_timing_and_needs_a_video(self):
+        self.assertIsNone(sample_moment(_row(youtube_id=None)))
+        m = sample_moment(_row(youtube_id="abc", youtube_timestamp_start=95.5, timestamp_start=10))
+        self.assertEqual((m["youtube_id"], m["start"]), ("abc", 95.5))
 
     def test_clean_roster_keeps_known_slots_and_links_directory(self):
         groups = [{"key": "label:speaker_01"}, {"key": "label:speaker_02"}]
