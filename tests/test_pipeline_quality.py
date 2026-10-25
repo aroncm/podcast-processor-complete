@@ -1518,3 +1518,14 @@ class DuplicateQuoteTests(unittest.TestCase):
         t = "Agents will buy media directly from publishers once the protocols settle and the trust problem gets solved"
         groups = duplicate_groups([self._row("q1", t, q=0.7), self._row("q2", t + " in practice", q=0.95)])
         self.assertEqual(groups[0][0]["id"], "q2")
+
+
+class AiJobTests(unittest.TestCase):
+    def test_job_comes_from_the_calling_function_or_an_explicit_label(self):
+        from modal_app.full_processor import ai_job, current_ai_job
+        def score_backlog_quality():
+            return current_ai_job()
+        self.assertEqual(score_backlog_quality(), "Backlog scoring")
+        with ai_job("Episode speakers"):
+            self.assertEqual(score_backlog_quality(), "Episode speakers", "an explicit label wins")
+        self.assertEqual(current_ai_job(), "Other")

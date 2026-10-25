@@ -175,6 +175,142 @@ def summarize_openai_usage() -> dict:
     }
 
 
+# ---- Every AI call, metered (Oct 25, 2026) ----------------------------------------------------------------------------
+# The per-episode ledger above covers transcription and episode analysis. Editorial jobs added since (thread matching,
+# theme companies, backlog scoring, episode speakers, question drafts) also call OpenAI, so every Responses call is
+# recorded in ai_usage_events with its job, model, tokens and estimated cost. The Episodes screen totals it by job and
+# model. A job is named explicitly with ai_job(), or found from the calling function.
+_AI_JOB = ContextVar("podthreads_ai_job", default=None)
+_AI_METER_DB = None
+AI_JOB_BY_FUNCTION = {
+    "extract_quotes": "Episode analysis", "rank_quote_candidates": "Episode analysis", "contextualize_and_map_quotes": "Episode analysis",
+    "propose_transcript_corrections": "Episode analysis", "resolve_diarized_speaker_identities": "Episode analysis",
+    "align_quote_to_segments_semantically": "Moment alignment",
+    "find_thread_matches": "Thread matching", "find_thread_proposals": "Thread matching", "refresh_thread_proposal": "Thread matching",
+    "link_thread_entities": "Thread companies and people", "suggest_theme_companies": "Theme companies",
+    "score_backlog_quality": "Backlog scoring", "episode_speakers_propose_endpoint": "Episode speakers",
+    "draft_question_endpoint": "Thread question drafts", "propose_historical_conversation_mapping": "Historical mapping",
+    "extract_bakeoff_baseline_candidates": "Quality lab", "openai_quota_check": "Quota check",
+}
+# The models each part of the pipeline uses: (job, setting, fallback setting or None, default).
+AI_MODEL_ROLES = [
+    ("Episode analysis: candidate quotes", "OPENAI_CANDIDATE_MODEL", None, "gpt-5.6-terra"),
+    ("Episode analysis: ranking", "OPENAI_RANKING_MODEL", "OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol"),
+    ("Episode analysis: context and mapping", "OPENAI_EDITORIAL_MODEL", None, "gpt-5.6-sol"),
+    ("Thread matching, companies, question drafts", "OPENAI_EDITORIAL_MODEL", None, "gpt-5.6-sol"),
+    ("Moment alignment", "OPENAI_ALIGNMENT_MODEL", "OPENAI_EDITORIAL_MODEL", "gpt-5.6-terra"),
+    ("Backlog scoring", "OPENAI_BACKLOG_SCORE_MODEL", None, "gpt-5.4-mini"),
+    ("Episode speakers", "OPENAI_ROSTER_MODEL", None, "gpt-5.4-mini"),
+    ("Transcription", "OPENAI_TRANSCRIPTION_MODEL", None, "whisper-1"),
+]
+
+
+class ai_job:
+    """with ai_job("Thread matching"): ... names the job for every AI call inside it."""
+    def __init__(self, label: str): self.label, self.token = label, None
+    def __enter__(self): self.token = _AI_JOB.set(self.label); return self
+    def __exit__(self, *exc): _AI_JOB.reset(self.token); return False
+
+
+def current_ai_job() -> str:
+    explicit = _AI_JOB.get()
+    if explicit:
+        return explicit
+    import inspect
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            label = AI_JOB_BY_FUNCTION.get(frame.f_code.co_name)
+            if label:
+                return label
+            frame = frame.f_back
+    finally:
+        del frame
+    return "Other"
+
+
+def log_ai_usage(response) -> None:
+    """Record one Responses call in ai_usage_events. Never raises: metering must not break the job it meters."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return
+    input_details = _object_value(usage, "input_tokens_details", {}) or {}
+    output_details = _object_value(usage, "output_tokens_details", {}) or {}
+    input_tokens = int(_object_value(usage, "input_tokens", 0) or 0)
+    output_tokens = int(_object_value(usage, "output_tokens", 0) or 0)
+    cached = int(_object_value(input_details, "cached_tokens", 0) or 0)
+    cache_write = int(_object_value(input_details, "cache_write_tokens", 0) or 0)
+    model = str(getattr(response, "model", "") or "")
+    cost = estimate_openai_text_cost(model, input_tokens, cached, cache_write, output_tokens)
+    global _AI_METER_DB
+    try:
+        if _AI_METER_DB is None:
+            from supabase import create_client as _create_meter_client
+            _AI_METER_DB = _create_meter_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+        _AI_METER_DB.table("ai_usage_events").insert({
+            "job": current_ai_job(), "model": model, "input_tokens": input_tokens, "cached_input_tokens": cached,
+            "output_tokens": output_tokens, "reasoning_tokens": int(_object_value(output_details, "reasoning_tokens", 0) or 0),
+            "estimated_cost_usd": cost, "priced": cost is not None,
+        }).execute()
+    except Exception as exc:  # the table may not exist yet, or the network may blip
+        print(f"ai usage not recorded: {exc}")
+
+
+def install_ai_meter() -> None:
+    """Wrap the OpenAI Responses API once per process so every call is metered, wherever it is made."""
+    try:
+        from openai.resources.responses import Responses
+    except Exception:
+        return
+    if getattr(Responses.create, "_podthreads_metered", False):
+        return
+    original = Responses.create
+
+    def create(self, *args, **kwargs):
+        response = original(self, *args, **kwargs)
+        if not kwargs.get("stream"):
+            log_ai_usage(response)
+        return response
+    create._podthreads_metered = True
+    Responses.create = create
+
+
+install_ai_meter()
+
+
+def resolved_ai_models():
+    out = []
+    for job, key, fallback, default in AI_MODEL_ROLES:
+        value = os.environ.get(key) or (os.environ.get(fallback) if fallback else None) or default
+        out.append({"job": job, "model": value, "setting": key, "set_explicitly": bool(os.environ.get(key))})
+    return out
+
+
+def openai_reported_costs(since_unix: int):
+    """Actual spend from OpenAI's Costs API, which needs an organization Admin key (OPENAI_ADMIN_KEY). None without it."""
+    key = os.environ.get("OPENAI_ADMIN_KEY")
+    if not key:
+        return None
+    import urllib.request, urllib.parse
+    total, page, days = 0.0, None, []
+    for _ in range(12):
+        params = {"start_time": since_unix, "bucket_width": "1d", "limit": 31}
+        if page:
+            params["page"] = page
+        req = urllib.request.Request("https://api.openai.com/v1/organization/costs?" + urllib.parse.urlencode(params),
+                                     headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+        for bucket in data.get("data", []):
+            amount = sum(float((r.get("amount") or {}).get("value") or 0) for r in bucket.get("results", []))
+            total += amount
+            days.append({"start": bucket.get("start_time"), "usd": round(amount, 4)})
+        if not data.get("has_more"):
+            break
+        page = data.get("next_page")
+    return {"total_usd": round(total, 2), "days": days}
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -11718,6 +11854,84 @@ def fastapi_app():
         pick.sort(key=lambda r: (-(r.get("quality_score") or 0), quote_words(r.get("quote_text"))))
         return {"success": True, "items": [review_queue_item(r) for r in pick]}
 
+    class BalanceRequest(BaseModel):
+        balance_usd: float
+
+    @web_app.get("/costs/summary")
+    async def costs_summary_endpoint(admin=Depends(require_admin)):
+        """What the AI work costs: every metered call by job and model, the models each job uses now, OpenAI's own
+        spend when an Admin key is set, and the balance estimate from the last balance the editor entered."""
+        supabase = service_client()
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=30)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        try:
+            rows = _select_all(lambda: supabase.table("ai_usage_events").select("job,model,estimated_cost_usd,priced,input_tokens,output_tokens,created_at")
+                               .gte("created_at", min(since, month_start).isoformat()))
+            metering = True
+        except Exception:
+            rows, metering = [], False   # before the ai_usage_events migration runs
+        episodes = _select_all(lambda: supabase.table("episode_processing_status").select("transcription_cost_usd,analysis_cost_usd,updated_at")
+                               .gte("updated_at", min(since, month_start).isoformat()))
+        def sum_rows(items, test):
+            return round(sum(float(r.get("estimated_cost_usd") or 0) for r in items if test(r)), 4)
+        recent = [r for r in rows if r["created_at"] >= since.isoformat()]
+        by_job = {}
+        for r in recent:
+            j = by_job.setdefault(r["job"] or "Other", {"job": r["job"] or "Other", "calls": 0, "cost_usd": 0.0, "models": {}, "last_at": None, "unpriced": 0})
+            j["calls"] += 1; j["cost_usd"] += float(r.get("estimated_cost_usd") or 0)
+            j["models"][r["model"]] = j["models"].get(r["model"], 0) + 1
+            if not r.get("priced"): j["unpriced"] += 1
+            if not j["last_at"] or r["created_at"] > j["last_at"]: j["last_at"] = r["created_at"]
+        transcription_30 = round(sum(float(e.get("transcription_cost_usd") or 0) for e in episodes if (e.get("updated_at") or "") >= since.isoformat()), 4)
+        jobs = sorted(({**j, "cost_usd": round(j["cost_usd"], 4), "models": [{"model": m, "calls": n} for m, n in sorted(j["models"].items(), key=lambda x: -x[1])]}
+                       for j in by_job.values()), key=lambda j: -j["cost_usd"])
+        by_model = {}
+        for r in recent:
+            m = by_model.setdefault(r["model"], {"model": r["model"], "calls": 0, "cost_usd": 0.0})
+            m["calls"] += 1; m["cost_usd"] += float(r.get("estimated_cost_usd") or 0)
+        settings = {}
+        try:
+            settings = (supabase.table("ai_cost_settings").select("*").eq("id", 1).maybe_single().execute().data) or {}
+        except Exception:
+            pass
+        reported_month = reported_since_balance = None
+        reported_error = None
+        try:
+            r = openai_reported_costs(int(month_start.timestamp()))
+            reported_month = r["total_usd"] if r else None
+            if settings.get("balance_as_of"):
+                as_of = int(datetime.fromisoformat(str(settings["balance_as_of"]).replace("Z", "+00:00")).timestamp())
+                r2 = openai_reported_costs(as_of)
+                reported_since_balance = r2["total_usd"] if r2 else None
+        except Exception as exc:
+            reported_error = f"OpenAI's cost report did not load: {exc}"
+        estimate_month = round(sum_rows(rows, lambda r: r["created_at"] >= month_start.isoformat())
+                               + sum(float(e.get("transcription_cost_usd") or 0) for e in episodes if (e.get("updated_at") or "") >= month_start.isoformat()), 2)
+        balance = None
+        if settings.get("balance_usd") is not None and settings.get("balance_as_of"):
+            as_of_iso = str(settings["balance_as_of"])
+            if reported_since_balance is not None:
+                spent, source = reported_since_balance, "openai"
+            else:
+                spent = sum_rows(rows, lambda r: r["created_at"] >= as_of_iso) + sum(float(e.get("transcription_cost_usd") or 0) for e in episodes if (e.get("updated_at") or "") >= as_of_iso)
+                spent, source = round(spent, 2), "estimate"
+            balance = {"entered_usd": float(settings["balance_usd"]), "as_of": as_of_iso, "spent_since_usd": spent, "spent_source": source,
+                       "remaining_usd": round(float(settings["balance_usd"]) - spent, 2)}
+        return {"success": True, "metering": metering, "admin_key": bool(os.environ.get("OPENAI_ADMIN_KEY")), "reported_error": reported_error,
+                "month": {"openai_reported_usd": reported_month, "estimated_usd": estimate_month, "since": month_start.isoformat()},
+                "last_30_days": {"ai_calls_usd": round(sum(j["cost_usd"] for j in jobs), 2), "transcription_usd": transcription_30,
+                                 "jobs": jobs, "models": sorted(({**m, "cost_usd": round(m["cost_usd"], 4)} for m in by_model.values()), key=lambda m: -m["cost_usd"])},
+                "configured_models": resolved_ai_models(), "balance": balance}
+
+    @web_app.post("/costs/balance")
+    async def costs_balance_endpoint(req: BalanceRequest, admin=Depends(require_admin)):
+        """The OpenAI balance as the editor reads it on platform.openai.com; spending is subtracted from it from now on."""
+        if req.balance_usd < 0 or req.balance_usd > 100000:
+            raise HTTPException(status_code=422, detail="Enter the balance in dollars")
+        service_client().table("ai_cost_settings").upsert({"id": 1, "balance_usd": round(req.balance_usd, 2), "balance_as_of": utcnow_iso()}).execute()
+        return {"success": True}
+
     @web_app.get("/review-queue/duplicates")
     async def review_queue_duplicates_endpoint(admin=Depends(require_admin)):
         """Each group of duplicate quotes, the suggested keeper first. Only pending copies can be rejected."""
@@ -11797,11 +12011,12 @@ def fastapi_app():
         people = supabase.table("guests").select("id,name,title,company,linkedin_url").limit(3000).execute().data or []
         haystack = normalize_directory_value(f"{req.episode_name} {description} " + " ".join(str(g.get('speaker_name') or '') for g in groups))
         hint = [[p["name"], p.get("title"), p.get("company")] for p in people if p.get("name") and normalize_directory_value(p["name"]) in haystack][:40]
-        result = await asyncio.to_thread(lambda: call_openai_structured(
-            OpenAI(api_key=os.environ["OPENAI_API_KEY"]), model=os.environ.get("OPENAI_ROSTER_MODEL", "gpt-5.4-mini"),
-            system_prompt="You identify the speakers of a podcast episode from its metadata and transcript. You never invent people.",
-            user_prompt=build_roster_prompt(req.podcast_name, req.episode_name, description, groups, hint),
-            schema_name="episode_roster", schema=ROSTER_SCHEMA, reasoning_effort="low", max_output_tokens=3000))
+        with ai_job("Episode speakers"):
+            result = await asyncio.to_thread(lambda: call_openai_structured(
+                OpenAI(api_key=os.environ["OPENAI_API_KEY"]), model=os.environ.get("OPENAI_ROSTER_MODEL", "gpt-5.4-mini"),
+                system_prompt="You identify the speakers of a podcast episode from its metadata and transcript. You never invent people.",
+                user_prompt=build_roster_prompt(req.podcast_name, req.episode_name, description, groups, hint),
+                schema_name="episode_roster", schema=ROSTER_SCHEMA, reasoning_effort="low", max_output_tokens=3000))
         return {"success": True, "groups": groups, "proposals": clean_roster(result, groups, people), "description": description[:600]}
 
     @web_app.post("/episode-speakers/apply")
