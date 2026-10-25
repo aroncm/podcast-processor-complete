@@ -11871,8 +11871,11 @@ def fastapi_app():
             metering = True
         except Exception:
             rows, metering = [], False   # before the ai_usage_events migration runs
-        episodes = _select_all(lambda: supabase.table("episode_processing_status").select("transcription_cost_usd,analysis_cost_usd,updated_at")
-                               .gte("updated_at", min(since, month_start).isoformat()))
+        try:   # per-episode transcription cost lives on the processing artifacts
+            episodes = _select_all(lambda: supabase.table("episode_processing_artifacts").select("transcription_cost_usd,analysis_cost_usd,updated_at")
+                                   .gte("updated_at", min(since, month_start).isoformat()))
+        except Exception:
+            episodes = []
         def sum_rows(items, test):
             return round(sum(float(r.get("estimated_cost_usd") or 0) for r in items if test(r)), 4)
         recent = [r for r in rows if r["created_at"] >= since.isoformat()]
