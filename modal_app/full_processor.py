@@ -10425,7 +10425,8 @@ def apns_send(tokens_by_env, title, body, path):
     return gone
 
 
-@app.function(image=push_image, secrets=[my_secret], timeout=1800, schedule=modal.Cron("*/30 * * * *", timezone="UTC"))
+@app.function(image=push_image, secrets=[my_secret, modal.Secret.from_name("podthreads-apns")], timeout=1800,
+              schedule=modal.Cron("*/30 * * * *", timezone="UTC"))
 def reader_updates():
     """Every 30 minutes: clips for newly published perspectives, then one notification per newly updated thread to the
     iPhones that follow it (or its theme). The first run only records where it starts, so nobody gets a backlog."""
