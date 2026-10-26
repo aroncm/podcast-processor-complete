@@ -10327,8 +10327,23 @@ def moment_audio_targets(supabase, quote_ids=None):
     for i in range(0, len(ep_ids), 100):
         for e in supabase.table("episodes").select("id,source_audio_url").in_("id", ep_ids[i:i + 100]).execute().data or []:
             episodes[e["id"]] = e.get("source_audio_url")
+    # Older perspectives never stored their episode's audio: find it in the podcast's RSS feed, once per episode.
+    meta = {p["id"]: p for p in _select_all(lambda: supabase.table("reader_perspectives_v1").select("id,podcast_name,episode_title"))}
+    feed_rows = supabase.table("test_podcast_feeds").select("name,rss_url").execute().data or []
+    resolved = {}
     for q in quotes:
         url = sources.get(q.get("source_test_quote_id")) or episodes.get(q.get("episode_id"))
+        if not (url and str(url).startswith("http") and "supabase" not in str(url)):
+            m = meta.get(q["id"]) or {}
+            key = (m.get("podcast_name"), m.get("episode_title"))
+            if key not in resolved:
+                try:
+                    found = resolve_rss_audio_source(key[0], key[1], feed_rows) if all(key) else None
+                except Exception as exc:
+                    print(f"moment audio: RSS lookup failed for {key}: {exc}")
+                    found = None
+                resolved[key] = (found or {}).get("audio_url")
+            url = resolved[key]
         q["_audio_url"] = url if url and str(url).startswith("http") and "supabase" not in str(url) else None
     return quotes
 
@@ -10345,18 +10360,34 @@ def build_moment_audio(quote_ids: list = None, max_cost_usd: float = 3.0, limit:
         supabase.storage.create_bucket(MOMENT_AUDIO_BUCKET, options={"public": True})
     except Exception:
         pass   # already there
-    spent, outcomes = 0.0, Counter()
-    for quote in moment_audio_targets(supabase, quote_ids)[:limit]:
-        if spent + (2 * MOMENT_WINDOW_PAD + 60) / 60 * MOMENT_TRANSCRIBE_USD_PER_MIN > max_cost_usd:
-            outcomes["stopped_at_cost_cap"] += 1
-            break
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    spent, outcomes, lock = [0.0], Counter(), threading.Lock()
+    per_clip = (2 * MOMENT_WINDOW_PAD + 60) / 60 * MOMENT_TRANSCRIBE_USD_PER_MIN
+
+    def one(quote):
+        with lock:
+            if spent[0] + per_clip > max_cost_usd:
+                outcomes["stopped_at_cost_cap"] += 1
+                return
+            spent[0] += per_clip   # reserve; settled with the real minutes below
+        minutes = 0.0
         try:
-            _, minutes, reason = build_one_moment_audio(supabase, client, quote)
+            # Another run may have cut it since the list was made (Oct 26: parallel runs).
+            if supabase.table("moment_audio").select("quote_id").eq("quote_id", quote["id"]).limit(1).execute().data:
+                reason = "already_done"
+            else:
+                _, minutes, reason = build_one_moment_audio(supabase, client, quote)
         except Exception as exc:
-            minutes, reason = 0.0, f"error:{type(exc).__name__}"
+            reason = f"error:{type(exc).__name__}"
             print(f"moment audio {quote['id']}: {exc}")
-        spent += minutes * MOMENT_TRANSCRIBE_USD_PER_MIN
-        outcomes[reason] += 1
+        with lock:
+            spent[0] += minutes * MOMENT_TRANSCRIBE_USD_PER_MIN - per_clip
+            outcomes[reason] += 1
+
+    with ThreadPoolExecutor(6) as pool:
+        list(pool.map(one, moment_audio_targets(supabase, quote_ids)[:limit]))
+    spent = spent[0]
     print(f"moment audio: {dict(outcomes)}, transcription ${spent:.2f}")
     return {"outcomes": dict(outcomes), "transcription_usd": round(spent, 4)}
 
