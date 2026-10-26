@@ -644,7 +644,15 @@ def _process_episode_with_ai_impl(
                     res = supabase.table('test_quotes').select('id').eq('episode_name', truncated_title).limit(1).execute()
                     if res.data:
                         is_duplicate = True
-                
+
+                # 3. Analyzed but kept nothing (Oct 26): an episode whose analysis finished with zero perspectives has
+                # no test_quotes row, so the checks above would process it again on every run.
+                if not is_duplicate and getattr(entry, 'id', None):
+                    res = (supabase.table('episode_processing_artifacts').select('id').eq('episode_guid', entry.id)
+                           .not_.is_('analysis_cost_usd', 'null').limit(1).execute())
+                    if res.data:
+                        is_duplicate = True
+
                 if not is_duplicate:
                     print(f"  📎 Found new episode: {entry.title}")
                     new_episodes.append(entry)
@@ -10230,6 +10238,220 @@ def scheduled_processor():
         raise
 
 
+# ---------------------------------------------------------------- reader updates: moment audio and push (Oct 26)
+# "Listen to a thread" plays each perspective as audio, so the iPhone can keep playing with the screen locked. Podcast
+# hosts insert ads into the audio per download, which moves the episode's clock, so each clip is cut from a window
+# around the stored RSS time, transcribed, and kept only when the perspective's words are found in it.
+MOMENT_AUDIO_BUCKET = "moment-audio"
+MOMENT_WINDOW_PAD = 40.0          # seconds of audio on each side of the stored time
+MOMENT_TRANSCRIBE_USD_PER_MIN = 0.006
+push_image = image.pip_install("pyjwt[crypto]==2.10.1", "httpx[http2]==0.28.1")
+
+
+def build_one_moment_audio(supabase, client, quote):
+    """Cut, verify and upload one perspective's audio. Returns (row or None, minutes transcribed, reason)."""
+    import subprocess
+    import tempfile
+    start, end = quote.get("rss_timestamp_start"), quote.get("rss_timestamp_end")
+    if start is None or end is None:
+        if quote.get("timestamp_source") in (None, "rss", "whisper") and quote.get("timestamp_start") is not None:
+            start, end = quote.get("timestamp_start"), quote.get("timestamp_end")
+        else:
+            return None, 0.0, "no_rss_time"
+    audio_url = quote.get("_audio_url")
+    if not audio_url:
+        return None, 0.0, "no_audio_url"
+    win_start = max(0.0, float(start) - MOMENT_WINDOW_PAD)
+    win_len = min(600.0, float(end) - float(start) + 2 * MOMENT_WINDOW_PAD)
+    window = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+    clip = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+    try:
+        got = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(win_start), "-i", audio_url, "-t", str(win_len),
+                              "-ac", "1", "-ar", "44100", "-b:a", "96k", "-y", window], capture_output=True, text=True, timeout=300)
+        if got.returncode != 0:
+            return None, 0.0, "download_failed"
+        minutes = win_len / 60
+        with open(window, "rb") as f:
+            transcript = client.audio.transcriptions.create(model="whisper-1", file=f, response_format="verbose_json",
+                                                            timestamp_granularities=["segment"])
+        segments = []
+        for i, seg in enumerate(getattr(transcript, "segments", None) or []):
+            get = (lambda k, d=None: seg.get(k, d)) if isinstance(seg, dict) else (lambda k, d=None: getattr(seg, k, d))
+            text = str(get("text", "") or "").strip()
+            if text:
+                segments.append({"id": i, "start": float(get("start", 0)), "end": float(get("end", 0)), "raw_text": text, "text": text})
+        ranked = rank_source_alignment_candidates(quote["text"], segments, MOMENT_WINDOW_PAD, MOMENT_WINDOW_PAD + float(end) - float(start), max_candidates=1)
+        if not ranked or ranked[0]["lexical_score"] < 0.55 or ranked[0]["distinctive_overlap"] < 3:
+            return None, minutes, "words_not_found"
+        best = ranked[0]
+        cut_start, cut_end = max(0.0, best["start"] - 0.6), min(win_len, best["end"] + 1.0)
+        cut = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(cut_start), "-to", str(cut_end), "-i", window,
+                              "-af", "afade=t=in:d=0.25", "-ac", "1", "-b:a", "96k", "-y", clip], capture_output=True, text=True, timeout=120)
+        if cut.returncode != 0:
+            return None, minutes, "cut_failed"
+        path = f"{quote['id']}.mp3"
+        with open(clip, "rb") as f:
+            supabase.storage.from_(MOMENT_AUDIO_BUCKET).upload(path, f.read(), {"content-type": "audio/mpeg", "upsert": "true",
+                                                                                 "cache-control": "31536000"})
+        row = {"quote_id": quote["id"], "audio_url": supabase.storage.from_(MOMENT_AUDIO_BUCKET).get_public_url(path).rstrip("?"),
+               "duration_seconds": round(cut_end - cut_start, 2), "match_score": best["lexical_score"],
+               "source_start_seconds": round(win_start + cut_start, 2)}
+        supabase.table("moment_audio").upsert(row).execute()
+        return row, minutes, "ok"
+    finally:
+        for p in (window, clip):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def moment_audio_targets(supabase, quote_ids=None):
+    """Published perspectives without a clip, with the RSS audio each was transcribed from."""
+    published = [p["id"] for p in _select_all(lambda: supabase.table("reader_perspectives_v1").select("id"))]
+    if quote_ids:
+        published = [q for q in published if q in set(quote_ids)]
+    done = {r["quote_id"] for r in _select_all(lambda: supabase.table("moment_audio").select("quote_id"))}
+    todo = [q for q in published if q not in done]
+    quotes = []
+    for i in range(0, len(todo), 100):
+        quotes += supabase.table("quotes").select("id,text,episode_id,source_test_quote_id,rss_timestamp_start,rss_timestamp_end,"
+                                                  "timestamp_start,timestamp_end,timestamp_source").in_("id", todo[i:i + 100]).execute().data or []
+    sources = {}
+    src_ids = [q["source_test_quote_id"] for q in quotes if q.get("source_test_quote_id")]
+    for i in range(0, len(src_ids), 100):
+        for r in supabase.table("test_quotes").select("id,episode_audio_url,audio_clip_url").in_("id", src_ids[i:i + 100]).execute().data or []:
+            sources[r["id"]] = r.get("episode_audio_url") or r.get("audio_clip_url")
+    episodes = {}
+    ep_ids = list({q["episode_id"] for q in quotes if q.get("episode_id")})
+    for i in range(0, len(ep_ids), 100):
+        for e in supabase.table("episodes").select("id,source_audio_url").in_("id", ep_ids[i:i + 100]).execute().data or []:
+            episodes[e["id"]] = e.get("source_audio_url")
+    for q in quotes:
+        url = sources.get(q.get("source_test_quote_id")) or episodes.get(q.get("episode_id"))
+        q["_audio_url"] = url if url and str(url).startswith("http") and "supabase" not in str(url) else None
+    return quotes
+
+
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+def build_moment_audio(quote_ids: list = None, max_cost_usd: float = 3.0, limit: int = 400):
+    """Clips for published perspectives that have none yet, stopping before max_cost_usd of transcription."""
+    from collections import Counter
+    from supabase import create_client
+    from openai import OpenAI
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    try:
+        supabase.storage.create_bucket(MOMENT_AUDIO_BUCKET, options={"public": True})
+    except Exception:
+        pass   # already there
+    spent, outcomes = 0.0, Counter()
+    for quote in moment_audio_targets(supabase, quote_ids)[:limit]:
+        if spent + (2 * MOMENT_WINDOW_PAD + 60) / 60 * MOMENT_TRANSCRIBE_USD_PER_MIN > max_cost_usd:
+            outcomes["stopped_at_cost_cap"] += 1
+            break
+        try:
+            _, minutes, reason = build_one_moment_audio(supabase, client, quote)
+        except Exception as exc:
+            minutes, reason = 0.0, f"error:{type(exc).__name__}"
+            print(f"moment audio {quote['id']}: {exc}")
+        spent += minutes * MOMENT_TRANSCRIBE_USD_PER_MIN
+        outcomes[reason] += 1
+    print(f"moment audio: {dict(outcomes)}, transcription ${spent:.2f}")
+    return {"outcomes": dict(outcomes), "transcription_usd": round(spent, 4)}
+
+
+def save_setting(supabase, key, value):
+    """Write one automation_settings value, whether or not the row exists yet."""
+    if supabase.table("automation_settings").select("key").eq("key", key).limit(1).execute().data:
+        supabase.table("automation_settings").update({"value": value}).eq("key", key).execute()
+    else:
+        supabase.table("automation_settings").insert({"key": key, "value": value}).execute()
+
+
+def apns_send(tokens_by_env, title, body, path):
+    """Send one alert to many iPhones. Returns the tokens Apple says are gone, so they can be removed."""
+    import time as _time
+    import httpx
+    import jwt
+    key, key_id, team = os.environ.get("APNS_KEY_P8"), os.environ.get("APNS_KEY_ID"), os.environ.get("APNS_TEAM_ID", "FSM2ZY8PEN")
+    if not key or not key_id:
+        print("push: APNS_KEY_P8 / APNS_KEY_ID not set; skipping")
+        return []
+    token = jwt.encode({"iss": team, "iat": int(_time.time())}, key.replace("\\n", "\n"), algorithm="ES256", headers={"kid": key_id})
+    payload = {"aps": {"alert": {"title": title, "body": body}, "sound": "default", "thread-id": path}, "path": path}
+    gone = []
+    for env, tokens in tokens_by_env.items():
+        host = "https://api.push.apple.com" if env == "production" else "https://api.sandbox.push.apple.com"
+        with httpx.Client(http2=True, timeout=15) as http:
+            for t in tokens:
+                r = http.post(f"{host}/3/device/{t}", json=payload, headers={
+                    "authorization": f"bearer {token}", "apns-topic": "com.podthreads.app", "apns-push-type": "alert", "apns-priority": "5"})
+                if r.status_code == 410 or (r.status_code == 400 and "BadDeviceToken" in r.text):
+                    gone.append(t)
+                elif r.status_code != 200:
+                    print(f"push {r.status_code}: {r.text[:200]}")
+    return gone
+
+
+@app.function(image=push_image, secrets=[my_secret], timeout=1800, schedule=modal.Cron("*/30 * * * *", timezone="UTC"))
+def reader_updates():
+    """Every 30 minutes: clips for newly published perspectives, then one notification per newly updated thread to the
+    iPhones that follow it (or its theme). The first run only records where it starts, so nobody gets a backlog."""
+    from supabase import create_client
+    from openai import OpenAI
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    try:
+        build_moment_audio.local(max_cost_usd=0.5, limit=20)
+    except Exception as exc:
+        print(f"reader_updates: moment audio failed: {exc}")
+    try:
+        return send_thread_notifications(supabase)
+    except Exception as exc:   # e.g. before the push_devices migration has been run
+        print(f"reader_updates: notifications failed: {exc}")
+        return {"status": "failed", "error": str(exc)[:300]}
+
+
+def send_thread_notifications(supabase):
+    state = supabase.table("automation_settings").select("value").eq("key", "push_last_published_at").limit(1).execute().data
+    since = (state[0]["value"] if state else None)
+    placements = _select_all(lambda: supabase.table("reader_placements_v1").select("quote_id,question_id,theme_id,published_at"))
+    newest = max((p["published_at"] for p in placements if p.get("published_at")), default=None)
+    if since is None or newest is None:
+        if newest:
+            save_setting(supabase, "push_last_published_at", newest)
+        return {"status": "initialized", "since": newest}
+    fresh = [p for p in placements if p.get("published_at") and p["published_at"] > since]
+    if not fresh:
+        return {"status": "nothing_new"}
+    questions = {q["id"]: q for q in _select_all(lambda: supabase.table("reader_questions_v1").select("id,theme_id,question_text"))}
+    counts = {}
+    for p in placements:
+        counts[p["question_id"]] = counts.get(p["question_id"], 0) + 1
+    perspectives = {p["id"]: p for p in _select_all(lambda: supabase.table("reader_perspectives_v1").select("id,speaker_name"))}
+    devices = _select_all(lambda: supabase.table("push_devices").select("token,environment,question_ids,theme_ids"))
+    sent, gone = 0, []
+    for qid in {p["question_id"] for p in fresh}:
+        q = questions.get(qid)
+        if not q or counts.get(qid, 0) < 2:   # threads show only from two perspectives
+            continue
+        who = [perspectives.get(p["quote_id"], {}).get("speaker_name") for p in fresh if p["question_id"] == qid]
+        who = [w for w in who if w]
+        targets = {}
+        for d in devices:
+            if qid in (d.get("question_ids") or []) or q.get("theme_id") in (d.get("theme_ids") or []):
+                targets.setdefault(d.get("environment") or "production", []).append(d["token"])
+        if not targets:
+            continue
+        title = f"New perspective from {who[0]}" if len(who) == 1 else (f"{len(who)} new perspectives" if who else "New in a thread you follow")
+        gone += apns_send(targets, title, q["question_text"], f"/thread/{qid}")
+        sent += sum(len(v) for v in targets.values())
+    for t in gone:
+        supabase.table("push_devices").delete().eq("token", t).execute()
+    save_setting(supabase, "push_last_published_at", newest)
+    return {"status": "sent", "notifications": sent, "removed_devices": len(gone)}
+
+
 def ensure_draft_gold_set(supabase, created_by=None):
     existing = (
         supabase.table("editorial_gold_sets")
@@ -11649,6 +11871,81 @@ def fastapi_app():
             "Cache-Control": "public, max-age=86400",
             "Referrer-Policy": "strict-origin-when-cross-origin",
         })
+
+    @web_app.get("/moment/watch")
+    async def moment_watch_endpoint(v: str, start: int, end: int):
+        """The moment player for "Watch the thread" (Oct 26): the same embed through YouTube's player API, which tells the
+        app when the moment ends so it can go straight to the next perspective."""
+        from fastapi.responses import HTMLResponse
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", v or "") or start < 0 or end <= start or end - start > 3600:
+            raise HTTPException(status_code=422, detail="Invalid moment")
+        html = ('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<meta name="referrer" content="strict-origin-when-cross-origin"><title>PodThreads moment</title>'
+                '<style>html,body{margin:0;height:100%;background:#000}#p{position:fixed;inset:0;width:100%;height:100%}</style></head>'
+                '<body><div id="p"></div><script src="https://www.youtube.com/iframe_api"></script><script>'
+                'function tell(m){try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(m)}catch(e){}}'
+                'function onYouTubeIframeAPIReady(){new YT.Player("p",{host:"https://www.youtube-nocookie.com",videoId:' + json.dumps(v) + ','
+                'playerVars:{autoplay:1,start:' + str(start) + ',end:' + str(end) + ',rel:0,modestbranding:1,playsinline:1},'
+                'events:{onStateChange:function(e){if(e.data===0)tell("ended");if(e.data===1)tell("playing")},onError:function(){tell("error")}}})}'
+                '</script></body></html>')
+        return HTMLResponse(html, headers={
+            "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' https://www.youtube.com https://s.ytimg.com; "
+                                       "frame-src https://www.youtube-nocookie.com https://www.youtube.com; style-src 'unsafe-inline'; img-src https: data:",
+            "Cache-Control": "public, max-age=86400",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+        })
+
+    class PushRegistration(BaseModel):
+        token: str
+        environment: str = "production"
+        question_ids: list[str] = []
+        theme_ids: list[str] = []
+
+    @web_app.post("/push/register")
+    async def push_register_endpoint(req: PushRegistration):
+        """An iPhone that allows notifications, with the threads and themes it follows (Oct 26). Public: a device token
+        only lets us send that device alerts about threads it chose."""
+        from supabase import create_client
+        token = (req.token or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64,200}", token) or req.environment not in ("production", "sandbox"):
+            raise HTTPException(status_code=422, detail="Invalid device")
+        uuid = lambda xs: [x for x in xs if re.fullmatch(r"[0-9a-f-]{36}", x or "")][:200]
+        supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+        supabase.table("push_devices").upsert({"token": token, "environment": req.environment, "question_ids": uuid(req.question_ids),
+                                               "theme_ids": uuid(req.theme_ids), "updated_at": utcnow_iso()}).execute()
+        return {"success": True}
+
+    @web_app.get("/widget")
+    async def widget_endpoint(follow: str = ""):
+        """Public feed for the iOS home-screen widget (Oct 26): the newest published thread, preferring threads the reader
+        follows (ids passed by the app), with its latest perspective. Published reader data only."""
+        from supabase import create_client
+        supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+        followed = [x for x in (follow or "").split(",") if re.fullmatch(r"[0-9a-f-]{36}", x)][:50]
+        questions = {q["id"]: q for q in _select_all(lambda: supabase.table("reader_questions_v1").select("id,theme_id,question_text"))}
+        themes = {t["id"]: t["name"] for t in _select_all(lambda: supabase.table("reader_themes_v1").select("id,name"))}
+        placements = _select_all(lambda: supabase.table("reader_placements_v1").select("quote_id,question_id"))
+        perspectives = {p["id"]: p for p in _select_all(lambda: supabase.table("reader_perspectives_v1").select(
+            "id,text,speaker_name,speaker_company,podcast_name,episode_date,published_at"))}
+        by_thread = {}
+        for pl in placements:
+            p = perspectives.get(pl["quote_id"])
+            if p and pl["question_id"] in questions:
+                by_thread.setdefault(pl["question_id"], []).append(p)
+        when = lambda p: str(p.get("episode_date") or p.get("published_at") or "")
+        threads = [(qid, sorted(ps, key=when, reverse=True)) for qid, ps in by_thread.items() if len(ps) >= 2]
+        if not threads:
+            return JSONResponse({"thread": None}, headers={"Cache-Control": "public, max-age=900"})
+        mine = [t for t in threads if t[0] in followed]
+        qid, ps = max(mine or threads, key=lambda t: when(t[1][0]))
+        q, top = questions[qid], ps[0]
+        text = " ".join(str(top.get("text") or "").split())
+        return JSONResponse({
+            "thread": {"id": qid, "question": q["question_text"], "theme": themes.get(q.get("theme_id")),
+                       "perspectives": len(ps), "latest": when(top)[:10], "followed": bool(mine)},
+            "perspective": {"speaker": top.get("speaker_name"), "company": top.get("speaker_company"),
+                            "podcast": top.get("podcast_name"), "text": text[:240] + ("…" if len(text) > 240 else "")},
+        }, headers={"Cache-Control": "public, max-age=900"})
 
     @web_app.get("/threads")
     async def threads_endpoint(admin=Depends(require_admin)):
