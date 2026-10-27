@@ -11907,7 +11907,8 @@ def fastapi_app():
     @web_app.get("/moment/watch")
     async def moment_watch_endpoint(v: str, start: int, end: int):
         """The moment player for "Watch the thread" (Oct 26): the same embed through YouTube's player API, which tells the
-        app when the moment ends so it can go straight to the next perspective."""
+        app when the moment ends so it can go straight to the next perspective. Since Oct 27 the app draws the controls
+        (one set for Listen and Watch): the page reports progress twice a second and takes play/pause through window.cmd."""
         from fastapi.responses import HTMLResponse
         if not re.fullmatch(r"[A-Za-z0-9_-]{11}", v or "") or start < 0 or end <= start or end - start > 3600:
             raise HTTPException(status_code=422, detail="Invalid moment")
@@ -11916,9 +11917,11 @@ def fastapi_app():
                 '<style>html,body{margin:0;height:100%;background:#000}#p{position:fixed;inset:0;width:100%;height:100%}</style></head>'
                 '<body><div id="p"></div><script src="https://www.youtube.com/iframe_api"></script><script>'
                 'function tell(m){try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(m)}catch(e){}}'
-                'function onYouTubeIframeAPIReady(){new YT.Player("p",{host:"https://www.youtube-nocookie.com",videoId:' + json.dumps(v) + ','
-                'playerVars:{autoplay:1,start:' + str(start) + ',end:' + str(end) + ',rel:0,modestbranding:1,playsinline:1},'
-                'events:{onStateChange:function(e){if(e.data===0)tell("ended");if(e.data===1)tell("playing")},onError:function(){tell("error")}}})}'
+                'var P=null;window.cmd=function(c){try{if(!P)return;if(c==="pause")P.pauseVideo();if(c==="play")P.playVideo()}catch(e){}};'
+                'function onYouTubeIframeAPIReady(){P=new YT.Player("p",{host:"https://www.youtube-nocookie.com",videoId:' + json.dumps(v) + ','
+                'playerVars:{autoplay:1,start:' + str(start) + ',end:' + str(end) + ',rel:0,modestbranding:1,playsinline:1,controls:0,disablekb:1,fs:0,iv_load_policy:3},'
+                'events:{onStateChange:function(e){if(e.data===0)tell("ended");if(e.data===1)tell("playing");if(e.data===2)tell("paused")},onError:function(){tell("error")}}});'
+                'setInterval(function(){try{if(P&&P.getCurrentTime)tell("t:"+Math.max(0,P.getCurrentTime()-' + str(start) + ').toFixed(1)+":' + str(end - start) + '")}catch(e){}},500)}'
                 '</script></body></html>')
         return HTMLResponse(html, headers={
             "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' https://www.youtube.com https://s.ytimg.com; "
