@@ -11351,15 +11351,26 @@ def fastapi_app():
                 detail="Missing Supabase access token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        try:
-            auth_result = service_client().auth.get_user(credentials.credentials)
-            user = auth_result.user
-        except Exception:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired access token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        import asyncio
+        # A dropped connection to Supabase is not a bad token (Oct 28: an editor adding matches got "expired" mid-session),
+        # so retry those and say what happened; only an auth error from Supabase means the token is bad.
+        user = None
+        for attempt in range(3):
+            try:
+                user = service_client().auth.get_user(credentials.credentials).user
+                break
+            except Exception as exc:
+                if "Auth" in type(exc).__name__:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Invalid or expired access token",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                print("sign-in check retrying after", type(exc).__name__, str(exc)[:80])
+                await asyncio.sleep(1 + attempt)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail="Couldn't reach the sign-in service. Try again in a moment.")
         app_metadata = getattr(user, "app_metadata", None) or {}
         if app_metadata.get("role") != "admin":
             raise HTTPException(
