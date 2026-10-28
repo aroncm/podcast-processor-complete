@@ -5701,18 +5701,20 @@ def find_thread_matches(question_id: str, job_id: str = None):
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             matches = [m for found in pool.map(run, batches) for m in found]
-        inserted = 0
+        inserted = []
         for match in matches:
             row = {"theme_id": theme["id"], "question_id": question_id, "fit_score": match["fit_score"], "reason": match["reason"],
                    "model": model, "prompt_version": THREAD_MATCH_PROMPT_VERSION, "processing_job_id": job_id,
                    "quote_id": match["id"] if match["kind"] == "published" else None,
                    "test_quote_id": match["id"] if match["kind"] == "staged" else None}
             try:
-                supabase.table("thread_match_suggestions").insert(row).execute()
-                inserted += 1
+                made = supabase.table("thread_match_suggestions").insert(row).execute().data or [{}]
+                inserted.append({**match, "match_id": made[0].get("id"), "theme_id": theme["id"]})
             except Exception as exc:
                 print(f"thread match skipped ({match['id']}): {exc}")
-        summary = {"candidates": len(candidates), "suggested": inserted}
+        job = supabase.table("processing_jobs").select("requested_by").eq("id", job_id).limit(1).execute().data if job_id else []
+        auto = auto_accept_thread_matches(supabase, inserted, (job[0].get("requested_by") if job else None) or autopilot_editor_id(supabase))
+        summary = {"candidates": len(candidates), "suggested": len(inserted), **auto}
         update_processing_job(supabase, job_id, "succeeded", progress=summary, result=summary, completed_at=utcnow_iso())
         return {"success": True, **summary}
     except Exception as exc:
@@ -5914,7 +5916,7 @@ def find_thread_proposals(scope: str, theme_id: str = None, job_id: str = None):
         client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         model = os.environ.get("OPENAI_EDITORIAL_MODEL", "gpt-5.6-sol")
         effort = os.environ.get("OPENAI_THREAD_DISCOVERY_REASONING", "high")
-        used, proposals, suggestions = set(), [], 0
+        used, proposals, suggestions, scanned = set(), [], 0, []
         base = {"model": model, "prompt_version": THREAD_DISCOVERY_PROMPT_VERSION, "processing_job_id": job_id, "status": "suggested"}
         if scope == "discover":
             by_theme = {}
@@ -5958,10 +5960,12 @@ def find_thread_proposals(scope: str, theme_id: str = None, job_id: str = None):
                     continue
                 m = kept[0]
                 try:
-                    supabase.table("thread_match_suggestions").insert({
+                    made = supabase.table("thread_match_suggestions").insert({
                         "theme_id": theme_id, "question_id": theme_questions[index]["id"], "fit_score": m["fit_score"], "reason": m["reason"],
                         "quote_id": m["id"] if m["kind"] == "published" else None, "test_quote_id": m["id"] if m["kind"] == "staged" else None,
-                        "model": model, "prompt_version": THREAD_DISCOVERY_PROMPT_VERSION, "processing_job_id": job_id}).execute()
+                        "model": model, "prompt_version": THREAD_DISCOVERY_PROMPT_VERSION, "processing_job_id": job_id}).execute().data or [{}]
+                    source = next((c for c in by_key.values() if c["id"] == m["id"]), {})
+                    scanned.append({**m, "match_id": made[0].get("id"), "theme_id": theme_id, "text": source.get("text"), "speaker_name": source.get("speaker_name")})
                     suggestions += 1
                 except Exception as exc:
                     print(f"theme scan suggestion skipped: {exc}")
@@ -5976,6 +5980,9 @@ def find_thread_proposals(scope: str, theme_id: str = None, job_id: str = None):
         if proposals:
             supabase.table("thread_proposals").insert(proposals).execute()
         summary = {"candidates": len(candidates), "proposals": len(proposals), "suggestions": suggestions}
+        if scanned:
+            job = supabase.table("processing_jobs").select("requested_by").eq("id", job_id).limit(1).execute().data if job_id else []
+            summary.update(auto_accept_thread_matches(supabase, scanned, (job[0].get("requested_by") if job else None) or autopilot_editor_id(supabase)))
         update_processing_job(supabase, job_id, "succeeded", progress=summary, result=summary, completed_at=utcnow_iso())
         return {"success": True, **summary}
     except Exception as exc:
@@ -6427,7 +6434,9 @@ READY_MIN_QUALITY = 0.9
 BACKLOG_SCORE_PROMPT_VERSION = "backlog-score-v1"
 ROSTER_PROMPT_VERSION = "episode-roster-v1"
 REJECT_REASONS = {"fragment": "Fragment", "off_topic": "Off-topic", "duplicate": "Duplicate",
-                  "wrong_speaker": "Wrong speaker", "low_value": "Low value"}
+                  "wrong_speaker": "Wrong speaker", "low_value": "Low value",
+                  # Craig's own reasons (Oct 28): a company pitch with no value to the ecosystem; run-on with no clear start or end
+                  "pitch": "Company pitch", "run_on": "Run-on"}
 REVIEW_QUEUE_FIELDS = (
     "id,quote_text,speaker_name,speaker_label,speaker_title,speaker_company,speaker_linkedin,guest_id,podcast_name,"
     "episode_name,episode_guid,date_published,youtube_id,youtube_alignment_status,youtube_timestamp_start,"
@@ -6567,6 +6576,7 @@ def roster_person_fields(person, before=None):
     """The quote fields an episode roster row writes, with the audit of where the match came from."""
     resolution = dict((before or {}).get("directory_resolution") or {})
     resolution.update({"speaker_status": "matched", "speaker_source": "episode_roster", "speaker_resolved_at": utcnow_iso()})
+    resolution.pop("autopilot_proposal", None)
     return {"guest_id": person["id"], "speaker_name": person.get("name"), "speaker_title": person.get("title") or "",
             "speaker_company": person.get("company") or "", "speaker_linkedin": person.get("linkedin_url") or None,
             "directory_resolution": resolution}
@@ -6623,6 +6633,383 @@ def clean_roster(result, groups, people):
                     "directory": {k: match.get(k) for k in ("id", "name", "title", "company")} if match else None}
     return [out.get(g["key"]) or {"key": g["key"], "name": "", "title": "", "company": "", "evidence": "No proposal.",
                                   "confidence": "low", "guest_id": None, "directory": None} for g in groups]
+
+
+# ---------------------------------------------------------------- autopilot (Oct 28, 2026)
+# What the editor's own record shows is safe is done without asking, and every change is logged in curation_decisions
+# (surface speaker_autopilot) or marked on the suggestion (auto_accepted_at) so the "Done automatically" list can undo it.
+# Back-test against Craig's 689 decisions: a full name written by the pipeline matched the speaker he confirmed 237 of
+# 237 times, so those are linked; the roster prompt was right 237 of 238 at high confidence but missed a co-host, so its
+# answers are stored as proposals for one-tap confirmation, never written. Thread matches at fit 0.70 or higher were
+# accepted 57 of 57 times; they are placed only when the speaker is verified and the editor screen raises no flag.
+
+AUTOPILOT_SPEAKER_SOURCE = "autopilot_pipeline_name"
+import threading
+_PERSON_ADD_LOCK = threading.Lock()   # episodes are asked in parallel; a new person is added once
+AUTOPILOT_PROPOSAL_VERSION = "autopilot-roster-v1"
+THREAD_AUTO_ACCEPT_FIT = 0.70
+EDITOR_SCREEN_VERSION = "editor-screen-v1"
+DECISION_LOG_FIELDS = ("approval_status", "rejection_reason", "speaker_name", "guest_id", "speaker_title", "speaker_company",
+                       "speaker_linkedin", "directory_resolution", "context_review_status", "mapping_review_status")
+
+
+def log_curation_decision(supabase, reviewer_id, before, after, decision, reason_code=None, reason_detail=None, extra=None):
+    return supabase.table("curation_decisions").insert({
+        "quote_id": before["id"], "reviewer_id": reviewer_id, "decision": decision,
+        "original_quote_text": before.get("quote_text"), "edited_quote_text": after.get("quote_text", before.get("quote_text")),
+        "reason_code": reason_code, "reason_detail": reason_detail,
+        "metadata": {"before": {k: before.get(k) for k in DECISION_LOG_FIELDS},
+                     "after": {k: after.get(k, before.get(k)) for k in DECISION_LOG_FIELDS}, **(extra or {})},
+    }).execute()
+
+
+def autopilot_editor_id(supabase):
+    """Whose name automatic decisions go under: PODTHREADS_EDITOR_ID, else the editor who decided most recently."""
+    if os.environ.get("PODTHREADS_EDITOR_ID"):
+        return os.environ["PODTHREADS_EDITOR_ID"]
+    rows = supabase.table("curation_decisions").select("reviewer_id").order("created_at", desc=True).limit(1).execute().data or []
+    return rows[0]["reviewer_id"] if rows else None
+
+
+def is_full_speaker_name(name):
+    n = normalize_directory_value(name)
+    return n not in PLACEHOLDER_SPEAKERS and len(n.split()) >= 2 and not re.match(r"^(speaker|guest|host)\s*\w?\d*$", n)
+
+
+def speaker_autopilot_plan(rows, people):
+    """Pending quotes with no directory link, by episode speaker slot. A slot whose quotes all carry the same full name
+    is settled: linked to the directory person of that name, or added with the title and company the quotes carry.
+    Everything else is left open for the roster proposal and the editor."""
+    from collections import Counter
+    by_name = {normalize_directory_value(p.get("name")): p for p in people if p.get("name")}
+    slots = {}
+    for r in rows:
+        if r.get("guest_id") or (r.get("directory_resolution") or {}).get("autopilot_declined"):
+            continue   # linked already, or the editor undid an automatic link here
+        slots.setdefault((r.get("podcast_name") or "", r.get("episode_name") or "", speaker_group_key(r)), []).append(r)
+    settled, unsettled = [], []
+    for items in slots.values():
+        names = {normalize_directory_value(r.get("speaker_name")) for r in items}
+        name = " ".join(str(items[0].get("speaker_name") or "").split())
+        common = lambda field: (Counter(" ".join(str(r.get(field) or "").split()) for r in items if str(r.get(field) or "").strip()).most_common(1) or [("", 0)])[0][0]
+        if len(names) == 1 and is_full_speaker_name(name):
+            person = by_name.get(normalize_directory_value(name))
+            if person:
+                settled.append({"rows": items, "person": person, "rule": "directory_name"}); continue
+            if common("speaker_title") and common("speaker_company"):
+                settled.append({"rows": items, "new": (name, common("speaker_title"), common("speaker_company")), "rule": "new_person"}); continue
+        unsettled.extend(items)
+    return settled, unsettled
+
+
+def link_speaker_automatically(supabase, reviewer_id, before, person, rule, created_person=False):
+    updates = roster_person_fields(person, before)
+    updates["directory_resolution"].update({"speaker_source": AUTOPILOT_SPEAKER_SOURCE, "speaker_resolved_by": reviewer_id, "autopilot_rule": rule})
+    updates.update(editorial_gate_invalidations(before, updates))
+    updates["updated_at"] = utcnow_iso()
+    done = supabase.table("test_quotes").update(updates).eq("id", before["id"]).eq("approval_status", "pending").is_("guest_id", "null").execute()
+    if not done.data:
+        return False   # decided or linked meanwhile
+    log_curation_decision(supabase, reviewer_id, before, {**before, **updates}, "edit", reason_detail="Speaker autopilot",
+                          extra={"surface": "speaker_autopilot", "rule": rule, "created_person": created_person, "guest_id": person["id"]})
+    return True
+
+
+def keeps_pipeline_name(proposal, rows):
+    """The roster answer only confirms the full name the pipeline wrote (high confidence) and supplies title and company."""
+    p = proposal or {}
+    names = {normalize_directory_value(r.get("speaker_name")) for r in rows}
+    return (len(names) == 1 and is_full_speaker_name(rows[0].get("speaker_name")) and normalize_directory_value(p.get("name")) in names
+            and p.get("confidence") == "high" and bool(p.get("guest_id") or (p.get("title") and p.get("company"))))
+
+
+def person_for_proposal(supabase, people, proposal):
+    """(directory person, newly added) for a roster answer, adding the person once when they are new."""
+    with _PERSON_ADD_LOCK:
+        known = {normalize_directory_value(x.get("name")) for x in people}
+        person = next((x for x in people if x["id"] == proposal["guest_id"]), None) if proposal.get("guest_id") else \
+            ensure_directory_person(supabase, proposal["name"], proposal["title"], proposal["company"])
+        created = bool(person) and normalize_directory_value(person.get("name")) not in known
+        if created:
+            people.append(person)
+        return person, created
+
+
+def propose_episode_speakers(supabase, client, podcast, episode, rows, people, reviewer_id):
+    """Ask the roster prompt once for an episode's open slots. When the pipeline already wrote a full name and the prompt
+    keeps that same name at high confidence, only adding the title and company, the quotes are linked (the pipeline's
+    full names were right 237 of 237 times). Any other answer is kept on each quote as autopilot_proposal for the
+    editor to confirm or fix on the episode screen. Returns (linked, people added, proposed)."""
+    groups = [g for g in episode_speaker_groups(rows) if g["needs_attention"]]
+    if not groups:
+        return 0, 0, 0
+    description = episode_description(supabase, podcast, episode)
+    haystack = normalize_directory_value(f"{episode} {description} " + " ".join(str(g.get('speaker_name') or '') for g in groups))
+    hint = [[p["name"], p.get("title"), p.get("company")] for p in people if p.get("name") and normalize_directory_value(p["name"]) in haystack][:40]
+    result = call_openai_structured(client, model=os.environ.get("OPENAI_ROSTER_MODEL", "gpt-5.4-mini"),
+        system_prompt="You identify the speakers of a podcast episode from its metadata and transcript. You never invent people.",
+        user_prompt=build_roster_prompt(podcast, episode, description, groups, hint),
+        schema_name="episode_roster", schema=ROSTER_SCHEMA, reasoning_effort="low", max_output_tokens=3000)
+    proposals = {p["key"]: p for p in clean_roster(result, groups, people)}
+    linked, added, written, people_by_key = 0, 0, 0, {}
+    for g in groups:
+        p = proposals.get(g["key"]) or {}
+        if keeps_pipeline_name(p, [r for r in rows if speaker_group_key(r) == g["key"]]):
+            try:
+                person, created = person_for_proposal(supabase, people, p)
+                added += created
+                if person:
+                    people_by_key[g["key"]] = (person, created)
+            except ValueError as exc:
+                print("autopilot: could not add", p.get("name"), exc)
+    for r in rows:
+        key = speaker_group_key(r)
+        if key in people_by_key:
+            person, created = people_by_key[key]
+            linked += link_speaker_automatically(supabase, reviewer_id, r, person, "roster_kept_name", created)
+            continue
+        p = proposals.get(key)
+        if not p:
+            continue
+        resolution = dict(r.get("directory_resolution") or {})
+        resolution["autopilot_proposal"] = {**{k: p.get(k) for k in ("name", "title", "company", "evidence", "confidence", "guest_id")},
+                                            "version": AUTOPILOT_PROPOSAL_VERSION, "proposed_at": utcnow_iso()}
+        _retry(lambda: supabase.table("test_quotes").update({"directory_resolution": resolution}).eq("id", r["id"]).eq("approval_status", "pending").execute())
+        written += 1
+    return linked, added, written
+
+
+def run_speaker_autopilot(supabase, reviewer_id, propose=True, dry_run=False):
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import OpenAI
+    rows = pending_backlog(supabase, "*")
+    people = supabase.table("guests").select("id,name,title,company,linkedin_url").limit(5000).execute().data or []
+    settled, unsettled = speaker_autopilot_plan(rows, people)
+    summary = {"pending": len(rows), "slots_settled": len(settled), "linked": 0, "people_added": 0, "proposed": 0, "errors": []}
+    if dry_run:   # the rule-only part; the roster step needs the AI and writes as it goes
+        summary["would_link"] = sum(len(s["rows"]) for s in settled)
+        summary["would_add"] = sorted({s["new"][0] for s in settled if s.get("new")})
+        return summary
+    for slot in settled:
+        created = False
+        person = slot.get("person")
+        if not person:
+            try:
+                existing = {normalize_directory_value(p.get("name")) for p in people}
+                person = ensure_directory_person(supabase, *slot["new"])
+                created = normalize_directory_value(person.get("name")) not in existing
+                if created:
+                    people.append(person); summary["people_added"] += 1
+            except ValueError as exc:
+                summary["errors"].append(f"{slot['new'][0]}: {exc}"); continue
+        for before in slot["rows"]:
+            if link_speaker_automatically(supabase, reviewer_id, before, person, slot["rule"], created):
+                summary["linked"] += 1
+    # answers already on file that only confirm the pipeline's full name are applied without asking again
+    slots = {}
+    for r in unsettled:
+        slots.setdefault((r.get("podcast_name"), r.get("episode_name"), speaker_group_key(r)), []).append(r)
+    applied = set()
+    for items in slots.values():
+        who = lambda r: tuple((proposal_of(r) or {}).get(k) for k in ("name", "title", "company", "confidence", "guest_id"))
+        p = proposal_of(items[0])
+        if len({who(r) for r in items}) != 1 or not keeps_pipeline_name(p, items):
+            continue
+        try:
+            person, created = person_for_proposal(supabase, people, p)
+        except ValueError as exc:
+            summary["errors"].append(f"{p.get('name')}: {exc}"); continue
+        summary["people_added"] += created
+        for before in items:
+            if person and link_speaker_automatically(supabase, reviewer_id, before, person, "roster_kept_name", created):
+                summary["linked"] += 1; applied.add(before["id"])
+    unsettled = [r for r in unsettled if r["id"] not in applied]
+    if propose:
+        episodes = {}
+        for r in unsettled:
+            if ((r.get("directory_resolution") or {}).get("autopilot_proposal") or {}).get("version") == AUTOPILOT_PROPOSAL_VERSION:
+                continue   # already asked; a new quote in the episode is asked about on the next run with the rest
+            episodes.setdefault((r.get("podcast_name") or "", r.get("episode_name") or ""), []).append(r)
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        def ask(item):
+            import time
+            (podcast, episode), items = item
+            for attempt in range(3):   # Supabase drops a pooled connection now and then ("Server disconnected")
+                try:
+                    return propose_episode_speakers(supabase, client, podcast, episode, items, people, reviewer_id)
+                except Exception as exc:
+                    if attempt == 2:
+                        summary["errors"].append(f"{episode}: {exc}"); return 0, 0, 0
+                    time.sleep(3 * (attempt + 1))
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for linked, added, proposed in pool.map(ask, episodes.items()):
+                summary["linked"] += linked; summary["people_added"] += added; summary["proposed"] += proposed
+    return summary
+
+
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+def speaker_autopilot(reviewer_id: str = None, propose: bool = True, dry_run: bool = False):
+    """Link every pending quote the pipeline's own full name settles, then ask the roster prompt about the rest."""
+    from supabase import create_client
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    with ai_job("Speaker autopilot"):
+        summary = run_speaker_autopilot(supabase, reviewer_id or autopilot_editor_id(supabase), propose=propose, dry_run=dry_run)
+    print("speaker autopilot", json.dumps({k: v for k, v in summary.items() if k != "would_add"}))
+    return summary
+
+
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2, schedule=modal.Cron("30 2 * * *", timezone="UTC"))
+def daily_autopilot():
+    """Every night, after the episode batch: settle speakers and pre-screen the episodes that arrived."""
+    from supabase import create_client
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    with ai_job("Speaker autopilot"):
+        print("speaker autopilot", json.dumps(run_speaker_autopilot(supabase, autopilot_editor_id(supabase))))
+    with ai_job("Editor screen"):
+        print("editor screen", json.dumps(run_editor_screen(supabase)))
+
+
+# ---------------------------------------------------------------- the editor screen: Craig's own rejection reasons
+# Back-test (Oct 28, 118 decided episodes): of quotes flagged "no clear insight" Craig had rejected 61% (his overall
+# rejection rate is 33%); "reject the whole episode" was right 5 of 5. Good enough for hints and a one-tap suggestion,
+# not for unticking quotes on his behalf.
+EDITOR_SCREEN_RUBRIC = """You screen spoken quotes from AdTech podcasts for PodThreads, which publishes quotes that add value for
+people across the advertising ecosystem. The editor rejects a quote when:
+  pitch: it is a direct pitch for the speaker's own company or product, with no value to the broader ecosystem
+  no_insight: it is low value, with no clear insight; it is not insightful, thought provoking, interesting, entertaining,
+    provocative or educational, and adds nothing for the reader
+  run_on: it is too long, run-on sentences with no clear beginning and end
+Read the episode's quotes together and compare them: the editor keeps the strongest quotes from an episode and drops the
+weaker ones. A quote that is fine on its own can still be the weakest of the set."""
+
+EDITOR_SCREEN_SCHEMA = {"type": "object", "properties": {
+    "episode_reject": {"type": "boolean"}, "episode_reason": {"type": "string"},
+    "quotes": {"type": "array", "items": {"type": "object", "properties": {
+        "index": {"type": "integer"}, "pitch": {"type": "boolean"}, "no_insight": {"type": "boolean"}, "run_on": {"type": "boolean"},
+        "keep": {"type": "boolean"}, "confidence": {"type": "number"}, "reason": {"type": "string"}},
+        "required": ["index", "pitch", "no_insight", "run_on", "keep", "confidence", "reason"], "additionalProperties": False}}},
+    "required": ["episode_reject", "episode_reason", "quotes"], "additionalProperties": False}
+
+
+def build_editor_screen_prompt(podcast, episode, rows):
+    items = [{"index": i, "speaker": r.get("speaker_name"), "words": quote_words(r.get("quote_text")), "quote": r.get("quote_text")} for i, r in enumerate(rows)]
+    return f"""Podcast: {podcast}
+Episode: {episode}
+
+Flag each quote (pitch, no_insight, run_on), then say whether the editor would keep it. confidence is your probability
+(0 to 1) that the editor makes the keep call you made. One short sentence of reason. episode_reject is true only when
+nothing in the episode is worth keeping (for example the whole episode is one company's pitch, or off the AdTech subject).
+
+QUOTES:
+{json.dumps(items, ensure_ascii=False)}"""
+
+
+def editor_screen(client, podcast, episode, rows):
+    """{quote id: screen} for a set of quotes read together."""
+    result = call_openai_structured(client, model=os.environ.get("OPENAI_SCREEN_MODEL", "gpt-5.4-mini"), system_prompt=EDITOR_SCREEN_RUBRIC,
+        user_prompt=build_editor_screen_prompt(podcast, episode, rows), schema_name="episode_screen", schema=EDITOR_SCREEN_SCHEMA,
+        reasoning_effort="low", max_output_tokens=6000)
+    got = {q["index"]: q for q in result.get("quotes") or [] if isinstance(q.get("index"), int)}
+    out = {}
+    for i, r in enumerate(rows):
+        q = got.get(i)
+        if q:
+            out[r["id"]] = {**{k: q[k] for k in ("pitch", "no_insight", "run_on", "keep")}, "confidence": round(float(q.get("confidence") or 0), 2),
+                            "reason": str(q.get("reason") or "")[:300], "episode_reject": bool(result.get("episode_reject")),
+                            "episode_reason": str(result.get("episode_reason") or "")[:400] if result.get("episode_reject") else "",
+                            "version": EDITOR_SCREEN_VERSION, "screened_at": utcnow_iso()}
+    return out
+
+
+def proposal_of(row):
+    return ((row or {}).get("directory_resolution") or {}).get("autopilot_proposal")
+
+
+def screen_of(row):
+    s = ((row or {}).get("analysis_review_flags") or {}).get("editor_screen") or {}
+    return s if s.get("version") == EDITOR_SCREEN_VERSION else None
+
+
+def save_editor_screen(supabase, rows, screens):
+    for r in rows:
+        if r["id"] in screens:
+            flags = dict(r.get("analysis_review_flags") or {}); flags["editor_screen"] = screens[r["id"]]
+            _retry(lambda: supabase.table("test_quotes").update({"analysis_review_flags": flags}).eq("id", r["id"]).execute())
+            r["analysis_review_flags"] = flags
+
+
+def screen_episode_rows(supabase, client, podcast, episode, rows):
+    """Screen an episode's pending quotes when any is unscreened. The whole set is read again so the comparison holds."""
+    if rows and any(screen_of(r) is None for r in rows):
+        save_editor_screen(supabase, rows, editor_screen(client, podcast, episode, rows))
+    return rows
+
+
+def run_editor_screen(supabase):
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import OpenAI
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    episodes = {}
+    for r in pending_backlog(supabase, "id,quote_text,speaker_name,podcast_name,episode_name,analysis_review_flags"):
+        episodes.setdefault((r.get("podcast_name") or "", r.get("episode_name") or ""), []).append(r)
+    todo = [(k, rows) for k, rows in episodes.items() if any(screen_of(r) is None for r in rows)]
+    errors = []
+    def one(item):
+        (podcast, episode), rows = item
+        try:
+            screen_episode_rows(supabase, client, podcast, episode, rows); return 1
+        except Exception as exc:
+            errors.append(f"{episode}: {exc}"); return 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        done = sum(pool.map(one, todo))
+    return {"episodes": len(episodes), "screened": done, "errors": errors[:20]}
+
+
+@app.function(image=image, secrets=[my_secret], timeout=3600, cpu=2)
+def screen_backlog_episodes():
+    from supabase import create_client
+    with ai_job("Editor screen"):
+        return run_editor_screen(create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"]))
+
+
+# ---------------------------------------------------------------- thread matches placed automatically
+def auto_accept_thread_matches(supabase, inserted, reviewer_id):
+    """Place suggestions at fit 0.70 or higher whose speaker is verified and whose quote the editor screen does not flag.
+    Each is marked auto_accepted_at so the Done automatically list can take it back out. Needs migration
+    20261028120000_thread_match_auto_accept.sql; without the column nothing is placed automatically."""
+    from openai import OpenAI
+    picks = [m for m in inserted if m.get("match_id") and float(m.get("fit_score") or 0) >= THREAD_AUTO_ACCEPT_FIT and m.get("text")]
+    if not picks or not reviewer_id:
+        return {"auto_accepted": 0}
+    try:
+        supabase.table("thread_match_suggestions").select("auto_accepted_at").limit(1).execute()
+    except Exception:
+        return {"auto_accepted": 0, "note": "auto-accept migration not applied"}
+    picks = [m for m in picks if perspective_speaker_check(supabase, m["kind"], m["id"])]
+    if not picks:
+        return {"auto_accepted": 0}
+    rows = [{"id": m["match_id"], "quote_text": m["text"], "speaker_name": m.get("speaker_name")} for m in picks]
+    try:
+        screens = editor_screen(OpenAI(api_key=os.environ["OPENAI_API_KEY"]), "Several", "Quotes matched to a thread", rows)
+    except Exception as exc:
+        print("thread auto-accept: screen failed, leaving all for the editor", exc)
+        return {"auto_accepted": 0}
+    accepted, published = 0, []
+    for m in picks:
+        s = screens.get(m["match_id"])
+        if not s or s["pitch"] or s["no_insight"] or s["run_on"]:
+            continue
+        try:
+            supabase.rpc("accept_thread_match", {"p_match_id": m["match_id"], "p_reviewer_id": reviewer_id}).execute()
+            supabase.table("thread_match_suggestions").update({"auto_accepted_at": utcnow_iso()}).eq("id", m["match_id"]).execute()
+            accepted += 1
+            if m["kind"] == "published":
+                published.append([m["id"], m["theme_id"]])
+        except Exception as exc:
+            print(f"thread auto-accept skipped ({m['match_id']}): {exc}")
+    if published:
+        link_thread_entities.spawn(published)
+    return {"auto_accepted": accepted}
 
 
 BACKLOG_SCORE_SCHEMA = {
@@ -12125,6 +12512,11 @@ def fastapi_app():
         action: str
         quote_ids: list[str]
         reason_code: str | None = None
+        surface: str | None = None
+
+    class AutopilotUndoRequest(BaseModel):
+        kind: str
+        ids: list[str]
 
     class RosterProposeRequest(BaseModel):
         podcast_name: str
@@ -12144,14 +12536,7 @@ def fastapi_app():
         rows: list[RosterApplyRow]
 
     def _log_decision(supabase, admin, before, after, decision, reason_code=None, reason_detail=None, extra=None):
-        fields = ("approval_status", "rejection_reason", "speaker_name", "guest_id", "speaker_title", "speaker_company",
-                  "speaker_linkedin", "directory_resolution", "context_review_status", "mapping_review_status")
-        return supabase.table("curation_decisions").insert({
-            "quote_id": before["id"], "reviewer_id": admin["id"], "decision": decision,
-            "original_quote_text": before.get("quote_text"), "edited_quote_text": after.get("quote_text", before.get("quote_text")),
-            "reason_code": reason_code, "reason_detail": reason_detail,
-            "metadata": {"before": {k: before.get(k) for k in fields}, "after": {k: after.get(k, before.get(k)) for k in fields}, **(extra or {})},
-        }).execute()
+        return log_curation_decision(supabase, admin["id"], before, after, decision, reason_code, reason_detail, extra)
 
     @web_app.get("/review-queue")
     async def review_queue_endpoint(podcast: str = "", verified_only: bool = False, linked_only: bool = False,
@@ -12304,7 +12689,7 @@ def fastapi_app():
             updates["updated_at"] = utcnow_iso()
             supabase.table("test_quotes").update(updates).eq("id", qid).eq("approval_status", "pending").execute()
             _log_decision(supabase, admin, before, {**before, **updates}, req.action, reason_code=req.reason_code,
-                          reason_detail=REJECT_REASONS.get(req.reason_code or ""), extra={"surface": "backlog_bulk"})
+                          reason_detail=REJECT_REASONS.get(req.reason_code or ""), extra={"surface": req.surface if req.surface == "episode_review" else "backlog_bulk"})
             done.append(qid)
         return {"success": True, "done": done, "failed": failed}
 
@@ -12394,6 +12779,150 @@ def fastapi_app():
                               extra={"surface": "episode_roster", "prompt_version": ROSTER_PROMPT_VERSION})
                 updated += 1
         return {"success": True, "updated": updated, "errors": errors}
+
+    # ---------------------------------------------------------------- one episode at a glance (Oct 28)
+    def _moment_order(r):
+        start = next((r.get(k) for k in ("youtube_timestamp_start", "timestamp_start", "rss_timestamp_start") if r.get(k) is not None), None)
+        return (start is None, float(start or 0), str(r.get("created_at") or ""))
+
+    def _flagged(screen):
+        return bool(screen) and (screen.get("pitch") or screen.get("no_insight") or screen.get("run_on"))
+
+    @web_app.get("/episode-review")
+    async def episode_review_endpoint(admin=Depends(require_admin)):
+        """Every episode with pending quotes, newest first, with what is left to do in it."""
+        rows = pending_backlog(service_client(), REVIEW_QUEUE_FIELDS + ",analysis_review_flags")
+        episodes = {}
+        for r in rows:
+            episodes.setdefault((r.get("podcast_name") or "", r.get("episode_name") or ""), []).append(r)
+        out = []
+        for (podcast, episode), items in episodes.items():
+            screens = [screen_of(r) for r in items]
+            whole = next((x for x in screens if x and x.get("episode_reject")), None)
+            needing = [r for r in items if speaker_needs_attention(r)]
+            out.append({"podcast_name": podcast, "episode_name": episode, "date_published": items[0].get("date_published"),
+                        "pending": len(items), "needs_speaker": len(needing),
+                        "speaker_suggested": sum(1 for r in needing if (proposal_of(r) or {}).get("confidence") == "high" and (proposal_of(r) or {}).get("name")),
+                        "timing_unverified": sum(1 for r in items if not timing_verified(r)),
+                        "flagged": sum(1 for x in screens if _flagged(x)), "screened": all(screens),
+                        "suggest_reject_episode": whole.get("episode_reason") if whole else None})
+        out.sort(key=lambda e: str(e["date_published"] or ""), reverse=True)
+        return {"success": True, "episodes": out}
+
+    @web_app.get("/episode-review/episode")
+    async def episode_review_detail_endpoint(podcast_name: str, episode_name: str, admin=Depends(require_admin)):
+        """An episode's pending quotes in the order spoken, each with the editor screen, plus its speaker slots and the
+        autopilot's proposals. The screen runs here the first time an episode is opened."""
+        import asyncio
+        from openai import OpenAI
+        supabase = service_client()
+        rows = _select_all(lambda: supabase.table("test_quotes").select("*").eq("approval_status", "pending")
+                           .eq("podcast_name", podcast_name).eq("episode_name", episode_name))
+        if not rows:
+            raise HTTPException(status_code=404, detail="No pending quotes for that episode")
+        screen_error = None
+        try:
+            with ai_job("Editor screen"):
+                await asyncio.to_thread(screen_episode_rows, supabase, OpenAI(api_key=os.environ["OPENAI_API_KEY"]), podcast_name, episode_name, rows)
+        except Exception as exc:
+            screen_error = f"The AI screen did not run: {exc}"
+        rows.sort(key=_moment_order)
+        _, extras = backlog_duplicates(supabase, rows)
+        def item(r):
+            twin = extras.get(r["id"])
+            return {**review_queue_item(r), "screen": screen_of(r),
+                    "duplicate_of": {"id": twin["id"], "quote_text": twin.get("quote_text"), "approval_status": twin.get("approval_status")} if twin else None}
+        groups = episode_speaker_groups(rows)
+        for g in groups:
+            first = next((r for r in rows if speaker_group_key(r) == g["key"]), None)
+            g["proposal"] = proposal_of(first) if g["needs_attention"] else None
+        whole = next((screen_of(r) for r in rows if (screen_of(r) or {}).get("episode_reject")), None)
+        return {"success": True, "quotes": [item(r) for r in rows], "groups": groups, "reject_reasons": REJECT_REASONS,
+                "suggest_reject_episode": whole.get("episode_reason") if whole else None, "screen_error": screen_error}
+
+    # ---------------------------------------------------------------- done automatically: the audit list, with undo
+    @web_app.get("/autopilot/log")
+    async def autopilot_log_endpoint(days: int = 14, admin=Depends(require_admin)):
+        supabase = service_client()
+        since = (datetime.now(timezone.utc) - timedelta(days=max(1, min(int(days), 90)))).isoformat()
+        made = _select_all(lambda: supabase.table("curation_decisions").select("id,quote_id,created_at,metadata")
+                           .eq("metadata->>surface", "speaker_autopilot").gte("created_at", since).order("created_at", desc=True))
+        undone = {(d.get("metadata") or {}).get("undoes") for d in _select_all(lambda: supabase.table("curation_decisions")
+                  .select("metadata").eq("metadata->>surface", "autopilot_undo").gte("created_at", since))}
+        ids = list({d["quote_id"] for d in made})
+        quotes = {}
+        for i in range(0, len(ids), 200):
+            for q in supabase.table("test_quotes").select("id,quote_text,podcast_name,episode_name,approval_status").in_("id", ids[i:i + 200]).execute().data or []:
+                quotes[q["id"]] = q
+        speakers = []
+        for d in made:
+            m = d.get("metadata") or {}; b = m.get("before") or {}; a = m.get("after") or {}; q = quotes.get(d["quote_id"]) or {}
+            speakers.append({"id": d["id"], "at": d["created_at"], "quote_id": d["quote_id"], "quote_text": q.get("quote_text"),
+                             "podcast_name": q.get("podcast_name"), "episode_name": q.get("episode_name"), "approval_status": q.get("approval_status"),
+                             "was": b.get("speaker_name"), "now": a.get("speaker_name"), "title": a.get("speaker_title"), "company": a.get("speaker_company"),
+                             "guest_id": a.get("guest_id"), "created_person": bool(m.get("created_person")), "rule": m.get("rule"), "undone": d["id"] in undone})
+        threads, migration = [], True
+        try:
+            rows = supabase.table("thread_match_suggestions").select("id,question_id,quote_id,test_quote_id,fit_score,reason,status,auto_accepted_at") \
+                .gte("auto_accepted_at", since).order("auto_accepted_at", desc=True).limit(500).execute().data or []
+        except Exception:
+            rows, migration = [], False
+        if rows:
+            qs = {q["id"]: q["question_text"] for q in supabase.table("conversation_questions").select("id,question_text").in_("id", list({r["question_id"] for r in rows})).execute().data or []}
+            pub_ids = [r["quote_id"] for r in rows if r.get("quote_id")]; st_ids = [r["test_quote_id"] for r in rows if r.get("test_quote_id")]
+            pub = {r["id"]: r for r in (supabase.table("reader_perspectives_v1").select("id,text,speaker_name").in_("id", pub_ids).execute().data or [])} if pub_ids else {}
+            st = {r["id"]: r for r in (supabase.table("test_quotes").select("id,quote_text,speaker_name").in_("id", st_ids).execute().data or [])} if st_ids else {}
+            for r in rows:
+                src = pub.get(r.get("quote_id")) or st.get(r.get("test_quote_id")) or {}
+                threads.append({"id": r["id"], "at": r["auto_accepted_at"], "question_text": qs.get(r["question_id"]), "fit_score": r["fit_score"], "reason": r["reason"],
+                                "quote_text": src.get("text") or src.get("quote_text"), "speaker_name": src.get("speaker_name"),
+                                "published": bool(r.get("quote_id")), "undone": r["status"] == "dismissed"})
+        return {"success": True, "speakers": speakers, "threads": threads, "thread_auto_accept_ready": migration}
+
+    @web_app.post("/autopilot/undo")
+    async def autopilot_undo_endpoint(req: AutopilotUndoRequest, admin=Depends(require_admin)):
+        """Take back automatic changes. A speaker goes back to what the pipeline wrote, and the autopilot will not link that
+        quote again; a thread placement comes out of the thread and its suggestion is dismissed."""
+        supabase = service_client()
+        if req.kind not in {"speaker", "thread"} or not req.ids or len(req.ids) > 300:
+            raise HTTPException(status_code=422, detail="Send kind speaker or thread and 1 to 300 ids")
+        done, failed = [], []
+        for item_id in req.ids:
+            try:
+                if req.kind == "speaker":
+                    d = (supabase.table("curation_decisions").select("id,quote_id,metadata").eq("id", item_id).limit(1).execute().data or [None])[0]
+                    if not d or (d.get("metadata") or {}).get("surface") != "speaker_autopilot":
+                        failed.append({"id": item_id, "reason": "Not an automatic speaker link"}); continue
+                    b, a = d["metadata"].get("before") or {}, d["metadata"].get("after") or {}
+                    row = (supabase.table("test_quotes").select("*").eq("id", d["quote_id"]).limit(1).execute().data or [None])[0]
+                    if not row or row.get("guest_id") != a.get("guest_id"):
+                        failed.append({"id": item_id, "reason": "The speaker was changed since"}); continue
+                    if row.get("approval_status") != "pending":
+                        failed.append({"id": item_id, "reason": "Already reviewed; fix the speaker with Edit"}); continue
+                    resolution = dict(b.get("directory_resolution") or {}); resolution["autopilot_declined"] = True
+                    restore = {k: b.get(k) for k in ("speaker_name", "guest_id", "speaker_title", "speaker_company", "speaker_linkedin")}
+                    restore.update({"directory_resolution": resolution, "updated_at": utcnow_iso()})
+                    supabase.table("test_quotes").update(restore).eq("id", row["id"]).execute()
+                    _log_decision(supabase, admin, row, {**row, **restore}, "edit", reason_detail="Undo speaker autopilot",
+                                  extra={"surface": "autopilot_undo", "undoes": item_id})
+                else:
+                    m = (supabase.table("thread_match_suggestions").select("id,quote_id,test_quote_id,status,auto_accepted_at").eq("id", item_id).limit(1).execute().data or [None])[0]
+                    if not m or not m.get("auto_accepted_at") or m["status"] != "accepted":
+                        failed.append({"id": item_id, "reason": "Not an automatic placement"}); continue
+                    if m.get("quote_id"):
+                        supabase.table("conversation_take_links").delete().eq("source_match_id", item_id).execute()
+                    else:
+                        t = (supabase.table("test_quotes").select("approval_status").eq("id", m["test_quote_id"]).limit(1).execute().data or [{}])[0]
+                        if t.get("approval_status") != "approved":
+                            failed.append({"id": item_id, "reason": "Already published; remove it on the thread's page"}); continue
+                        supabase.table("test_quotes").update({"mapping_review_status": "unreviewed", "mapping_reviewed_by": None, "mapping_reviewed_at": None,
+                                                              "updated_at": utcnow_iso()}).eq("id", m["test_quote_id"]).execute()
+                    supabase.table("thread_match_suggestions").update({"status": "dismissed", "reviewed_by": admin["id"], "reviewed_at": utcnow_iso()}).eq("id", item_id).execute()
+                    print(f"AUDIT thread_auto_accept_undone match={item_id} by={admin['id']}")
+                done.append(item_id)
+            except Exception as exc:
+                failed.append({"id": item_id, "reason": str(exc)[:200]})
+        return {"success": True, "done": done, "failed": failed}
 
     @web_app.post("/thread-discovery")
     async def thread_discovery_endpoint(admin=Depends(require_admin)):

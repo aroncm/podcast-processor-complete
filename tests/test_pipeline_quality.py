@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from modal_app.full_processor import (
     is_fragment, is_ready, review_queue_order, speaker_group_key, episode_speaker_groups, sample_moment, clean_roster,
     clean_backlog_scores, build_backlog_score_prompt, roster_person_fields, review_queue_item,
+    speaker_autopilot_plan, is_full_speaker_name, screen_of, EDITOR_SCREEN_VERSION, keeps_pipeline_name,
     delete_account_data,
     ACCOUNT_OWNED_TABLES,
     THREAD_MATCH_SCHEMA,
@@ -1475,6 +1476,44 @@ class EpisodeRosterTests(unittest.TestCase):
         self.assertEqual((f["guest_id"], f["speaker_name"]), ("ari", "Ari Paparo"))
         self.assertEqual(f["directory_resolution"]["speaker_source"], "episode_roster")
         self.assertEqual(f["directory_resolution"]["category_status"], "matched")
+
+
+class SpeakerAutopilotTests(unittest.TestCase):
+    def test_full_names_settle_and_everything_else_waits(self):
+        people = [{"id": "ari", "name": "Ari Paparo", "title": "CEO", "company": "Marketecture"}]
+        rows = [_row(id="1", speaker_name="Ari Paparo", guest_id=None), _row(id="2", speaker_name="ari  paparo", guest_id=None),
+                _row(id="3", speaker_name="Joe Zappa", speaker_title="Editor", speaker_company="Marketecture", guest_id=None),
+                _row(id="4", speaker_name="Eric", guest_id=None), _row(id="5", speaker_name="Host", guest_id=None),
+                _row(id="6", speaker_name="New Person", speaker_title="", speaker_company="", guest_id=None),
+                _row(id="7", speaker_name="Ari Paparo", guest_id="ari"),
+                _row(id="8", speaker_name="Ari Paparo", guest_id=None, directory_resolution={"autopilot_declined": True})]
+        settled, unsettled = speaker_autopilot_plan(rows, people)
+        by_rule = {s["rule"]: sorted(r["id"] for r in s["rows"]) for s in settled}
+        self.assertEqual(by_rule["directory_name"], ["1", "2"])
+        self.assertEqual(by_rule["new_person"], ["3"])
+        self.assertEqual(sorted(r["id"] for r in unsettled), ["4", "5", "6"], "first names, placeholders and new people without a title wait")
+
+    def test_roster_answer_applies_only_when_it_keeps_the_pipeline_name(self):
+        rows = [_row(speaker_name="Khurrum Malik", guest_id=None)]
+        sure = {"name": "Khurrum  Malik", "title": "VP", "company": "Walmart Connect", "confidence": "high", "guest_id": None}
+        self.assertTrue(keeps_pipeline_name(sure, rows))
+        self.assertFalse(keeps_pipeline_name({**sure, "confidence": "medium"}, rows))
+        self.assertFalse(keeps_pipeline_name({**sure, "name": "Eric Franchi"}, rows), "a different name is a proposal, never a write")
+        self.assertFalse(keeps_pipeline_name({**sure, "title": ""}, rows))
+        self.assertFalse(keeps_pipeline_name({**sure, "name": "Eric"}, [_row(speaker_name="Eric", guest_id=None)]), "a first name is never kept")
+
+    def test_full_name_rule(self):
+        self.assertTrue(is_full_speaker_name("Joe Zappa"))
+        for name in ("Eric", "Host", "Speaker 2", "guest a", "", "Unknown Speaker"):
+            self.assertFalse(is_full_speaker_name(name), name)
+
+    def test_roster_link_clears_the_autopilot_proposal(self):
+        f = roster_person_fields({"id": "ari", "name": "Ari Paparo"}, {"directory_resolution": {"autopilot_proposal": {"name": "Ari Paparo"}}})
+        self.assertNotIn("autopilot_proposal", f["directory_resolution"])
+
+    def test_screen_of_ignores_other_versions(self):
+        self.assertIsNone(screen_of({"analysis_review_flags": {"editor_screen": {"version": "old"}}}))
+        self.assertTrue(screen_of({"analysis_review_flags": {"editor_screen": {"version": EDITOR_SCREEN_VERSION, "pitch": True}}})["pitch"])
 
 
 class BacklogScoreTests(unittest.TestCase):
