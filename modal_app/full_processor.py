@@ -12634,6 +12634,9 @@ def fastapi_app():
         reason_code: str | None = None
         surface: str | None = None
 
+    class BulkUndoRequest(BaseModel):
+        decision_ids: list[str]
+
     class SpokenWordsRequest(BaseModel):
         quote_id: str
 
@@ -12797,7 +12800,7 @@ def fastapi_app():
             raise HTTPException(status_code=422, detail="Send between 1 and 300 quotes")
         supabase = service_client()
         rows = {r["id"]: r for r in (supabase.table("test_quotes").select("*").in_("id", req.quote_ids).execute().data or [])}
-        done, failed = [], []
+        done, failed, decision_ids = [], [], []
         for qid in req.quote_ids:
             before = rows.get(qid)
             if not before or before.get("approval_status") != "pending":
@@ -12811,9 +12814,33 @@ def fastapi_app():
                 updates = {"approval_status": "rejected", "rejection_reason": REJECT_REASONS[req.reason_code]}
             updates["updated_at"] = utcnow_iso()
             supabase.table("test_quotes").update(updates).eq("id", qid).eq("approval_status", "pending").execute()
-            _log_decision(supabase, admin, before, {**before, **updates}, req.action, reason_code=req.reason_code,
-                          reason_detail=REJECT_REASONS.get(req.reason_code or ""), extra={"surface": req.surface if req.surface == "episode_review" else "backlog_bulk"})
+            logged = _log_decision(supabase, admin, before, {**before, **updates}, req.action, reason_code=req.reason_code,
+                                   reason_detail=REJECT_REASONS.get(req.reason_code or ""), extra={"surface": req.surface if req.surface == "episode_review" else "backlog_bulk"})
             done.append(qid)
+            decision_ids.append((logged.data or [{}])[0].get("id"))
+        return {"success": True, "done": done, "failed": failed, "decision_ids": [d for d in decision_ids if d]}
+
+    @web_app.post("/review-queue/bulk-undo")
+    async def review_queue_bulk_undo_endpoint(req: BulkUndoRequest, admin=Depends(require_admin)):
+        """Put a bulk approval or rejection back to pending (Oct 28: 13 quotes approved by accident). Only quotes still in
+        the state that decision left them, not yet mapped or published, are restored; each restore is logged as an undo."""
+        if not req.decision_ids or len(req.decision_ids) > 300:
+            raise HTTPException(status_code=422, detail="Send between 1 and 300 decisions")
+        supabase = service_client()
+        done, failed = [], []
+        for did in req.decision_ids:
+            d = (supabase.table("curation_decisions").select("id,quote_id,decision,metadata").eq("id", did).limit(1).execute().data or [None])[0]
+            if not d or d["decision"] not in {"approve", "reject"} or (d.get("metadata") or {}).get("surface") not in {"backlog_bulk", "episode_review"}:
+                failed.append({"id": did, "reason": "Not a bulk decision"}); continue
+            row = (supabase.table("test_quotes").select("*").eq("id", d["quote_id"]).limit(1).execute().data or [None])[0]
+            expected = "approved" if d["decision"] == "approve" else "rejected"
+            if not row or row.get("approval_status") != expected or row.get("mapping_review_status") == "approved":
+                failed.append({"id": did, "reason": "Changed since, or already placed in a thread"}); continue
+            updates = {"approval_status": "pending", "rejection_reason": None, "updated_at": utcnow_iso()}
+            supabase.table("test_quotes").update(updates).eq("id", row["id"]).eq("approval_status", expected).execute()
+            _log_decision(supabase, admin, row, {**row, **updates}, "undo", reason_detail="Undo bulk decision",
+                          extra={"surface": "bulk_undo", "undoes": did})
+            done.append(row["id"])
         return {"success": True, "done": done, "failed": failed}
 
     @web_app.post("/review-queue/score")
