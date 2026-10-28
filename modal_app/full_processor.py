@@ -6430,7 +6430,6 @@ def suggest_theme_companies(theme_id: str, job_id: str = None):
 # done in Threads now. These helpers let an editor clear the pending backlog quote by quote, fix speakers once per
 # episode, and set aside fragments, without bypassing the take checks in missing_take_verification_fields.
 FRAGMENT_WORDS = 15
-READY_MIN_QUALITY = 0.9
 BACKLOG_SCORE_PROMPT_VERSION = "backlog-score-v1"
 ROSTER_PROMPT_VERSION = "episode-roster-v1"
 REJECT_REASONS = {"fragment": "Fragment", "off_topic": "Off-topic", "duplicate": "Duplicate",
@@ -6465,10 +6464,9 @@ def speaker_linked(row):
 
 
 def is_ready(row):
-    """Linked speaker, verified timing, a top score and not a fragment: safe to approve from a skim list."""
-    q = (row or {}).get("quality_score")
-    return (speaker_linked(row) and timing_verified(row) and isinstance(q, (int, float)) and q >= READY_MIN_QUALITY
-            and not is_fragment(row) and not missing_take_verification_fields(row))
+    """Linked speaker, verified video timing and not a fragment: safe to approve from the Ready list, which shows them
+    highest score first. Craig (Oct 28): every such quote belongs there, not only those scoring 0.90 or more."""
+    return speaker_linked(row) and timing_verified(row) and not is_fragment(row) and not missing_take_verification_fields(row)
 
 
 DUPLICATE_OVERLAP = 0.6   # share of the shorter quote's five-word phrases that also appear in the other

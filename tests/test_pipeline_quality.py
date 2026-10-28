@@ -1437,8 +1437,8 @@ class BacklogTriageTests(unittest.TestCase):
         self.assertTrue(is_ready(_row()))
         self.assertFalse(is_ready(_row(guest_id=None)), "an unlinked speaker is not ready")
         self.assertFalse(is_ready(_row(youtube_alignment_status="legacy_unverified")), "unverified timing is not ready")
-        self.assertFalse(is_ready(_row(quality_score=0.89)))
-        self.assertFalse(is_ready(_row(quality_score=None)))
+        self.assertTrue(is_ready(_row(quality_score=0.5)), "every verified quote is listed; the score only orders the list")
+        self.assertFalse(is_ready(_row(youtube_id=None, youtube_alignment_status=None)), "the Ready list needs verified video timing")
         item = review_queue_item(_row(guest_id=None))
         self.assertIn("speaker directory match", item["blockers"])
 
