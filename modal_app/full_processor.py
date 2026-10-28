@@ -7053,7 +7053,7 @@ def find_spoken_words(client, quote_text, captions, expected_start, expected_end
         user_prompt=(f"PROMPT VERSION: {SPOKEN_WORDS_VERSION}\nA PARAPHRASED QUOTE OF THE POINT:\n{quote_text}\n\nTRANSCRIPT CANDIDATES:\n" + "\n\n".join(blocks) +
                      "\n\nIf one candidate contains the speaker making this same point, give its segment range (one complete thought, "
                      "20 to 90 words, starting and ending on a full sentence) and the cleaned spoken words. Otherwise found=false."),
-        schema_name="spoken_words", schema=SPOKEN_WORDS_SCHEMA, reasoning_effort="medium", max_output_tokens=2000)
+        schema_name="spoken_words", schema=SPOKEN_WORDS_SCHEMA, reasoning_effort="medium", max_output_tokens=6000)
     i = result.get("candidate_id", -1)
     if not result.get("found") or not 0 <= i < len(candidates):
         return {"found": False, "reason": str(result.get("reason") or "")[:300]}
@@ -7102,7 +7102,7 @@ def propose_spoken_words(quote_ids: list, compressed_caption_bundle: bytes, bund
         try:
             found = find_spoken_words(client, row.get("quote_text") or "", captions, start, end)
         except Exception as exc:
-            print("spoken words failed", row["id"], exc); return "error"
+            print("spoken words failed", row["id"], exc); return f"error: {type(exc).__name__}: {str(exc)[:80]}"
         flags = dict(row.get("analysis_review_flags") or {})
         flags["spoken_words"] = {**found, "youtube_id": row["youtube_id"], "past_video_end": float(start) > captions[-1]["end"],
                                  "version": SPOKEN_WORDS_VERSION, "proposed_at": utcnow_iso()}
