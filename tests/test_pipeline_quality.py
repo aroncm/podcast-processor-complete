@@ -6,6 +6,7 @@ from modal_app.full_processor import (
     is_fragment, is_ready, review_queue_order, speaker_group_key, episode_speaker_groups, sample_moment, clean_roster,
     clean_backlog_scores, build_backlog_score_prompt, roster_person_fields, review_queue_item,
     speaker_autopilot_plan, is_full_speaker_name, screen_of, EDITOR_SCREEN_VERSION, keeps_pipeline_name,
+    spoken_words_are_verbatim,
     delete_account_data,
     ACCOUNT_OWNED_TABLES,
     THREAD_MATCH_SCHEMA,
@@ -1514,6 +1515,17 @@ class SpeakerAutopilotTests(unittest.TestCase):
     def test_screen_of_ignores_other_versions(self):
         self.assertIsNone(screen_of({"analysis_review_flags": {"editor_screen": {"version": "old"}}}))
         self.assertTrue(screen_of({"analysis_review_flags": {"editor_screen": {"version": EDITOR_SCREEN_VERSION, "pitch": True}}})["pitch"])
+
+
+class SpokenWordsTests(unittest.TestCase):
+    segs = [{"text": "Most people, um, most companies that come through my door,"}, {"text": "they are saying what they do and for whom. That is the first question."}]
+
+    def test_words_taken_from_the_captions_pass(self):
+        self.assertTrue(spoken_words_are_verbatim("Most companies that come through my door, they are saying what they do and for whom.", self.segs))
+
+    def test_added_or_reworded_words_fail(self):
+        self.assertFalse(spoken_words_are_verbatim("Most companies aren't answering the questions of how they're different and why it matters.", self.segs))
+        self.assertFalse(spoken_words_are_verbatim("Most companies that come through my door are saying what they sell and for whom.", self.segs))
 
 
 class BacklogScoreTests(unittest.TestCase):

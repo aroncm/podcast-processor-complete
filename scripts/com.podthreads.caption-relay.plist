@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- PodThreads caption relay (scripts/caption_relay.py). Install:
+     cp scripts/com.podthreads.caption-relay.plist ~/Library/LaunchAgents/
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.podthreads.caption-relay.plist
+     Runs at login and four times a day; a run missed while the Mac was asleep happens on wake. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.podthreads.caption-relay</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/craigaron/podcast-processor-new/podcast-processor-complete/venv/bin/python</string>
+    <string>/Users/craigaron/podcast-processor-new/podcast-processor-complete/scripts/caption_relay.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>MODAL_PROFILE</key><string>aron-personal</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/Users/craigaron/Library/Logs/podthreads-caption-relay.log</string>
+  <key>StandardErrorPath</key><string>/Users/craigaron/Library/Logs/podthreads-caption-relay.log</string>
+</dict>
+</plist>
