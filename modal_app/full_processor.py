@@ -12702,6 +12702,48 @@ def fastapi_app():
                                "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
         return {"success": True, "suggestions": rows, "placed": placed, "mapped": mapped}
 
+    @web_app.get("/library")
+    async def library_endpoint(admin=Depends(require_admin)):
+        """Everything approved: published perspectives with the threads they are in, and approved takes not yet published
+        with the thread they are mapped to. The editor searches and edits from one list."""
+        supabase = service_client()
+        pub = _select_all(lambda: supabase.table("reader_perspectives_v1").select(
+            "id,text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end,published_at")
+            .order("published_at", desc=True))
+        placements = _select_all(lambda: supabase.table("reader_placements_v1").select("quote_id,question_id"))
+        questions = {q["id"]: q["question_text"] for q in _select_all(lambda: supabase.table("conversation_questions").select("id,question_text"))}
+        threads_of = {}
+        for p in placements:
+            if questions.get(p["question_id"]):
+                threads_of.setdefault(p["quote_id"], []).append({"id": p["question_id"], "question": questions[p["question_id"]]})
+        promoted = {r["source_test_quote_id"] for r in _select_all(lambda: supabase.table("quotes").select("source_test_quote_id")
+                                                                     .not_.is_("source_test_quote_id", "null"))}
+        staged = [r for r in _select_all(lambda: supabase.table("test_quotes").select(
+            "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,"
+            "youtube_alignment_status,youtube_timestamp_start,youtube_timestamp_end,timestamp_start,timestamp_end,rss_timestamp_start,"
+            "rss_timestamp_end,audio_clip_url,episode_audio_url,mapping_review_status,proposed_question_text,updated_at")
+            .eq("approval_status", "approved").order("updated_at", desc=True)) if r["id"] not in promoted]
+        by_text = {" ".join(str(q).casefold().split()): qid for qid, q in questions.items()}
+        items = []
+        for r in pub:
+            items.append({**r, "kind": "published", "status": "published", "threads": threads_of.get(r["id"], []),
+                          "moment_verified": r.get("youtube_start") is not None, "audio": None,
+                          "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
+        for r in staged:
+            mapped = r.get("mapping_review_status") == "approved" and r.get("proposed_question_text")
+            qid = by_text.get(" ".join(str(r.get("proposed_question_text") or "").casefold().split())) if mapped else None
+            verified = r.get("youtube_alignment_status") in ("verified", "manual_verified")
+            start = r.get("youtube_timestamp_start") if verified else r.get("timestamp_start")
+            end = r.get("youtube_timestamp_end") if verified else r.get("timestamp_end")
+            items.append({"id": r["id"], "kind": "staged", "status": "mapped" if mapped else "approved", "text": r["quote_text"],
+                          "guest_id": r.get("guest_id"), "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
+                          "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_name"),
+                          "episode_date": str(r.get("date_published") or "")[:10] or None, "youtube_id": r.get("youtube_id"),
+                          "youtube_start": start, "youtube_end": end, "moment_verified": verified, "audio": episode_audio_moment(r),
+                          "threads": [{"id": qid, "question": r["proposed_question_text"]}] if mapped else [],
+                          "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
+        return {"success": True, "items": items}
+
     @web_app.post("/threads/{question_id}/edit")
     async def edit_thread_endpoint(question_id: str, req: ThreadEditRequest, admin=Depends(require_admin)):
         """Reword a published thread's question (Oct 28). The thread keeps its id and address. Takes mapped to it but not
