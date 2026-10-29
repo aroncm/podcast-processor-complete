@@ -4153,28 +4153,22 @@ def _segment_fields(raw):
     return getattr(raw, "text", ""), float(getattr(raw, "start", 0)), float(getattr(raw, "end", 0)), getattr(raw, "speaker", None)
 
 
-def voice_reference_clips(chunk_path, segments, limit=4):
-    """A 4 to 8 second clip of each of the first chunk's main voices, as data URLs, for labelling the rest of the episode
-    with the same names. Voices that never speak 4 seconds at a stretch are left out (and keep chunk-local labels)."""
+def voice_reference_clip(chunk_path, segments, speaker):
+    """A 4 to 8 second clip of one voice from a chunk, as a data URL, or None when it never speaks 4 seconds at a stretch."""
     import base64
     import subprocess
     import tempfile
-    talk = {}
-    for text, start, end, speaker in segments:
-        if speaker:
-            talk[speaker] = talk.get(speaker, 0) + (end - start)
-    names, refs, label_of = [], [], {}
-    for speaker in sorted(talk, key=lambda k: -talk[k])[:limit]:
-        best = max((x for x in segments if x[3] == speaker and x[2] - x[1] >= 4), key=lambda x: min(x[2] - x[1], 8), default=None)
-        if not best:
-            continue
-        with tempfile.NamedTemporaryFile(suffix=".wav") as clip:
-            subprocess.run(["ffmpeg", "-v", "error", "-ss", str(best[1]), "-t", str(min(8, best[2] - best[1])), "-i", chunk_path,
-                            "-ac", "1", "-ar", "16000", "-y", clip.name], check=True)
-            refs.append("data:audio/wav;base64," + base64.b64encode(open(clip.name, "rb").read()).decode())
-        label_of[speaker] = f"voice_{len(names) + 1}"
-        names.append(label_of[speaker])
-    return names, refs, label_of
+    best = max((x for x in segments if x[3] == speaker and x[2] - x[1] >= 4), key=lambda x: min(x[2] - x[1], 8), default=None)
+    if not best:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".wav") as clip:
+        subprocess.run(["ffmpeg", "-v", "error", "-ss", str(best[1]), "-t", str(min(8, best[2] - best[1])), "-i", chunk_path,
+                        "-ac", "1", "-ar", "16000", "-y", clip.name], check=True)
+        return "data:audio/wav;base64," + base64.b64encode(open(clip.name, "rb").read()).decode()
+
+
+MAX_EPISODE_VOICES = 4      # the most reference voices the diarizing model accepts
+NEW_VOICE_SECONDS = 20      # a voice must speak this long in a chunk to become an episode-wide voice
 
 
 def quote_voice(segments):
@@ -4259,28 +4253,46 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
             update_processing_job(supabase, job_id, "transcribing", progress={"transcript_chunk": done["n"], "transcript_chunks": len(chunk_paths)})
             return model, getattr(result, "text", "") or "", [_segment_fields(x) for x in (getattr(result, "segments", None) or [])]
 
-        results = [None] * len(chunk_paths)
-        results[0] = transcribe(0)
-        known, label_of = None, {}
-        if diarize and results[0][0] == DIARIZE_MODEL:
-            try:
-                names, refs, label_of = voice_reference_clips(chunk_paths[0], results[0][2])
-                known = (names, refs)
-            except Exception as exc:
-                print(f"⚠️ Voice reference clips failed; later chunks keep their own labels: {exc}")
+        # Rounds: the first chunk alone, then four at a time. After each round, every voice heard there that is not an
+        # episode voice yet (a guest who joins after the intro) gets a clip and a name for the rounds after it.
+        results, names, refs = [None] * len(chunk_paths), [], []
+        local_name = {}     # (chunk index, the model's label in that chunk) -> episode voice
+
+        def learn_voices(index):
+            model, _, segments = results[index]
+            if not diarize or model != DIARIZE_MODEL:
+                return
+            talk = {}
+            for _, start, end, speaker in segments:
+                if speaker and speaker not in names:
+                    talk[speaker] = talk.get(speaker, 0.0) + (end - start)
+            for speaker in sorted(talk, key=lambda k: -talk[k]):
+                if len(names) >= MAX_EPISODE_VOICES or talk[speaker] < NEW_VOICE_SECONDS:
+                    break
+                try:
+                    clip = voice_reference_clip(chunk_paths[index], segments, speaker)
+                except Exception as exc:
+                    print(f"⚠️ Voice clip failed: {exc}"); clip = None
+                if clip:
+                    names.append(f"voice_{len(names) + 1}"); refs.append(clip)
+                    local_name[(index, speaker)] = names[-1]
+
+        rounds = [[0]] + [list(range(i, min(i + 4, len(chunk_paths)))) for i in range(1, len(chunk_paths), 4)]
         with ThreadPoolExecutor(max_workers=4) as pool:
-            for index, result in zip(range(1, len(chunk_paths)), pool.map(lambda i: transcribe(i, known), range(1, len(chunk_paths)))):
-                results[index] = result
+            for chunk_round in rounds:
+                known = (list(names), list(refs)) if names else None
+                for index, result in zip(chunk_round, pool.map(lambda i: transcribe(i, known), chunk_round)):
+                    results[index] = result
+                for index in chunk_round:
+                    learn_voices(index)
 
         transcript_parts, absolute_segments, used_models = [], [], []
-        named = set(known[0]) if known else set()
+        named = set(names)
         for index, (model, text, segments) in enumerate(results):
             used_models.append(model)
             transcript_parts.append(text)
             for seg_text, start, end, speaker in segments:
-                speaker = str(speaker or "").strip()
-                if index == 0 and speaker in label_of:
-                    speaker = label_of[speaker]
+                speaker = local_name.get((index, str(speaker or "").strip()), str(speaker or "").strip())
                 label = speaker if speaker in named else (f"chunk-{index}:{speaker}" if speaker else None)
                 absolute_segments.append({
                     "id": len(absolute_segments), "text": seg_text.strip(),
@@ -4293,7 +4305,7 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
             "model": "+".join(dict.fromkeys(used_models)) or transcript_model,
             "diarization_requested": diarize,
             "diarization_complete": bool(absolute_segments) and all(segment.get("speaker_label") for segment in absolute_segments),
-            "episode_voices": known[0] if known else [],
+            "episode_voices": names,
         }
     finally:
         shutil.rmtree(chunk_dir, ignore_errors=True)
@@ -6688,12 +6700,15 @@ def episode_speaker_groups(rows):
         g = groups.setdefault(speaker_group_key(r), {"key": speaker_group_key(r), "speaker_label": r.get("speaker_label"),
                                                     "speaker_name": r.get("speaker_name"), "speaker_title": r.get("speaker_title"),
                                                     "speaker_company": r.get("speaker_company"), "guest_id": r.get("guest_id"),
-                                                    "count": 0, "needs_attention": False, "samples": [], "moments": []})
+                                                    "count": 0, "needs_attention": False, "samples": [], "moments": [], "quote_ids": []})
         g["count"] += 1
         g["needs_attention"] = g["needs_attention"] or speaker_needs_attention(r)
-        if len(g["samples"]) < 2:
+        # Every quote of the slot, so the editor can hear each one and untick any that is someone else: voice labels are
+        # usually right but not always (Oct 29 test: the same guest matched to a host in one run and not another).
+        if len(g["samples"]) < 20:
             g["samples"].append(str(r.get("quote_text") or "")[:240])
             g["moments"].append(sample_moment(r))
+            g.setdefault("quote_ids", []).append(r.get("id"))
     return sorted(groups.values(), key=lambda g: (-g["count"], g["key"]))
 
 
@@ -12992,6 +13007,7 @@ def fastapi_app():
         title: str | None = None
         company: str | None = None
         linkedin_url: str | None = None
+        quote_ids: list[str] | None = None    # only these quotes of the slot (the editor unticked the rest)
 
     class RosterApplyRequest(BaseModel):
         podcast_name: str
@@ -13256,7 +13272,7 @@ def fastapi_app():
                 # the directory is the one place a person's LinkedIn lives; every perspective reads it from there
                 supabase.table("guests").update({"linkedin_url": linkedin}).eq("id", person["id"]).execute()
                 person = {**person, "linkedin_url": linkedin}
-            for before in [r for r in items if speaker_group_key(r) == row.key]:
+            for before in [r for r in items if speaker_group_key(r) == row.key and (row.quote_ids is None or r["id"] in row.quote_ids)]:
                 updates = roster_person_fields(person, before)
                 updates["directory_resolution"]["speaker_resolved_by"] = admin["id"]
                 updates.update(editorial_gate_invalidations(before, updates))
