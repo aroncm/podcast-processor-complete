@@ -5663,6 +5663,15 @@ def thread_match_candidates(supabase, question_id):
     return candidates
 
 
+def thread_mapped_takes(supabase, theme_name, question_text, fields="id"):
+    """Approved takes mapped to this thread but not yet published. Publishing finds the thread by the theme name and
+    question wording stored on the take, so these are matched the same way (case and outer spaces ignored)."""
+    same = lambda a, b: str(a or "").strip().casefold() == str(b or "").strip().casefold()
+    rows = _select_all(lambda: supabase.table("test_quotes").select(f"{fields},proposed_theme_name,proposed_question_text")
+                       .eq("approval_status", "approved").eq("mapping_review_status", "approved"))
+    return [r for r in rows if same(r.get("proposed_theme_name"), theme_name) and same(r.get("proposed_question_text"), question_text)]
+
+
 @app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
 def find_thread_matches(question_id: str, job_id: str = None):
     """Suggest perspectives for one published thread. Suggestions are private until an editor accepts them."""
@@ -11295,6 +11304,13 @@ def fastapi_app():
     class ThreadPlacementRemoveRequest(BaseModel):
         quote_id: str
 
+    class ThreadEditRequest(BaseModel):
+        question_text: str
+        summary: str | None = None
+
+    class ThreadUnmapRequest(BaseModel):
+        test_quote_id: str
+
     class ThreadProposalAcceptRequest(BaseModel):
         theme_name: str | None = None
         theme_summary: str | None = None
@@ -12522,7 +12538,7 @@ def fastapi_app():
         return {"success": True, "themes": theme_rows,
                 "pending_discoveries": sum(1 for p in proposals if p["scope"] == "discover"),
                 "threads": [{
-            "question_id": q["id"], "question_text": q["question_text"], "theme_id": q["theme_id"],
+            "question_id": q["id"], "question_text": q["question_text"], "question_summary": q.get("summary"), "theme_id": q["theme_id"],
             "theme_name": themes[q["theme_id"]]["name"], "perspectives": count(links, q["id"]),
             "pending_suggestions": count(pending, q["id"]),
         } for q in sorted(questions, key=lambda q: (themes[q["theme_id"]]["name"].casefold(), q["question_text"].casefold()))]}
@@ -12576,7 +12592,69 @@ def fastapi_app():
                   .in_("id", placed_ids).execute().data or []) if placed_ids else []
         for r in placed:
             r.update({"kind": "published", "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id")), "moment_verified": r.get("youtube_start") is not None})
-        return {"success": True, "suggestions": rows, "placed": placed}
+        mapped = []
+        question = (supabase.table("conversation_questions").select("theme_id,question_text").eq("id", question_id).limit(1).execute().data or [None])[0]
+        theme = (supabase.table("conversation_themes").select("name").eq("id", question["theme_id"]).limit(1).execute().data or [None])[0] if question else None
+        if theme:
+            for r in thread_mapped_takes(supabase, theme["name"], question["question_text"],
+                                         "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published"):
+                mapped.append({"id": r["id"], "kind": "staged", "text": r["quote_text"], "guest_id": r.get("guest_id"), "speaker_name": r.get("speaker_name"),
+                               "speaker_title": r.get("speaker_title"), "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"),
+                               "episode_title": r.get("episode_name"), "episode_date": str(r.get("date_published") or "")[:10] or None,
+                               "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
+        return {"success": True, "suggestions": rows, "placed": placed, "mapped": mapped}
+
+    @web_app.post("/threads/{question_id}/edit")
+    async def edit_thread_endpoint(question_id: str, req: ThreadEditRequest, admin=Depends(require_admin)):
+        """Reword a published thread's question (Oct 28). The thread keeps its id and address. Takes mapped to it but not
+        yet published carry the new wording, because publishing finds the thread by its wording. Suggestions made for
+        the old wording, waiting or dismissed, are cleared so Find perspectives judges every take against the new one."""
+        clean = lambda v: " ".join(str(v or "").split())
+        text, summary = clean(req.question_text), clean(req.summary) or None
+        if len(text) < 10:
+            raise HTTPException(status_code=422, detail="Write the question in full")
+        supabase = service_client()
+        q = (supabase.table("conversation_questions").select("id,theme_id,question_text,summary").eq("id", question_id).limit(1).execute().data or [None])[0]
+        if not q:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        theme = supabase.table("conversation_themes").select("name").eq("id", q["theme_id"]).single().execute().data
+        reworded = text.casefold() != q["question_text"].strip().casefold()
+        if reworded and any(o["id"] != question_id and o["question_text"].strip().casefold() == text.casefold() for o in
+                            (supabase.table("conversation_questions").select("id,question_text").eq("theme_id", q["theme_id"]).execute().data or [])):
+            raise HTTPException(status_code=422, detail="Another thread in this theme already asks that question")
+        mapped = thread_mapped_takes(supabase, theme["name"], q["question_text"])
+        supabase.table("conversation_questions").update({"question_text": text, "summary": summary, "reviewed_by": admin["id"],
+                                                         "reviewed_at": utcnow_iso(), "updated_at": utcnow_iso()}).eq("id", question_id).execute()
+        for r in mapped:
+            _retry(lambda: supabase.table("test_quotes").update({"proposed_question_text": text, "proposed_question_summary": summary or text,
+                                                                 "updated_at": utcnow_iso()}).eq("id", r["id"]).execute())
+        cleared = 0
+        if reworded:
+            cleared = len(supabase.table("thread_match_suggestions").delete().eq("question_id", question_id)
+                          .in_("status", ["suggested", "dismissed"]).execute().data or [])
+        print(f"AUDIT thread_edited question={question_id} by={admin['id']} from={q['question_text']!r} to={text!r} "
+              f"summary_from={q.get('summary')!r} carried={len(mapped)} cleared={cleared}")
+        return {"success": True, "reworded": reworded, "carried": len(mapped), "cleared": cleared}
+
+    @web_app.post("/threads/{question_id}/unmap")
+    async def unmap_thread_take_endpoint(question_id: str, req: ThreadUnmapRequest, admin=Depends(require_admin)):
+        """Take an approved, unpublished take out of this thread. It stays approved, goes back to needing a thread, and
+        is not suggested for this one again."""
+        supabase = service_client()
+        q = (supabase.table("conversation_questions").select("theme_id,question_text").eq("id", question_id).limit(1).execute().data or [None])[0]
+        theme = (supabase.table("conversation_themes").select("name").eq("id", q["theme_id"]).limit(1).execute().data or [None])[0] if q else None
+        before = (supabase.table("test_quotes").select("*").eq("id", req.test_quote_id).limit(1).execute().data or [None])[0]
+        same = lambda a, b: str(a or "").strip().casefold() == str(b or "").strip().casefold()
+        if not (theme and before and before.get("approval_status") == "approved" and before.get("mapping_review_status") == "approved"
+                and same(before.get("proposed_theme_name"), theme["name"]) and same(before.get("proposed_question_text"), q["question_text"])):
+            raise HTTPException(status_code=422, detail="This take is not mapped to this thread, or it has been published")
+        updates = {"mapping_review_status": "unreviewed", "mapping_reviewed_by": None, "mapping_reviewed_at": None, "updated_at": utcnow_iso()}
+        supabase.table("test_quotes").update(updates).eq("id", req.test_quote_id).eq("mapping_review_status", "approved").execute()
+        supabase.table("thread_match_suggestions").update({"status": "dismissed", "reviewed_by": admin["id"], "reviewed_at": utcnow_iso()}) \
+            .eq("question_id", question_id).eq("test_quote_id", req.test_quote_id).execute()
+        _log_decision(supabase, admin, before, {**before, **updates}, "edit", reason_detail="Removed from thread",
+                      extra={"surface": "thread_unmap", "question_id": question_id, "question_text": q["question_text"]})
+        return {"success": True}
 
     @web_app.post("/thread-matches/{match_id}/accept")
     async def accept_thread_match_endpoint(match_id: str, admin=Depends(require_admin)):
