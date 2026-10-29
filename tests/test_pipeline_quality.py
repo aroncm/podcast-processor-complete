@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from modal_app.full_processor import (
     is_fragment, is_ready, review_queue_order, speaker_group_key, episode_speaker_groups, sample_moment, clean_roster,
     clean_backlog_scores, build_backlog_score_prompt, roster_person_fields, review_queue_item,
-    speaker_autopilot_plan, is_full_speaker_name, screen_of, EDITOR_SCREEN_VERSION, keeps_pipeline_name,
+    speaker_autopilot_plan, is_full_speaker_name, screen_of, EDITOR_SCREEN_VERSION, keeps_pipeline_name, similar_directory_person, person_for_proposal,
     spoken_words_are_verbatim,
     delete_account_data,
     ACCOUNT_OWNED_TABLES,
@@ -1493,6 +1493,17 @@ class SpeakerAutopilotTests(unittest.TestCase):
         self.assertEqual(by_rule["directory_name"], ["1", "2"])
         self.assertEqual(by_rule["new_person"], ["3"])
         self.assertEqual(sorted(r["id"] for r in unsettled), ["4", "5", "6"], "first names, placeholders and new people without a title wait")
+
+    def test_a_name_a_letter_or_two_off_a_directory_person_waits_for_the_editor(self):
+        people = [{"id": "myles", "name": "Myles Younger", "title": "Co-host", "company": "The AI Edge Podcast"}]
+        self.assertEqual(similar_directory_person("Miles Younger", people)["id"], "myles")
+        self.assertIsNone(similar_directory_person("Myles Younger", people), "the same name is a match, not a near miss")
+        self.assertIsNone(similar_directory_person("Mike Ditter", people))
+        rows = [_row(id="1", speaker_name="Miles Younger", speaker_title="Host", speaker_company="The AI Edge Podcast", guest_id=None)]
+        settled, unsettled = speaker_autopilot_plan(rows, people)
+        self.assertEqual((settled, [r["id"] for r in unsettled]), ([], ["1"]))
+        with self.assertRaises(ValueError):
+            person_for_proposal(None, list(people), {"name": "Miles Younger", "title": "Host", "company": "The AI Edge Podcast", "guest_id": None})
 
     def test_roster_answer_applies_only_when_it_keeps_the_pipeline_name(self):
         rows = [_row(speaker_name="Khurrum Malik", guest_id=None)]

@@ -6685,6 +6685,27 @@ def is_full_speaker_name(name):
     return n not in PLACEHOLDER_SPEAKERS and len(n.split()) >= 2 and not re.match(r"^(speaker|guest|host)\s*\w?\d*$", n)
 
 
+def name_edit_distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def similar_directory_person(name, people):
+    """A directory person whose name is one or two letters off this one (Oct 29: the autopilot added Miles Younger beside
+    Myles Younger). The autopilot never adds such a name; the editor decides whether it is the same person."""
+    n = normalize_directory_value(name)
+    for person in people:
+        other = normalize_directory_value(person.get("name"))
+        if other and other != n and abs(len(other) - len(n)) <= 2 and name_edit_distance(n, other) <= 2:
+            return person
+    return None
+
+
 def speaker_autopilot_plan(rows, people):
     """Pending quotes with no directory link, by episode speaker slot. A slot whose quotes all carry the same full name
     is settled: linked to the directory person of that name, or added with the title and company the quotes carry.
@@ -6705,7 +6726,7 @@ def speaker_autopilot_plan(rows, people):
             person = by_name.get(normalize_directory_value(name))
             if person:
                 settled.append({"rows": items, "person": person, "rule": "directory_name"}); continue
-            if common("speaker_title") and common("speaker_company"):
+            if common("speaker_title") and common("speaker_company") and not similar_directory_person(name, people):
                 settled.append({"rows": items, "new": (name, common("speaker_title"), common("speaker_company")), "rule": "new_person"}); continue
         unsettled.extend(items)
     return settled, unsettled
@@ -6736,6 +6757,10 @@ def person_for_proposal(supabase, people, proposal):
     """(directory person, newly added) for a roster answer, adding the person once when they are new."""
     with _PERSON_ADD_LOCK:
         known = {normalize_directory_value(x.get("name")) for x in people}
+        if not proposal.get("guest_id") and normalize_directory_value(proposal.get("name")) not in known:
+            similar = similar_directory_person(proposal.get("name"), people)
+            if similar:
+                raise ValueError(f"close to {similar['name']} already in the directory; left for the editor")
         person = next((x for x in people if x["id"] == proposal["guest_id"]), None) if proposal.get("guest_id") else \
             ensure_directory_person(supabase, proposal["name"], proposal["title"], proposal["company"])
         created = bool(person) and normalize_directory_value(person.get("name")) not in known
@@ -6760,6 +6785,11 @@ def propose_episode_speakers(supabase, client, podcast, episode, rows, people, r
         user_prompt=build_roster_prompt(podcast, episode, description, groups, hint),
         schema_name="episode_roster", schema=ROSTER_SCHEMA, reasoning_effort="low", max_output_tokens=3000)
     proposals = {p["key"]: p for p in clean_roster(result, groups, people)}
+    for p in proposals.values():
+        similar = None if p.get("guest_id") else similar_directory_person(p.get("name"), people)
+        if similar:
+            p["evidence"] = (f"Same person as {similar['name']} ({', '.join(x for x in (similar.get('title'), similar.get('company')) if x)}) in the directory? "
+                             f"The spelling differs, so pick them from the directory if so. " + str(p.get("evidence") or ""))[:400]
     linked, added, written, people_by_key = 0, 0, 0, {}
     for g in groups:
         p = proposals.get(g["key"]) or {}
