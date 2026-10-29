@@ -6564,9 +6564,16 @@ def clear_episode_video(supabase, podcast_name, episode_name, youtube_id, log):
 
 
 def speaker_group_key(row):
-    """One speaker slot in an episode: the diarization label when there is one, else the name as written."""
+    """One speaker slot in an episode: the diarization label when there is one, else the name as written. Quotes with no
+    name ("Unknown Speaker") are each their own slot: sharing a placeholder says nothing about sharing a voice (Oct 29,
+    one Apply would have put one person on five unknown quotes)."""
     label = normalize_directory_value((row or {}).get("speaker_label"))
-    return f"label:{label}" if label else f"name:{normalize_directory_value((row or {}).get('speaker_name'))}"
+    if label:
+        return f"label:{label}"
+    name = normalize_directory_value((row or {}).get("speaker_name"))
+    if name in PLACEHOLDER_SPEAKERS or re.match(r"^(speaker|guest|host)\s*\d*$", name or ""):
+        return f"quote:{(row or {}).get('id')}"
+    return f"name:{name}"
 
 
 def speaker_needs_attention(row):

@@ -1611,3 +1611,12 @@ def test_an_episode_without_a_video_offers_the_podcasts_audio_at_the_quote():
     assert episode_audio_moment(row) == {"url": "https://media.example/ep.mp3", "start": 1584.0, "end": 1608.0}
     assert episode_audio_moment({**row, "youtube_id": "abc"}) is None
     assert episode_audio_moment({**row, "audio_clip_url": None}) is None
+
+
+def test_unknown_speakers_are_never_one_slot():
+    from modal_app.full_processor import speaker_group_key, episode_speaker_groups
+    rows = [{"id": f"q{i}", "speaker_name": "Unknown Speaker", "quote_text": "x"} for i in range(5)]
+    assert len(episode_speaker_groups(rows)) == 5
+    assert speaker_group_key({"id": "a", "speaker_name": "Speaker 2"}) == "quote:a"
+    assert speaker_group_key({"id": "a", "speaker_name": "Gareth Glaser"}) == speaker_group_key({"id": "b", "speaker_name": "gareth glaser"})
+    assert speaker_group_key({"id": "a", "speaker_name": "Unknown", "speaker_label": "SPEAKER_01"}) == "label:speaker_01"
