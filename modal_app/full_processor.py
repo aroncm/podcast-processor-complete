@@ -13142,7 +13142,7 @@ def fastapi_app():
         ids = list({d["quote_id"] for d in made})
         quotes = {}
         for i in range(0, len(ids), 200):
-            for q in supabase.table("test_quotes").select("id,quote_text,podcast_name,episode_name,approval_status").in_("id", ids[i:i + 200]).execute().data or []:
+            for q in supabase.table("test_quotes").select("id,quote_text,podcast_name,episode_name,approval_status,guest_id,speaker_name").in_("id", ids[i:i + 200]).execute().data or []:
                 quotes[q["id"]] = q
         speakers = []
         for d in made:
@@ -13150,7 +13150,9 @@ def fastapi_app():
             speakers.append({"id": d["id"], "at": d["created_at"], "quote_id": d["quote_id"], "quote_text": q.get("quote_text"),
                              "podcast_name": q.get("podcast_name"), "episode_name": q.get("episode_name"), "approval_status": q.get("approval_status"),
                              "was": b.get("speaker_name"), "now": a.get("speaker_name"), "title": a.get("speaker_title"), "company": a.get("speaker_company"),
-                             "guest_id": a.get("guest_id"), "created_person": bool(m.get("created_person")), "rule": m.get("rule"), "undone": d["id"] in undone})
+                             "guest_id": a.get("guest_id"), "created_person": bool(m.get("created_person")), "rule": m.get("rule"), "undone": d["id"] in undone,
+                             # the editor has since put someone else on the quote: the logged link is history, not the quote's speaker
+                             "corrected_to": q.get("speaker_name") if q and q.get("guest_id") != a.get("guest_id") else None})
         threads, migration = [], True
         try:
             rows = supabase.table("thread_match_suggestions").select("id,question_id,quote_id,test_quote_id,fit_score,reason,status,auto_accepted_at") \
