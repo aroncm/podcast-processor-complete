@@ -1620,3 +1620,31 @@ def test_unknown_speakers_are_never_one_slot():
     assert speaker_group_key({"id": "a", "speaker_name": "Speaker 2"}) == "quote:a"
     assert speaker_group_key({"id": "a", "speaker_name": "Gareth Glaser"}) == speaker_group_key({"id": "b", "speaker_name": "gareth glaser"})
     assert speaker_group_key({"id": "a", "speaker_name": "Unknown", "speaker_label": "SPEAKER_01"}) == "label:speaker_01"
+
+
+def test_a_reprocessed_episodes_reworded_passage_is_a_near_copy():
+    from modal_app.full_processor import is_near_copy, duplicate_groups
+    a = {"id": "a", "quote_text": "The best CEOs in 2026 are going to organize teams, pricing, and messaging around measurable outcomes, not features.",
+         "rss_timestamp_start": 1402, "podcast_name": "Open Market", "episode_name": "e"}
+    b = {"id": "b", "quote_text": "The best CEOs in 2026 are going to organize their teams, their pricing and their messaging around measurable outcomes rather than features.",
+         "rss_timestamp_start": 1425, "podcast_name": "Open Market", "episode_name": "e"}
+    far = {**b, "id": "c", "rss_timestamp_start": 1900}
+    other = {"id": "d", "quote_text": "No war hero has ever gone to the troops and said our enemy is great.", "rss_timestamp_start": 1410,
+             "podcast_name": "Open Market", "episode_name": "e"}
+    assert is_near_copy(a, b)
+    assert not is_near_copy(a, far)       # the same words twenty minutes later are a callback, not a copy
+    assert not is_near_copy(a, other)
+    assert [sorted(r["id"] for r in g) for g in duplicate_groups([a, b, other])] == [["a", "b"]]
+
+
+def test_timing_predictions_use_the_nearest_verified_shift_and_never_verify():
+    from modal_app.full_processor import episode_timing_predictions
+    rows = [
+        {"id": "v1", "youtube_id": "x", "youtube_alignment_status": "verified", "youtube_timestamp_start": 130, "rss_timestamp_start": 100},
+        {"id": "v2", "youtube_id": "x", "youtube_alignment_status": "manual_verified", "youtube_timestamp_start": 1040, "rss_timestamp_start": 1000},
+        {"id": "u1", "youtube_id": "x", "youtube_alignment_status": "failed", "rss_timestamp_start": 200},
+        {"id": "u2", "youtube_id": "x", "youtube_alignment_status": "pending", "rss_timestamp_start": 900},
+    ]
+    p = episode_timing_predictions(rows)
+    assert p == {"u1": 230.0, "u2": 940.0}
+    assert episode_timing_predictions([r for r in rows if r["id"].startswith("u")]) == {}

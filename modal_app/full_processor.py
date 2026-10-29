@@ -4251,7 +4251,9 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
                     ),
                 })
 
-            if max_end <= 0:
+            # Advance by the chunk's real length. Oct 29: advancing by the last word's end put every chunk that ended in
+            # music or silence a few seconds early, and the error grew through the episode.
+            try:
                 probe = subprocess.run(
                     [
                         "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -4261,8 +4263,10 @@ def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
                     text=True,
                     check=True,
                 )
-                max_end = float(probe.stdout.strip())
-            absolute_offset += max_end
+                chunk_length = float(probe.stdout.strip())
+            except Exception:
+                chunk_length = max_end
+            absolute_offset += max(chunk_length, max_end)
 
         return {
             "text": "\n".join(transcript_parts).strip(),
@@ -6451,7 +6455,8 @@ REVIEW_QUEUE_FIELDS = (
     "id,quote_text,speaker_name,speaker_label,speaker_title,speaker_company,speaker_linkedin,guest_id,podcast_name,"
     "episode_name,episode_guid,date_published,youtube_id,youtube_alignment_status,youtube_timestamp_start,"
     "youtube_timestamp_end,yt_timestamp_confidence,rss_timestamp_start,rss_timestamp_end,timestamp_start,timestamp_end,"
-    "quality_score,ranking_reason,quote_word_count,approval_status,created_at,directory_resolution,audio_clip_url,episode_audio_url"
+    "quality_score,ranking_reason,quote_word_count,approval_status,created_at,directory_resolution,audio_clip_url,episode_audio_url,"
+    "youtube_alignment_details"
 )
 
 
@@ -6486,6 +6491,33 @@ def _quote_shingles(text):
     return {" ".join(words[i:i + 5]) for i in range(max(1, len(words) - 4))} if words else set()
 
 
+QUALITY_FLOOR = float(os.environ.get("PODTHREADS_QUALITY_FLOOR", "0.5"))
+NEAR_COPY_SECONDS = 30      # an episode processed twice yields the same passage a few seconds apart, reworded
+NEAR_COPY_WORDS = 0.75      # share of the shorter quote's meaningful words that also appear in the other
+_FILLER = {"the", "a", "an", "and", "to", "of", "is", "it", "that", "you", "in", "i", "we", "they", "are", "be", "this", "for",
+           "on", "not", "just", "so", "but", "your", "our", "my", "like", "its", "it's", "was", "with", "or", "what", "if"}
+
+
+def _content_words(text):
+    return set(re.findall(r"[a-z0-9']+", str(text or "").lower())) - _FILLER
+
+
+def _audio_start(r):
+    return next((float(r[k]) for k in ("rss_timestamp_start", "timestamp_start") if (r or {}).get(k) is not None), None)
+
+
+def is_near_copy(a, b):
+    """The same passage of the same episode taken twice: the same phrasing, or (Oct 29, after re-processed episodes
+    left reworded pairs like Open Market's "best CEOs in 2026") the same moment in mostly the same words."""
+    sa, sb = _quote_shingles(a.get("quote_text")), _quote_shingles(b.get("quote_text"))
+    if sa and sb and len(sa & sb) / min(len(sa), len(sb)) >= DUPLICATE_OVERLAP:
+        return True
+    ta, tb = _audio_start(a), _audio_start(b)
+    wa, wb = _content_words(a.get("quote_text")), _content_words(b.get("quote_text"))
+    return ta is not None and tb is not None and abs(ta - tb) <= NEAR_COPY_SECONDS and bool(wa and wb) \
+        and len(wa & wb) / min(len(wa), len(wb)) >= NEAR_COPY_WORDS
+
+
 def duplicate_groups(rows):
     """Quotes from the same episode that say the same thing: exact copies, or a shorter quote whose phrasing is mostly
     inside a longer one. Returns groups of 2+ rows, each with the copy to keep first: one already approved or
@@ -6499,11 +6531,10 @@ def duplicate_groups(rows):
             parent[x] = parent.get(parent[x], parent[x]); x = parent[x]
         return x
     for rs in by_ep.values():
-        sh = [(r["id"], _quote_shingles(r.get("quote_text"))) for r in rs]
-        for i in range(len(sh)):
-            for j in range(i + 1, len(sh)):
-                a, sa = sh[i]; b, sb = sh[j]
-                if sa and sb and len(sa & sb) / min(len(sa), len(sb)) >= DUPLICATE_OVERLAP:
+        for i in range(len(rs)):
+            for j in range(i + 1, len(rs)):
+                if is_near_copy(rs[i], rs[j]):
+                    a, b = rs[i]["id"], rs[j]["id"]
                     parent[find(a)] = find(b); linked.update((a, b))
     groups = {}
     for r in rows:
@@ -6533,7 +6564,49 @@ def review_queue_item(row):
     return {**{k: row.get(k) for k in REVIEW_QUEUE_FIELDS.split(",")},
             "word_count": quote_words(row.get("quote_text")), "fragment": is_fragment(row),
             "timing_verified": timing_verified(row), "speaker_linked": speaker_linked(row),
-            "blockers": missing_take_verification_fields(row), "ready": is_ready(row), "audio": episode_audio_moment(row)}
+            "blockers": missing_take_verification_fields(row), "ready": is_ready(row), "audio": episode_audio_moment(row),
+            "predicted_start": (row.get("youtube_alignment_details") or {}).get("predicted_start") if not timing_verified(row) else None}
+
+
+VERIFIED_STATUSES = ("verified", "manual_verified")
+
+
+def episode_timing_predictions(rows):
+    """Where each unverified quote should be in the episode's video: its podcast-audio time plus the shift of the nearest
+    verified quote. Only a prediction, where the editor's player opens. Oct 29 back-test: a median of 4 seconds off, and
+    only a quarter within 2 seconds even between two verified quotes that agree, because audio times mark the start of a
+    transcript segment rather than the quote's first word. So nothing is ever marked verified this way."""
+    anchors = sorted(((a, float(r["youtube_timestamp_start"]) - a) for r in rows
+                      if r.get("youtube_alignment_status") in VERIFIED_STATUSES and r.get("youtube_timestamp_start") is not None
+                      and (a := _audio_start(r)) is not None))
+    if not anchors:
+        return {}
+    out = {}
+    for r in rows:
+        a = _audio_start(r)
+        if r.get("youtube_id") and r.get("youtube_alignment_status") not in VERIFIED_STATUSES and a is not None:
+            out[r["id"]] = round(max(0.0, a + min(anchors, key=lambda x: abs(x[0] - a))[1]), 1)
+    return out
+
+
+def predict_episode_timing(supabase, podcast_name, episode_name):
+    """Store episode_timing_predictions on the episode's open quotes, where the review card's player reads it."""
+    rows = supabase.table("test_quotes").select(
+        "id,youtube_id,youtube_alignment_status,youtube_alignment_details,youtube_timestamp_start,rss_timestamp_start,timestamp_start") \
+        .eq("podcast_name", podcast_name).eq("episode_name", episode_name).in_("approval_status", ["pending", "approved"]).execute().data or []
+    by_video, written = {}, 0
+    for r in rows:
+        if r.get("youtube_id"):
+            by_video.setdefault(r["youtube_id"], []).append(r)
+    for rs in by_video.values():
+        predicted = episode_timing_predictions(rs)
+        for r in rs:
+            p = predicted.get(r["id"])
+            if p is not None and (r.get("youtube_alignment_details") or {}).get("predicted_start") != p:
+                supabase.table("test_quotes").update({"youtube_alignment_details": {**(r.get("youtube_alignment_details") or {}), "predicted_start": p}}) \
+                    .eq("id", r["id"]).execute()
+                written += 1
+    return written
 
 
 def episode_audio_moment(row):
@@ -6585,7 +6658,8 @@ def sample_moment(row):
     """Where a sample quote is in the episode's YouTube video, so the editor can hear who says it. None without a video."""
     if not row.get("youtube_id"):
         return None
-    start = next((row.get(k) for k in ("youtube_timestamp_start", "timestamp_start", "rss_timestamp_start") if row.get(k) is not None), 0)
+    predicted = None if timing_verified(row) else (row.get("youtube_alignment_details") or {}).get("predicted_start")
+    start = predicted if predicted is not None else next((row.get(k) for k in ("youtube_timestamp_start", "timestamp_start", "rss_timestamp_start") if row.get(k) is not None), 0)
     return {"youtube_id": row["youtube_id"], "start": max(0, float(start)), "verified": timing_verified(row)}
 
 
@@ -6940,6 +7014,20 @@ def daily_autopilot():
         print("speaker autopilot", json.dumps(run_speaker_autopilot(supabase, autopilot_editor_id(supabase))))
     with ai_job("Editor screen"):
         print("editor screen", json.dumps(run_editor_screen(supabase)))
+    print("timing predictions", predict_all_episode_timing(supabase))
+
+
+def predict_all_episode_timing(supabase):
+    """Refresh where every open quote's player opens, from the moments verified so far (captions or the editor)."""
+    rows = _select_all(lambda: supabase.table("test_quotes").select("podcast_name,episode_name").in_("approval_status", ["pending", "approved"])
+                       .not_.is_("youtube_id", "null").not_.in_("youtube_alignment_status", list(VERIFIED_STATUSES)))
+    written = 0
+    for podcast, episode in {(r["podcast_name"], r["episode_name"]) for r in rows}:
+        try:
+            written += predict_episode_timing(supabase, podcast, episode)
+        except Exception as exc:
+            print("timing predictions failed", podcast, episode, str(exc)[:120])
+    return {"episodes": len({(r["podcast_name"], r["episode_name"]) for r in rows}), "written": written}
 
 
 # ---------------------------------------------------------------- the editor screen: Craig's own rejection reasons
@@ -7913,7 +8001,10 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             episode.title,
             client,
             curation_examples=curation_examples,
-        )[:5]
+        )
+        # The quality bar (Oct 29): the editor approved 3 in 4 takes scoring 0.9 and fewer than half under 0.5, so a take
+        # under the floor is not staged at all; at most five per episode.
+        ranked_quotes = [q for q in ranked_quotes if float(q.get("quality_score") or 0) >= QUALITY_FLOOR][:5]
         ranked_quotes = [
             bind_candidate_to_directories(
                 quote,
@@ -8007,6 +8098,9 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             else processing_cost / max(len(all_quotes), 1)
         )
         candidate_set_id = str(uuid.uuid4())
+        # A re-processed episode would otherwise stage the same passages again, reworded (Oct 29)
+        episode_quotes = _retry(lambda: supabase.table("test_quotes").select("id,quote_text,rss_timestamp_start,timestamp_start")
+                                .eq("podcast_name", feed["name"]).eq("episode_name", episode.title[:100]).execute().data) or []
         update_processing_job(
             supabase,
             job_id,
@@ -8129,6 +8223,11 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 'mapping_review_status': 'unreviewed',
             }
             
+            twin = next((r for r in episode_quotes if is_near_copy(r, record)), None)
+            if twin:
+                print(f"⏭️ Near-copy of a quote already staged for this episode ({twin.get('id')}): {quote['text'][:50]}")
+                continue
+            episode_quotes.append(record)
             print(f"🚀 Attempting to save quote to Supabase: {quote['text'][:50]}...")
             try:
                 db_res = supabase.table('test_quotes').insert(record).execute()
@@ -13124,7 +13223,7 @@ def fastapi_app():
         supabase = service_client()
         items = [r for r in _select_all(lambda: supabase.table("test_quotes").select("*").eq("approval_status", "pending")
                  .eq("podcast_name", req.podcast_name).eq("episode_name", req.episode_name))]
-        updated, errors = 0, []
+        updated, errors, apply_id = 0, [], str(uuid.uuid4())
         for row in req.rows:
             try:
                 linkedin = clean_linkedin_url(row.linkedin_url)
@@ -13153,9 +13252,36 @@ def fastapi_app():
                 updates["updated_at"] = utcnow_iso()
                 supabase.table("test_quotes").update(updates).eq("id", before["id"]).execute()
                 _log_decision(supabase, admin, before, {**before, **updates}, "edit", reason_detail="Episode speakers",
-                              extra={"surface": "episode_roster", "prompt_version": ROSTER_PROMPT_VERSION})
+                              extra={"surface": "episode_roster", "prompt_version": ROSTER_PROMPT_VERSION, "apply_id": apply_id})
                 updated += 1
-        return {"success": True, "updated": updated, "errors": errors}
+        return {"success": True, "updated": updated, "errors": errors, "apply_id": apply_id if updated else None}
+
+    class RosterUndoRequest(BaseModel):
+        apply_id: str
+
+    @web_app.post("/episode-speakers/undo")
+    async def episode_speakers_undo_endpoint(req: RosterUndoRequest, admin=Depends(require_admin)):
+        """Take back one Apply: every quote it changed goes back to how it was, unless it was reviewed or changed since."""
+        supabase = service_client()
+        decisions = supabase.table("curation_decisions").select("id,quote_id,metadata").eq("metadata->>surface", "episode_roster") \
+            .eq("metadata->>apply_id", req.apply_id).execute().data or []
+        if not decisions:
+            raise HTTPException(status_code=404, detail="Nothing to undo for that apply")
+        undone, skipped = 0, []
+        for d in decisions:
+            b, a = d["metadata"].get("before") or {}, d["metadata"].get("after") or {}
+            row = (supabase.table("test_quotes").select("*").eq("id", d["quote_id"]).limit(1).execute().data or [None])[0]
+            if not row or row.get("approval_status") != "pending":
+                skipped.append("already reviewed"); continue
+            if row.get("guest_id") != a.get("guest_id"):
+                skipped.append("speaker changed since"); continue
+            restore = {k: b.get(k) for k in DECISION_LOG_FIELDS if k not in ("approval_status", "rejection_reason")}
+            restore["updated_at"] = utcnow_iso()
+            supabase.table("test_quotes").update(restore).eq("id", row["id"]).execute()
+            _log_decision(supabase, admin, row, {**row, **restore}, "edit", reason_detail="Undo episode speakers",
+                          extra={"surface": "episode_roster_undo", "undoes": req.apply_id})
+            undone += 1
+        return {"success": True, "undone": undone, "skipped": skipped}
 
     # ---------------------------------------------------------------- one episode at a glance (Oct 28)
     def _moment_order(r):
@@ -13728,6 +13854,10 @@ def fastapi_app():
                 },
                 "p_processing_job_id": before.get("processing_job_id"),
             }).execute()
+            try:   # every confirmed moment sharpens where the episode's other quotes open
+                predict_episode_timing(supabase, before.get("podcast_name"), before.get("episode_name"))
+            except Exception as exc:
+                print("timing predictions failed", str(exc)[:120])
             after = (
                 supabase.table("test_quotes")
                 .select("*")
