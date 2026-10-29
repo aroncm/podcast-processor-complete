@@ -201,7 +201,7 @@ AI_MODEL_ROLES = [
     ("Moment alignment", "OPENAI_ALIGNMENT_MODEL", "OPENAI_EDITORIAL_MODEL", "gpt-5.6-terra"),
     ("Backlog scoring", "OPENAI_BACKLOG_SCORE_MODEL", None, "gpt-5.4-mini"),
     ("Episode speakers", "OPENAI_ROSTER_MODEL", None, "gpt-5.4-mini"),
-    ("Transcription", "OPENAI_TRANSCRIPTION_MODEL", None, "whisper-1"),
+    ("Transcription", "OPENAI_TRANSCRIPTION_MODEL", "OPENAI_TRANSCRIPTION_FALLBACK_MODEL", "gpt-4o-transcribe-diarize"),
 ]
 
 
@@ -762,7 +762,7 @@ def _process_episode_with_ai_impl(
 @app.function(
     image=image,
     secrets=[my_secret],
-    timeout=1800,
+    timeout=3600,   # Oct 29: voice-labelled transcription takes about five minutes an episode
     cpu=2,
 )
 def process_episode_with_ai(
@@ -4144,138 +4144,156 @@ TRANSCRIPT WITH GLOBAL SEGMENT IDS:
     return proposals
 
 
+DIARIZE_MODEL = "gpt-4o-transcribe-diarize"
+
+
+def _segment_fields(raw):
+    if isinstance(raw, dict):
+        return raw.get("text", ""), float(raw.get("start", 0)), float(raw.get("end", raw.get("start", 0))), raw.get("speaker")
+    return getattr(raw, "text", ""), float(getattr(raw, "start", 0)), float(getattr(raw, "end", 0)), getattr(raw, "speaker", None)
+
+
+def voice_reference_clips(chunk_path, segments, limit=4):
+    """A 4 to 8 second clip of each of the first chunk's main voices, as data URLs, for labelling the rest of the episode
+    with the same names. Voices that never speak 4 seconds at a stretch are left out (and keep chunk-local labels)."""
+    import base64
+    import subprocess
+    import tempfile
+    talk = {}
+    for text, start, end, speaker in segments:
+        if speaker:
+            talk[speaker] = talk.get(speaker, 0) + (end - start)
+    names, refs, label_of = [], [], {}
+    for speaker in sorted(talk, key=lambda k: -talk[k])[:limit]:
+        best = max((x for x in segments if x[3] == speaker and x[2] - x[1] >= 4), key=lambda x: min(x[2] - x[1], 8), default=None)
+        if not best:
+            continue
+        with tempfile.NamedTemporaryFile(suffix=".wav") as clip:
+            subprocess.run(["ffmpeg", "-v", "error", "-ss", str(best[1]), "-t", str(min(8, best[2] - best[1])), "-i", chunk_path,
+                            "-ac", "1", "-ar", "16000", "-y", clip.name], check=True)
+            refs.append("data:audio/wav;base64," + base64.b64encode(open(clip.name, "rb").read()).decode())
+        label_of[speaker] = f"voice_{len(names) + 1}"
+        names.append(label_of[speaker])
+    return names, refs, label_of
+
+
+def quote_voice(segments):
+    """The voice that speaks a quote. A listener's "Yeah," or "Right." in the middle is an interjection, not a second
+    speaker: the main voice must carry 85% of the labelled speaking time, or the quote really does cross speakers."""
+    talk = {}
+    for seg in segments:
+        label = str(seg.get("speaker_label") or "").strip()
+        if label:
+            talk[label] = talk.get(label, 0.0) + max(0.0, float(seg.get("end", 0)) - float(seg.get("start", 0)))
+    if not talk:
+        return ""
+    main = max(talk, key=talk.get)
+    if len(talk) > 1 and talk[main] < 0.85 * sum(talk.values()):
+        raise ValueError("quote crosses diarized speaker boundaries")
+    return main
+
+
 def transcribe_audio_in_chunks(temp_path, client, supabase, job_id=None):
-    """Transcribe every 20-minute chunk and retain absolute segment offsets."""
+    """Transcribe the episode in chunks and keep absolute segment times. With the diarizing model (the default since
+    Oct 29), every segment carries the voice speaking: the first five minutes are transcribed alone, a short clip of each
+    voice heard there is given to the other chunks, and they label those voices with the same episode-wide names
+    (voice_1, voice_2 ...). A voice first heard later keeps a chunk-local label, so two people are never merged. A chunk
+    the diarizing model fails on falls back to the plain model and has no voice labels."""
     import glob
     import shutil
     import subprocess
     import tempfile
+    from concurrent.futures import ThreadPoolExecutor
 
     chunk_dir = tempfile.mkdtemp(prefix="podtakes-transcript-")
     chunk_pattern = os.path.join(chunk_dir, "chunk-%03d.mp3")
-    transcript_model = os.environ.get("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+    transcript_model = os.environ.get("OPENAI_TRANSCRIPTION_MODEL", DIARIZE_MODEL)
     fallback_model = os.environ.get("OPENAI_TRANSCRIPTION_FALLBACK_MODEL", "whisper-1")
-    chunk_seconds = 600 if transcript_model == "gpt-4o-transcribe-diarize" else 1200
+    diarize = transcript_model == DIARIZE_MODEL
+    # Oct 29 test: the diarizing model runs at about half real time, so a 10-minute chunk outran its 5-minute limit
+    chunk_seconds = 300 if diarize else 1200
+    timeout = float(os.environ.get("OPENAI_DIARIZATION_TIMEOUT_SECONDS", "600"))
     try:
         split_result = subprocess.run(
-            [
-                "ffmpeg", "-v", "error", "-i", temp_path,
-                "-f", "segment", "-segment_time", str(chunk_seconds),
-                "-reset_timestamps", "1", "-c", "copy", "-y", chunk_pattern,
-            ],
-            capture_output=True,
-            text=True,
+            ["ffmpeg", "-v", "error", "-i", temp_path, "-f", "segment", "-segment_time", str(chunk_seconds),
+             "-reset_timestamps", "1", "-c", "copy", "-y", chunk_pattern],
+            capture_output=True, text=True,
         )
         if split_result.returncode != 0:
             raise RuntimeError(f"Audio chunking failed: {split_result.stderr[-1000:]}")
-
         chunk_paths = sorted(glob.glob(os.path.join(chunk_dir, "chunk-*.mp3")))
         if not chunk_paths:
             raise RuntimeError("Audio chunking produced no files")
 
-        absolute_offset = 0.0
-        transcript_parts = []
-        absolute_segments = []
-        used_models = []
+        # Each chunk starts where the previous one really ends. Oct 29: advancing by the last word's end put every chunk
+        # that ended in music or silence a few seconds early, and the error grew through the episode.
+        def length_of(path):
+            probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                    "-of", "default=noprint_wrappers=1:nokey=1", path], capture_output=True, text=True, check=True)
+            return float(probe.stdout.strip())
+        offsets, total = [], 0.0
+        for path in chunk_paths:
+            offsets.append(total)
+            total += length_of(path)
 
-        for chunk_index, chunk_path in enumerate(chunk_paths):
-            update_processing_job(
-                supabase,
-                job_id,
-                "transcribing",
-                progress={
-                    "transcript_chunk": chunk_index + 1,
-                    "transcript_chunks": len(chunk_paths),
-                },
-            )
-            active_model = transcript_model
+        done = {"n": 0}
+
+        def transcribe(index, known=None):
+            path = chunk_paths[index]
             try:
-                with open(chunk_path, "rb") as audio_file:
-                    if transcript_model == "gpt-4o-transcribe-diarize":
-                        transcript = client.audio.transcriptions.create(
-                            model=transcript_model,
-                            file=audio_file,
-                            response_format="diarized_json",
-                            chunking_strategy="auto",
-                            timeout=float(os.environ.get("OPENAI_DIARIZATION_TIMEOUT_SECONDS", "300")),
-                        )
-                    else:
-                        transcript = client.audio.transcriptions.create(
-                            model=transcript_model,
-                            file=audio_file,
-                            response_format="verbose_json",
-                            timestamp_granularities=["segment"],
-                        )
+                if not diarize:
+                    raise RuntimeError("plain model")
+                with open(path, "rb") as audio_file:
+                    result = client.audio.transcriptions.create(
+                        model=DIARIZE_MODEL, file=audio_file, response_format="diarized_json", chunking_strategy="auto",
+                        timeout=timeout, **({"extra_body": {"known_speaker_names": known[0], "known_speaker_references": known[1]}} if known and known[0] else {}))
+                model = DIARIZE_MODEL
             except Exception as exc:
-                if transcript_model != "gpt-4o-transcribe-diarize" or not fallback_model:
-                    raise
-                active_model = fallback_model
-                print(
-                    f"⚠️ Diarized transcription unavailable for chunk {chunk_index + 1}; "
-                    f"falling back to {fallback_model}: {type(exc).__name__}"
-                )
-                with open(chunk_path, "rb") as audio_file:
-                    transcript = client.audio.transcriptions.create(
-                        model=fallback_model,
-                        file=audio_file,
-                        response_format="verbose_json",
-                        timestamp_granularities=["segment"],
-                    )
-            used_models.append(active_model)
+                if diarize:
+                    print(f"⚠️ Diarized transcription unavailable for chunk {index + 1}; falling back to {fallback_model}: {type(exc).__name__}")
+                with open(path, "rb") as audio_file:
+                    result = client.audio.transcriptions.create(model=fallback_model if diarize else transcript_model, file=audio_file,
+                                                                response_format="verbose_json", timestamp_granularities=["segment"])
+                model = fallback_model if diarize else transcript_model
+            done["n"] += 1
+            update_processing_job(supabase, job_id, "transcribing", progress={"transcript_chunk": done["n"], "transcript_chunks": len(chunk_paths)})
+            return model, getattr(result, "text", "") or "", [_segment_fields(x) for x in (getattr(result, "segments", None) or [])]
 
-            chunk_text = getattr(transcript, "text", "") or ""
-            transcript_parts.append(chunk_text)
-            raw_segments = getattr(transcript, "segments", None) or []
-            max_end = 0.0
-            for raw_segment in raw_segments:
-                if isinstance(raw_segment, dict):
-                    text = raw_segment.get("text", "")
-                    start = float(raw_segment.get("start", 0))
-                    end = float(raw_segment.get("end", start))
-                    speaker = raw_segment.get("speaker")
-                else:
-                    text = getattr(raw_segment, "text", "")
-                    start = float(getattr(raw_segment, "start", 0))
-                    end = float(getattr(raw_segment, "end", start))
-                    speaker = getattr(raw_segment, "speaker", None)
-                max_end = max(max_end, end)
-                absolute_segments.append({
-                    "id": len(absolute_segments),
-                    "text": text.strip(),
-                    "start": round(start + absolute_offset, 3),
-                    "end": round(end + absolute_offset, 3),
-                    "chunk_index": chunk_index,
-                    "speaker_label": (
-                        f"chunk-{chunk_index}:{speaker}"
-                        if str(speaker or "").strip() else None
-                    ),
-                })
-
-            # Advance by the chunk's real length. Oct 29: advancing by the last word's end put every chunk that ended in
-            # music or silence a few seconds early, and the error grew through the episode.
+        results = [None] * len(chunk_paths)
+        results[0] = transcribe(0)
+        known, label_of = None, {}
+        if diarize and results[0][0] == DIARIZE_MODEL:
             try:
-                probe = subprocess.run(
-                    [
-                        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1", chunk_path,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                chunk_length = float(probe.stdout.strip())
-            except Exception:
-                chunk_length = max_end
-            absolute_offset += max(chunk_length, max_end)
+                names, refs, label_of = voice_reference_clips(chunk_paths[0], results[0][2])
+                known = (names, refs)
+            except Exception as exc:
+                print(f"⚠️ Voice reference clips failed; later chunks keep their own labels: {exc}")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for index, result in zip(range(1, len(chunk_paths)), pool.map(lambda i: transcribe(i, known), range(1, len(chunk_paths)))):
+                results[index] = result
 
+        transcript_parts, absolute_segments, used_models = [], [], []
+        named = set(known[0]) if known else set()
+        for index, (model, text, segments) in enumerate(results):
+            used_models.append(model)
+            transcript_parts.append(text)
+            for seg_text, start, end, speaker in segments:
+                speaker = str(speaker or "").strip()
+                if index == 0 and speaker in label_of:
+                    speaker = label_of[speaker]
+                label = speaker if speaker in named else (f"chunk-{index}:{speaker}" if speaker else None)
+                absolute_segments.append({
+                    "id": len(absolute_segments), "text": seg_text.strip(),
+                    "start": round(start + offsets[index], 3), "end": round(end + offsets[index], 3),
+                    "chunk_index": index, "speaker_label": label,
+                })
         return {
             "text": "\n".join(transcript_parts).strip(),
             "segments": absolute_segments,
             "model": "+".join(dict.fromkeys(used_models)) or transcript_model,
-            "diarization_requested": transcript_model == "gpt-4o-transcribe-diarize",
-            "diarization_complete": bool(absolute_segments) and all(
-                segment.get("speaker_label") for segment in absolute_segments
-            ),
+            "diarization_requested": diarize,
+            "diarization_complete": bool(absolute_segments) and all(segment.get("speaker_label") for segment in absolute_segments),
+            "episode_voices": known[0] if known else [],
         }
     finally:
         shutil.rmtree(chunk_dir, ignore_errors=True)
@@ -7935,14 +7953,7 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                     if end_time - start_time < 15:
                         end_time = start_time + 15
 
-                    source_speaker_labels = {
-                        str(segment.get("speaker_label") or "").strip()
-                        for segment in segments[start_id:end_id + 1]
-                        if str(segment.get("speaker_label") or "").strip()
-                    }
-                    if len(source_speaker_labels) > 1:
-                        raise ValueError("quote crosses diarized speaker boundaries")
-                    source_speaker_label = next(iter(source_speaker_labels), "")
+                    source_speaker_label = quote_voice(segments[start_id:end_id + 1])
                     candidate_speaker_label = str(candidate.get("speaker_label") or "").strip()
                     if source_speaker_label and candidate_speaker_label != source_speaker_label:
                         raise ValueError("candidate speaker label does not match source segments")
@@ -10850,7 +10861,7 @@ def create_audio_clip(quote_id: str):
 @app.function(
     image=image,
     secrets=[my_secret],
-    timeout=1800,
+    timeout=3600,
     schedule=modal.Cron("0 0 * * *", timezone="UTC"),
 )
 def scheduled_processor():

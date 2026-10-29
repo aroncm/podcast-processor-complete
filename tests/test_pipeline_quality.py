@@ -1648,3 +1648,13 @@ def test_timing_predictions_use_the_nearest_verified_shift_and_never_verify():
     p = episode_timing_predictions(rows)
     assert p == {"u1": 230.0, "u2": 940.0}
     assert episode_timing_predictions([r for r in rows if r["id"].startswith("u")]) == {}
+
+
+def test_a_listeners_interjection_does_not_split_a_quote_between_voices():
+    import pytest
+    from modal_app.full_processor import quote_voice
+    seg = lambda label, a, b: {"speaker_label": label, "start": a, "end": b}
+    assert quote_voice([seg("voice_1", 0, 20), seg("voice_2", 20, 20.6), seg("voice_1", 20.6, 40)]) == "voice_1"
+    assert quote_voice([seg(None, 0, 10)]) == ""
+    with pytest.raises(ValueError):
+        quote_voice([seg("voice_1", 0, 15), seg("voice_2", 15, 30)])
