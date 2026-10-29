@@ -6451,7 +6451,7 @@ REVIEW_QUEUE_FIELDS = (
     "id,quote_text,speaker_name,speaker_label,speaker_title,speaker_company,speaker_linkedin,guest_id,podcast_name,"
     "episode_name,episode_guid,date_published,youtube_id,youtube_alignment_status,youtube_timestamp_start,"
     "youtube_timestamp_end,yt_timestamp_confidence,rss_timestamp_start,rss_timestamp_end,timestamp_start,timestamp_end,"
-    "quality_score,ranking_reason,quote_word_count,approval_status,created_at,directory_resolution"
+    "quality_score,ranking_reason,quote_word_count,approval_status,created_at,directory_resolution,audio_clip_url,episode_audio_url"
 )
 
 
@@ -6533,7 +6533,34 @@ def review_queue_item(row):
     return {**{k: row.get(k) for k in REVIEW_QUEUE_FIELDS.split(",")},
             "word_count": quote_words(row.get("quote_text")), "fragment": is_fragment(row),
             "timing_verified": timing_verified(row), "speaker_linked": speaker_linked(row),
-            "blockers": missing_take_verification_fields(row), "ready": is_ready(row)}
+            "blockers": missing_take_verification_fields(row), "ready": is_ready(row), "audio": episode_audio_moment(row)}
+
+
+def episode_audio_moment(row):
+    """The podcast's own audio at the quote, for episodes with no YouTube video."""
+    url = row.get("audio_clip_url") or row.get("episode_audio_url")
+    start = next((row.get(k) for k in ("rss_timestamp_start", "timestamp_start") if row.get(k) is not None), None)
+    if row.get("youtube_id") or not url or start is None:
+        return None
+    end = next((row.get(k) for k in ("rss_timestamp_end", "timestamp_end") if row.get(k) is not None), None)
+    return {"url": url, "start": max(0, float(start)), "end": float(end) if end is not None else None}
+
+
+def clear_episode_video(supabase, podcast_name, episode_name, youtube_id, log):
+    """Take a wrong YouTube video off every quote in the episode; they fall back to the podcast's own audio. Published
+    perspectives are left alone and counted. log(row, after) records each change."""
+    rows = supabase.table("test_quotes").select("*").eq("podcast_name", podcast_name).eq("episode_name", episode_name) \
+        .eq("youtube_id", youtube_id).execute().data or []
+    for row in rows:
+        details = dict(row.get("youtube_alignment_details") or {})
+        details["rejected_youtube_ids"] = sorted(set(details.get("rejected_youtube_ids") or []) | {youtube_id})
+        upd = {"youtube_id": None, "youtube_alignment_status": "not_applicable", "youtube_timestamp_start": None,
+               "youtube_timestamp_end": None, "yt_timestamp_confidence": None, "youtube_aligned_at": None,
+               "youtube_alignment_details": details, "updated_at": utcnow_iso()}
+        supabase.table("test_quotes").update(upd).eq("id", row["id"]).execute()
+        log(row, {**row, **upd})
+    published = len(supabase.table("quotes").select("id").eq("youtube_id", youtube_id).execute().data or [])
+    return {"cleared": len(rows), "published_left": published}
 
 
 def speaker_group_key(row):
@@ -7494,11 +7521,9 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         else:
             print("❌ No YouTube ID found in RSS. Initiating fallback search...")
             # Try searching with just the episode title first (often more successful for long titles)
-            youtube_id = search_youtube_for_episode(episode.title)
-            
-            if not youtube_id:
-                print("  ⚠️ Search with title only failed. Trying [Podcast Name] + [Episode Title]...")
-                youtube_id = search_youtube_for_episode(f"{feed['name']} {episode.title}")
+            # Oct 29: a title-only search attached other shows' videos (gold mining, a gun review) to 14 episodes; a result now
+            # has to come from the podcast's channel and match the episode's title, or the episode keeps its RSS audio.
+            youtube_id = search_youtube_for_episode(f"{feed['name']} {episode.title}", podcast_name=feed['name'], episode_title=episode.title)
                 
             if youtube_id:
                 print(f"📺 FOUND YouTube ID (via search): {youtube_id}")
@@ -10463,8 +10488,37 @@ def run_editorial_evaluation(sample_limit: int = 40, job_id: str = None):
         )
         raise
 
-def search_youtube_for_episode(query: str) -> str | None:
-    """Uses yt-dlp to search YouTube for the episode and pick the best full-length match."""
+# Channels that carry a podcast whose name they don't contain (MarketectureTV publishes the network's other shows).
+PODCAST_YOUTUBE_CHANNELS = {
+    "marketecture": {"marketecturetv"},
+    "adtechgod pod": {"marketecturetv"},
+    "open market": {"marketecturetv", "open market"},
+    "the ai edge podcast": {"u of digital"},
+}
+
+
+def squash_name(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def youtube_result_from_podcast(entry, podcast_name):
+    """A search result counts only when it comes from the podcast's own channel."""
+    channel = squash_name(entry.get("channel") or entry.get("uploader"))
+    key = normalize_text(podcast_name or "").strip()
+    core = squash_name(re.sub(r"\b(the|podcast|pod)\b", " ", key))
+    allowed = {squash_name(c) for c in PODCAST_YOUTUBE_CHANNELS.get(key, ())}
+    return bool(channel) and (channel in allowed or bool(core and core in channel))
+
+
+def youtube_title_fits(entry, podcast_name, episode_title):
+    # U of Digital retitles AI Edge episodes on YouTube, so a title is a preference, not a requirement
+    return youtube_title_matches_episode(entry.get("title"), episode_title)["matches"] or \
+        youtube_title_matches_episode(entry.get("title"), f"{podcast_name} {episode_title}")["matches"]
+
+
+def search_youtube_for_episode(query: str, podcast_name=None, episode_title=None) -> str | None:
+    """Uses yt-dlp to search YouTube for the episode and pick the best full-length match. With a podcast name, only a
+    result from that podcast's channel whose title matches the episode is accepted."""
     import yt_dlp
     
     ydl_opts = {
@@ -10485,7 +10539,14 @@ def search_youtube_for_episode(query: str) -> str | None:
         try:
             info = ydl.extract_info(search_query, download=False)
             if 'entries' in info:
-                for entry in info['entries']:
+                entries = list(info['entries'] or [])
+                if podcast_name:
+                    kept = [e for e in entries if youtube_result_from_podcast(e, podcast_name)]
+                    for e in entries:
+                        if e not in kept:
+                            print(f"  ⏭️ Not this podcast's channel: {str(e.get('title'))[:40]}... ({e.get('channel') or e.get('uploader')})")
+                    entries = sorted(kept, key=lambda e: not youtube_title_fits(e, podcast_name, episode_title or query))
+                for entry in entries:
                     duration = entry.get('duration', 0)
                     if not duration: duration = 0
                     
@@ -13129,6 +13190,26 @@ def fastapi_app():
         _log_decision(supabase, admin, row, after, "edit", reason_detail="Used the speaker's own words",
                       extra={"surface": "episode_review", "spoken_words": found})
         return {"success": True, "item": {**review_queue_item(after), "screen": screen_of(after), "spoken_words": None}}
+
+    class WrongVideoRequest(BaseModel):
+        quote_id: str
+
+    @web_app.post("/episode-review/wrong-video")
+    async def wrong_video_endpoint(req: WrongVideoRequest, admin=Depends(require_admin)):
+        """The episode's YouTube video is someone else's: take it off every quote in the episode, which then play the
+        podcast's own audio."""
+        supabase = service_client()
+        row = (supabase.table("test_quotes").select("podcast_name,episode_name,youtube_id").eq("id", req.quote_id).limit(1).execute().data or [None])[0]
+        if not row:
+            raise HTTPException(status_code=404, detail="Quote not found")
+        if not row.get("youtube_id"):
+            raise HTTPException(status_code=422, detail="This quote has no video")
+        r = clear_episode_video(supabase, row["podcast_name"], row["episode_name"], row["youtube_id"],
+                                lambda before, after: _log_decision(supabase, admin, before, after, "edit", reason_detail="Wrong video",
+                                                                    extra={"surface": "wrong_video", "youtube_id": row["youtube_id"]}))
+        print(f"AUDIT wrong_video youtube_id={row['youtube_id']} episode={row['episode_name']!r} cleared={r['cleared']} by={admin['id']}")
+        item = (supabase.table("test_quotes").select("*").eq("id", req.quote_id).limit(1).execute().data or [None])[0]
+        return {"success": True, **r, "item": {**review_queue_item(item), "screen": screen_of(item)} if item else None}
 
     # ---------------------------------------------------------------- done automatically: the audit list, with undo
     @web_app.get("/autopilot/log")

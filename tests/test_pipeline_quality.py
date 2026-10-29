@@ -1591,3 +1591,23 @@ class AiJobTests(unittest.TestCase):
         with ai_job("Episode speakers"):
             self.assertEqual(score_backlog_quality(), "Episode speakers", "an explicit label wins")
         self.assertEqual(current_ai_job(), "Other")
+
+
+def test_a_youtube_search_result_counts_only_from_the_podcasts_own_channel():
+    from modal_app.full_processor import youtube_result_from_podcast
+    # Oct 29: a title-only search put other shows' videos on 14 episodes
+    assert not youtube_result_from_podcast({"channel": "TheBContinuedPodcast", "title": "Culture, Change, and the M&A Playbook"}, "The Aperiam Podcast")
+    assert not youtube_result_from_podcast({"channel": "Gun Talk Media"}, "The FPC Podcast")
+    assert not youtube_result_from_podcast({"channel": "MarketectureTV"}, "The Aperiam Podcast")
+    assert youtube_result_from_podcast({"channel": "MarketectureTV"}, "Marketecture")
+    assert youtube_result_from_podcast({"channel": "U of Digital"}, "The AI Edge Podcast")
+    assert youtube_result_from_podcast({"uploader": "Adtech Adtalk"}, "Adtech Adtalk")
+    assert not youtube_result_from_podcast({}, "Adtech Adtalk")
+
+
+def test_an_episode_without_a_video_offers_the_podcasts_audio_at_the_quote():
+    from modal_app.full_processor import episode_audio_moment
+    row = {"youtube_id": None, "audio_clip_url": "https://media.example/ep.mp3", "rss_timestamp_start": 1584, "rss_timestamp_end": 1608}
+    assert episode_audio_moment(row) == {"url": "https://media.example/ep.mp3", "start": 1584.0, "end": 1608.0}
+    assert episode_audio_moment({**row, "youtube_id": "abc"}) is None
+    assert episode_audio_moment({**row, "audio_clip_url": None}) is None
