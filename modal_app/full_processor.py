@@ -5710,7 +5710,7 @@ MAPPED_TAKE_FIELDS = ",".join(dict.fromkeys(
     "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,"
     "youtube_id,youtube_alignment_status,youtube_timestamp_start,youtube_timestamp_end,timestamp_start,timestamp_end,"
     "rss_timestamp_start,rss_timestamp_end,audio_clip_url,episode_audio_url,editorial_context,context_review_status,"
-    "source_transcript_excerpt".split(",") + PUBLISH_FIELDS.split(",")))
+    "source_transcript_excerpt,analysis_review_flags".split(",") + PUBLISH_FIELDS.split(",")))
 
 
 def mapped_take_row(r):
@@ -5725,7 +5725,10 @@ def mapped_take_row(r):
             "youtube_end": r.get("youtube_timestamp_end") if verified else r.get("timestamp_end"), "moment_verified": verified,
             "audio": episode_audio_moment(r), "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id")),
             "editorial_context": r.get("editorial_context"), "context_approved": r.get("context_review_status") == "approved",
-            "has_evidence": bool(str(r.get("source_transcript_excerpt") or "").strip()), "blockers": publish_blockers(r)}
+            "has_evidence": bool(str(r.get("source_transcript_excerpt") or "").strip()), "blockers": publish_blockers(r),
+            # why there is no draft, when the automatic draft already tried and could not find the passage
+            "draft_problem": (r.get("analysis_review_flags") or {}).get("ai_draft_reason")
+            if (r.get("analysis_review_flags") or {}).get("ai_draft_status") == "source_unavailable" else None}
 
 
 @app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
