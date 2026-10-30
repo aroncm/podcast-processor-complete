@@ -12825,7 +12825,8 @@ def fastapi_app():
         pub = {r["id"]: r for r in (supabase.table("reader_perspectives_v1").select(
             "id,text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end").in_("id", pub_ids).execute().data or [])} if pub_ids else {}
         staged = {r["id"]: r for r in (supabase.table("test_quotes").select(
-            "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,timestamp_start,timestamp_end,youtube_alignment_status").in_("id", staged_ids).execute().data or [])} if staged_ids else {}
+            "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,timestamp_start,timestamp_end,youtube_alignment_status,"
+            "editorial_context,context_review_status,source_transcript_excerpt,analysis_review_flags").in_("id", staged_ids).execute().data or [])} if staged_ids else {}
         rows = []
         for s in suggestions:
             if s.get("quote_id") and s["quote_id"] in pub:
@@ -12841,7 +12842,12 @@ def fastapi_app():
                              "episode_date": str(r.get("date_published") or "")[:10] or None,
                              "youtube_id": r.get("youtube_id"), "youtube_start": r.get("timestamp_start"), "youtube_end": r.get("timestamp_end"),
                              "moment_verified": r.get("youtube_alignment_status") in ("verified", "manual_verified"),
-                             "guest_id": r.get("guest_id"), "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
+                             "guest_id": r.get("guest_id"), "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id")),
+                             # Oct 29: the context comes with the suggestion, so mapping and approving it are one step
+                             "editorial_context": r.get("editorial_context"), "context_approved": r.get("context_review_status") == "approved",
+                             "has_evidence": bool(str(r.get("source_transcript_excerpt") or "").strip()),
+                             "draft_problem": (r.get("analysis_review_flags") or {}).get("ai_draft_reason")
+                             if (r.get("analysis_review_flags") or {}).get("ai_draft_status") == "source_unavailable" else None})
         placed_ids = [r["quote_id"] for r in (supabase.table("reader_placements_v1").select("quote_id").eq("question_id", question_id).execute().data or [])]
         placed = (supabase.table("reader_perspectives_v1").select(
             "id,text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end")
