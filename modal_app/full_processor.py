@@ -13126,7 +13126,7 @@ def fastapi_app():
         except Exception:
             rows, metering = [], False   # before the ai_usage_events migration runs
         try:   # per-episode transcription cost lives on the processing artifacts
-            episodes = _select_all(lambda: supabase.table("episode_processing_artifacts").select("transcription_cost_usd,analysis_cost_usd,updated_at")
+            episodes = _select_all(lambda: supabase.table("episode_processing_artifacts").select("transcription_cost_usd,analysis_cost_usd,total_api_cost_usd,updated_at")
                                    .gte("updated_at", min(since, month_start).isoformat()))
         except Exception:
             episodes = []
@@ -13175,11 +13175,14 @@ def fastapi_app():
                 spent, source = round(spent, 2), "estimate"
             balance = {"entered_usd": float(settings["balance_usd"]), "as_of": as_of_iso, "spent_since_usd": spent, "spent_source": source,
                        "remaining_usd": round(float(settings["balance_usd"]) - spent, 2)}
+        costed = [float(e["total_api_cost_usd"]) for e in episodes if e.get("total_api_cost_usd") is not None and (e.get("updated_at") or "") >= since.isoformat()]
         return {"success": True, "metering": metering, "admin_key": bool(os.environ.get("OPENAI_ADMIN_KEY")), "reported_error": reported_error,
                 "month": {"openai_reported_usd": reported_month, "estimated_usd": estimate_month, "since": month_start.isoformat()},
                 "last_30_days": {"ai_calls_usd": round(sum(j["cost_usd"] for j in jobs), 2), "transcription_usd": transcription_30,
                                  "jobs": jobs, "models": sorted(({**m, "cost_usd": round(m["cost_usd"], 4)} for m in by_model.values()), key=lambda m: -m["cost_usd"])},
-                "configured_models": resolved_ai_models(), "balance": balance}
+                "configured_models": resolved_ai_models(), "balance": balance,
+                # Oct 29: moved here from the retired Workflow Performance panel
+                "per_episode": {"episodes": len(costed), "average_usd": round(sum(costed) / len(costed), 2) if costed else None}}
 
     @web_app.post("/costs/balance")
     async def costs_balance_endpoint(req: BalanceRequest, admin=Depends(require_admin)):
