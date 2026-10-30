@@ -1658,3 +1658,16 @@ def test_a_listeners_interjection_does_not_split_a_quote_between_voices():
     assert quote_voice([seg(None, 0, 10)]) == ""
     with pytest.raises(ValueError):
         quote_voice([seg("voice_1", 0, 15), seg("voice_2", 15, 30)])
+
+
+def test_a_mapped_take_says_what_stands_between_it_and_readers():
+    from modal_app.full_processor import mapped_take_row, MAPPED_TAKE_FIELDS, PUBLISH_FIELDS
+    assert set(PUBLISH_FIELDS.split(",")) <= set(MAPPED_TAKE_FIELDS.split(","))
+    ready = {"id": "a", "quote_text": "Clean rooms are a tax.", "speaker_name": "Ana Milicevic", "guest_id": "ana", "speaker_title": "Principal",
+             "speaker_company": "Sparrow", "approval_status": "approved", "context_review_status": "approved",
+             "editorial_context": "Context " * 30, "source_transcript_excerpt": "…", "mapping_review_status": "approved",
+             "proposed_theme_name": "Data", "proposed_theme_summary": "s", "proposed_question_text": "q?", "connection_context": "c"}
+    assert mapped_take_row(ready)["blockers"] == []
+    draft = mapped_take_row({**ready, "context_review_status": "unreviewed", "source_transcript_excerpt": None})
+    assert draft["blockers"] == ["approve the context", "attach the transcript evidence"]
+    assert not draft["context_approved"] and not draft["has_evidence"]

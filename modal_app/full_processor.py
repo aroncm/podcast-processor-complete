@@ -5706,6 +5706,28 @@ def thread_mapped_takes(supabase, theme_name, question_text, fields="id"):
     return [r for r in rows if same(r.get("proposed_theme_name"), theme_name) and same(r.get("proposed_question_text"), question_text)]
 
 
+MAPPED_TAKE_FIELDS = ",".join(dict.fromkeys(
+    "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,"
+    "youtube_id,youtube_alignment_status,youtube_timestamp_start,youtube_timestamp_end,timestamp_start,timestamp_end,"
+    "rss_timestamp_start,rss_timestamp_end,audio_clip_url,episode_audio_url,editorial_context,context_review_status,"
+    "source_transcript_excerpt".split(",") + PUBLISH_FIELDS.split(",")))
+
+
+def mapped_take_row(r):
+    """A take mapped to a thread but not yet published, as the Threads screen shows it: the words, who said it, the
+    moment, the industry context to approve, and whatever still stands between it and readers (Oct 29: the context is
+    approved here, where the take is placed, and the Publish screen is gone)."""
+    verified = r.get("youtube_alignment_status") in ("verified", "manual_verified")
+    return {"id": r["id"], "kind": "staged", "text": r["quote_text"], "guest_id": r.get("guest_id"), "speaker_name": r.get("speaker_name"),
+            "speaker_title": r.get("speaker_title"), "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"),
+            "episode_title": r.get("episode_name"), "episode_date": str(r.get("date_published") or "")[:10] or None,
+            "youtube_id": r.get("youtube_id"), "youtube_start": r.get("youtube_timestamp_start") if verified else r.get("timestamp_start"),
+            "youtube_end": r.get("youtube_timestamp_end") if verified else r.get("timestamp_end"), "moment_verified": verified,
+            "audio": episode_audio_moment(r), "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id")),
+            "editorial_context": r.get("editorial_context"), "context_approved": r.get("context_review_status") == "approved",
+            "has_evidence": bool(str(r.get("source_transcript_excerpt") or "").strip()), "blockers": publish_blockers(r)}
+
+
 @app.function(image=image, secrets=[my_secret], timeout=1800, cpu=2)
 def find_thread_matches(question_id: str, job_id: str = None):
     """Suggest perspectives for one published thread. Suggestions are private until an editor accepts them."""
@@ -12749,6 +12771,11 @@ def fastapi_app():
                      .eq("publication_status", "published").execute().data or []) if q["theme_id"] in themes]
         links = _select_all(lambda: supabase.table("reader_placements_v1").select("question_id"))
         pending = _select_all(lambda: supabase.table("thread_match_suggestions").select("question_id").eq("status", "suggested"))
+        fold = lambda v: " ".join(str(v or "").casefold().split())
+        waiting = {}
+        for r in _select_all(lambda: supabase.table("test_quotes").select(PUBLISH_FIELDS).eq("approval_status", "approved").eq("mapping_review_status", "approved")):
+            key = (fold(r.get("proposed_theme_name")), fold(r.get("proposed_question_text")))
+            w = waiting.setdefault(key, [0, 0]); w[0] += 1; w[1] += not publish_blockers(r)
         count = lambda rows, qid: sum(1 for r in rows if r["question_id"] == qid)
         try:
             proposals = _select_all(lambda: supabase.table("thread_proposals").select("theme_id,scope").eq("status", "suggested"))
@@ -12764,6 +12791,8 @@ def fastapi_app():
             "question_id": q["id"], "question_text": q["question_text"], "question_summary": q.get("summary"), "theme_id": q["theme_id"],
             "theme_name": themes[q["theme_id"]]["name"], "perspectives": count(links, q["id"]),
             "pending_suggestions": count(pending, q["id"]),
+            "mapped": waiting.get((fold(themes[q["theme_id"]]["name"]), fold(q["question_text"])), [0, 0])[0],
+            "ready": waiting.get((fold(themes[q["theme_id"]]["name"]), fold(q["question_text"])), [0, 0])[1],
         } for q in sorted(questions, key=lambda q: (themes[q["theme_id"]]["name"].casefold(), q["question_text"].casefold()))]}
 
     @web_app.post("/threads/{question_id}/find-matches")
@@ -12819,12 +12848,7 @@ def fastapi_app():
         question = (supabase.table("conversation_questions").select("theme_id,question_text").eq("id", question_id).limit(1).execute().data or [None])[0]
         theme = (supabase.table("conversation_themes").select("name").eq("id", question["theme_id"]).limit(1).execute().data or [None])[0] if question else None
         if theme:
-            for r in thread_mapped_takes(supabase, theme["name"], question["question_text"],
-                                         "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published"):
-                mapped.append({"id": r["id"], "kind": "staged", "text": r["quote_text"], "guest_id": r.get("guest_id"), "speaker_name": r.get("speaker_name"),
-                               "speaker_title": r.get("speaker_title"), "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"),
-                               "episode_title": r.get("episode_name"), "episode_date": str(r.get("date_published") or "")[:10] or None,
-                               "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
+            mapped = [mapped_take_row(r) for r in thread_mapped_takes(supabase, theme["name"], question["question_text"], MAPPED_TAKE_FIELDS)]
         return {"success": True, "suggestions": rows, "placed": placed, "mapped": mapped}
 
     @web_app.get("/library")
@@ -12920,6 +12944,24 @@ def fastapi_app():
         _log_decision(supabase, admin, before, {**before, **updates}, "edit", reason_detail="Removed from thread",
                       extra={"surface": "thread_unmap", "question_id": question_id, "question_text": q["question_text"]})
         return {"success": True}
+
+    @web_app.post("/threads/{question_id}/publish-ready")
+    async def publish_ready_in_thread_endpoint(question_id: str, admin=Depends(require_admin)):
+        """Publish every take mapped to this thread that has nothing left to fix (Oct 29). Each goes through the same
+        checked publish step as before, one at a time; anything still blocked stays put and says why."""
+        supabase = service_client()
+        q = (supabase.table("conversation_questions").select("theme_id,question_text").eq("id", question_id).limit(1).execute().data or [None])[0]
+        theme = (supabase.table("conversation_themes").select("name").eq("id", q["theme_id"]).limit(1).execute().data or [None])[0] if q else None
+        if not theme:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        published, failed = [], []
+        for r in thread_mapped_takes(supabase, theme["name"], q["question_text"], PUBLISH_FIELDS):
+            if publish_blockers(r):
+                continue
+            result = await promote_quote_to_production.remote.aio(r["id"], admin["id"])
+            (published if result.get("success") else failed).append({"id": r["id"], "error": result.get("error")})
+        print(f"AUDIT thread_publish_ready question={question_id} by={admin['id']} published={len(published)} failed={len(failed)}")
+        return {"success": True, "published": len(published), "failed": failed}
 
     @web_app.post("/thread-matches/{match_id}/accept")
     async def accept_thread_match_endpoint(match_id: str, admin=Depends(require_admin)):
