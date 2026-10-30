@@ -12872,6 +12872,9 @@ def fastapi_app():
         theme = (supabase.table("conversation_themes").select("name").eq("id", question["theme_id"]).limit(1).execute().data or [None])[0] if question else None
         if theme:
             mapped = [mapped_take_row(r) for r in thread_mapped_takes(supabase, theme["name"], question["question_text"], MAPPED_TAKE_FIELDS)]
+        # Oct 30: newest said first, as readers see the thread
+        newest = lambda r: str(r.get("episode_date") or "")
+        placed.sort(key=newest, reverse=True); mapped.sort(key=newest, reverse=True)
         return {"success": True, "suggestions": rows, "placed": placed, "mapped": mapped}
 
     @web_app.get("/library")
