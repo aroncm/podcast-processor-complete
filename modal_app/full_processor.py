@@ -6730,10 +6730,11 @@ def episode_speaker_groups(rows):
         g["needs_attention"] = g["needs_attention"] or speaker_needs_attention(r)
         # Every quote of the slot, so the editor can hear each one and untick any that is someone else: voice labels are
         # usually right but not always (Oct 29 test: the same guest matched to a host in one run and not another).
+        # Oct 29: every quote id, so By episode can set the speaker on each row (it used to stop at 20)
+        g.setdefault("quote_ids", []).append(r.get("id"))
         if len(g["samples"]) < 20:
             g["samples"].append(str(r.get("quote_text") or "")[:240])
             g["moments"].append(sample_moment(r))
-            g.setdefault("quote_ids", []).append(r.get("id"))
     return sorted(groups.values(), key=lambda g: (-g["count"], g["key"]))
 
 
