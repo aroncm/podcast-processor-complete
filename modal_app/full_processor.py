@@ -12982,7 +12982,8 @@ def fastapi_app():
         if not theme:
             raise HTTPException(status_code=404, detail="Thread not found")
         published, failed = [], []
-        for r in thread_mapped_takes(supabase, theme["name"], q["question_text"], PUBLISH_FIELDS):
+        # Oct 30: PUBLISH_FIELDS has no id; without it every Publish ready crashed before publishing anything
+        for r in thread_mapped_takes(supabase, theme["name"], q["question_text"], f"id,{PUBLISH_FIELDS}"):
             if publish_blockers(r):
                 continue
             result = await promote_quote_to_production.remote.aio(r["id"], admin["id"])

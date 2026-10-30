@@ -1678,3 +1678,11 @@ def test_a_timestamp_read_back_with_fewer_digits_still_counts_as_saved():
     assert same_saved_value("2026-10-30T01:02:03.12345+00:00", "2026-10-30T01:02:03.123450+00:00")
     assert not same_saved_value("2026-10-30T01:02:04+00:00", "2026-10-30T01:02:03+00:00")
     assert not same_saved_value("approved", "unreviewed")
+
+
+def test_publish_ready_loads_the_take_ids_it_publishes():
+    import inspect
+    from modal_app import full_processor
+    src = inspect.getsource(full_processor)
+    body = src[src.index("async def publish_ready_in_thread_endpoint"):src.index('@web_app.post("/thread-matches/{match_id}/accept")')]
+    assert 'f"id,{PUBLISH_FIELDS}"' in body
