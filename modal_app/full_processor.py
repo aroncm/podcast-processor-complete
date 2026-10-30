@@ -12860,17 +12860,21 @@ def fastapi_app():
             "id,text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_title,episode_date,youtube_id,youtube_start,youtube_end,published_at")
             .order("published_at", desc=True))
         placements = _select_all(lambda: supabase.table("reader_placements_v1").select("quote_id,question_id"))
-        questions = {q["id"]: q["question_text"] for q in _select_all(lambda: supabase.table("conversation_questions").select("id,question_text"))}
+        # Oct 29: each thread carries its theme, so the Library can show a theme's questions and their perspectives
+        theme_names = {t["id"]: t["name"] for t in _select_all(lambda: supabase.table("conversation_themes").select("id,name"))}
+        question_rows = _select_all(lambda: supabase.table("conversation_questions").select("id,question_text,theme_id"))
+        questions = {q["id"]: q["question_text"] for q in question_rows}
+        theme_of = {q["id"]: theme_names.get(q.get("theme_id")) for q in question_rows}
         threads_of = {}
         for p in placements:
             if questions.get(p["question_id"]):
-                threads_of.setdefault(p["quote_id"], []).append({"id": p["question_id"], "question": questions[p["question_id"]]})
+                threads_of.setdefault(p["quote_id"], []).append({"id": p["question_id"], "question": questions[p["question_id"]], "theme": theme_of.get(p["question_id"])})
         promoted = {r["source_test_quote_id"] for r in _select_all(lambda: supabase.table("quotes").select("source_test_quote_id")
                                                                      .not_.is_("source_test_quote_id", "null"))}
         staged = [r for r in _select_all(lambda: supabase.table("test_quotes").select(
             "id,quote_text,guest_id,speaker_name,speaker_title,speaker_company,podcast_name,episode_name,date_published,youtube_id,"
             "youtube_alignment_status,youtube_timestamp_start,youtube_timestamp_end,timestamp_start,timestamp_end,rss_timestamp_start,"
-            "rss_timestamp_end,audio_clip_url,episode_audio_url,mapping_review_status,proposed_question_text,updated_at")
+            "rss_timestamp_end,audio_clip_url,episode_audio_url,mapping_review_status,proposed_question_text,proposed_theme_name,updated_at")
             .eq("approval_status", "approved").order("updated_at", desc=True)) if r["id"] not in promoted]
         by_text = {" ".join(str(q).casefold().split()): qid for qid, q in questions.items()}
         items = []
@@ -12889,7 +12893,7 @@ def fastapi_app():
                           "speaker_company": r.get("speaker_company"), "podcast_name": r.get("podcast_name"), "episode_title": r.get("episode_name"),
                           "episode_date": str(r.get("date_published") or "")[:10] or None, "youtube_id": r.get("youtube_id"),
                           "youtube_start": start, "youtube_end": end, "moment_verified": verified, "audio": episode_audio_moment(r),
-                          "threads": [{"id": qid, "question": r["proposed_question_text"]}] if mapped else [],
+                          "threads": [{"id": qid, "question": r["proposed_question_text"], "theme": theme_of.get(qid) or r.get("proposed_theme_name")}] if mapped else [],
                           "speaker_verified": speaker_is_verified(r.get("speaker_name"), r.get("guest_id"))})
         return {"success": True, "items": items}
 
