@@ -4607,6 +4607,19 @@ PUBLISH_FIELDS = (
 )
 
 
+def same_saved_value(saved, expected):
+    """Whether a column read back holds what was written, comparing timestamps as instants."""
+    if saved == expected:
+        return True
+    if isinstance(saved, str) and isinstance(expected, str) and re.match(r"\d{4}-\d{2}-\d{2}T", saved) and re.match(r"\d{4}-\d{2}-\d{2}T", expected):
+        try:
+            parse = lambda v: datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return parse(saved) == parse(expected)
+        except ValueError:
+            return False
+    return False
+
+
 def publish_blockers(record):
     """Everything still standing between a staged take and the reader, in the order an editor fixes it.
     Mirrors the database's own checks (promote_curated_quote and promote_curated_quote_with_conversation),
@@ -14413,9 +14426,11 @@ def fastapi_app():
         if not persisted.data:
             raise HTTPException(status_code=500, detail="Saved take could not be reloaded")
         after = persisted.data
+        # Oct 30: timestamps are compared as times. Postgres drops trailing zeros from microseconds ("…12.123450" comes
+        # back "…12.12345"), so a string compare failed about one save in ten after the save had succeeded.
         mismatched_fields = [
             key for key, expected in updates.items()
-            if key != "updated_at" and after.get(key) != expected
+            if key != "updated_at" and not same_saved_value(after.get(key), expected)
         ]
         if mismatched_fields:
             raise HTTPException(

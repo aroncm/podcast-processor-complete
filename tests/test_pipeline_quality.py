@@ -1671,3 +1671,10 @@ def test_a_mapped_take_says_what_stands_between_it_and_readers():
     draft = mapped_take_row({**ready, "context_review_status": "unreviewed", "source_transcript_excerpt": None})
     assert draft["blockers"] == ["approve the context", "attach the transcript evidence"]
     assert not draft["context_approved"] and not draft["has_evidence"]
+
+
+def test_a_timestamp_read_back_with_fewer_digits_still_counts_as_saved():
+    from modal_app.full_processor import same_saved_value
+    assert same_saved_value("2026-10-30T01:02:03.12345+00:00", "2026-10-30T01:02:03.123450+00:00")
+    assert not same_saved_value("2026-10-30T01:02:04+00:00", "2026-10-30T01:02:03+00:00")
+    assert not same_saved_value("approved", "unreviewed")
