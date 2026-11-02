@@ -13336,6 +13336,13 @@ def fastapi_app():
                 person = (supabase.table("guests").select("id,name,title,company,linkedin_url").eq("id", row.guest_id).limit(1).execute().data or [None])[0]
                 if not person:
                     errors.append(f"{row.key}: that directory person no longer exists"); continue
+                # Nov 2: a directory person missing a title or company gets the editor's, so the quote can be approved.
+                # Only empty fields are filled; a person's existing title or company is never overwritten here.
+                fill = {f: (getattr(row, f) or "").strip() for f in ("title", "company")
+                        if not str(person.get(f) or "").strip() and (getattr(row, f) or "").strip()}
+                if fill:
+                    supabase.table("guests").update(fill).eq("id", person["id"]).execute()
+                    person = {**person, **fill}
             else:
                 name, title, company = (row.name or "").strip(), (row.title or "").strip(), (row.company or "").strip()
                 if len(name.split()) < 2 or not title or not company:
