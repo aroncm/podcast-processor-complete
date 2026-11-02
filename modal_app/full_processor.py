@@ -6761,6 +6761,22 @@ def clean_linkedin_url(value):
     return url
 
 
+def fill_directory_role(supabase, person):
+    """Copy a directory person's title and company onto their pending and approved quotes that have none (Nov 2), so
+    filling a person in once unblocks every quote linked to them. A quote's own title or company is never overwritten."""
+    filled = 0
+    for field, column in (("title", "speaker_title"), ("company", "speaker_company")):
+        value = str(person.get(field) or "").strip()
+        if not value:
+            continue
+        for blank in (supabase.table("test_quotes").update({column: value}).eq("guest_id", person["id"])
+                      .in_("approval_status", ["pending", "approved"]).is_(column, "null"),
+                      supabase.table("test_quotes").update({column: value}).eq("guest_id", person["id"])
+                      .in_("approval_status", ["pending", "approved"]).eq(column, "")):
+            filled += len(blank.execute().data or [])
+    return filled
+
+
 def roster_person_fields(person, before=None):
     """The quote fields an episode roster row writes, with the audit of where the match came from."""
     resolution = dict((before or {}).get("directory_resolution") or {})
@@ -13343,6 +13359,7 @@ def fastapi_app():
                 if fill:
                     supabase.table("guests").update(fill).eq("id", person["id"]).execute()
                     person = {**person, **fill}
+                    fill_directory_role(supabase, person)
             else:
                 name, title, company = (row.name or "").strip(), (row.title or "").strip(), (row.company or "").strip()
                 if len(name.split()) < 2 or not title or not company:
