@@ -4645,6 +4645,11 @@ def publish_blockers(record):
     return blockers
 
 
+def context_edited(draft, value):
+    """True when the editor changed the drafted context (ignoring spacing), so the AI draft's word floor no longer applies."""
+    return " ".join(str(draft or "").split()) != " ".join(str(value or "").split())
+
+
 def editorial_gate_invalidations(before, updates):
     """Reopen only the approval gates affected by an audited edit."""
     before = before or {}
@@ -14354,7 +14359,11 @@ def fastapi_app():
                 updates["rejection_reason"] = req.reason_detail or req.reason_code
             elif req.action == "approve_context":
                 context_value = updates.get("editorial_context", before.get("editorial_context"))
-                if not context_value or len(context_value.split()) < 25:
+                # Nov 2 (Craig): the 25-word floor catches thin AI drafts; a context the editor wrote or edited is theirs
+                # to size, so it only has to say something.
+                if not context_value or not context_value.split():
+                    raise HTTPException(status_code=422, detail="Write the context before approving it")
+                if not context_edited(before.get("editorial_context"), context_value) and len(context_value.split()) < 25:
                     raise HTTPException(status_code=422, detail="Context is too thin for SME approval")
                 updates.update({
                     "context_review_status": "approved",

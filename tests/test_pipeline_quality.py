@@ -64,6 +64,7 @@ from modal_app.full_processor import (
     missing_take_verification_fields,
     PUBLISH_FIELDS,
     publish_blockers,
+    context_edited,
     merge_reviewed_question_taxonomy,
     merge_tentative_conversation_candidates,
     merge_verified_speaker_connections,
@@ -1471,6 +1472,11 @@ class EpisodeRosterTests(unittest.TestCase):
                                          {"key": "label:nope", "name": "X Y", "title": "", "company": "", "evidence": "", "confidence": "low"}]}, groups, people)
         self.assertEqual(out[0]["guest_id"], "ari")
         self.assertEqual(out[1]["name"], "", "a slot with no proposal stays empty, never invented")
+
+    def test_context_edited_ignores_spacing_only(self):
+        self.assertFalse(context_edited("Consumer adoption of AI.", "  Consumer adoption  of AI. "))
+        self.assertTrue(context_edited("A long AI draft about search.", "Consumer adoption of AI for their questions."))
+        self.assertTrue(context_edited(None, "An editor's own context."))
 
     def test_roster_fields_audit(self):
         f = roster_person_fields({"id": "ari", "name": "Ari Paparo", "title": "CEO", "company": "Marketecture"}, {"directory_resolution": {"category_status": "matched"}})
