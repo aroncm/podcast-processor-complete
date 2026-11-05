@@ -501,6 +501,10 @@ def update_processing_job_from_env(job_id: str | None, state: str, **fields) -> 
         print(f"AUDIT_WARNING job={job_id} state={state} client_failed={exc}")
 
 
+CREDIT_STOP_MESSAGE = ("Stopped: OpenAI would not run (out of credits, or the key was refused) after {done} "
+                       "episode(s) finished. The rest stay waiting and run on the next batch once the balance is topped up.")
+
+
 def _process_episode_with_ai_impl(
     feed_ids: list = None,
     start_date: str = None,
@@ -601,8 +605,11 @@ def _process_episode_with_ai_impl(
     start_dt = datetime.fromisoformat(start_date) if start_date else None
     end_dt = datetime.fromisoformat(end_date) if end_date else None
     
+    # Nov 4: an empty OpenAI balance (or a bad key) fails every episode the same way, so the batch stops at the first
+    # one and says so, instead of trying the rest and reporting a quiet night.
+    credit_stop = None
     for feed in feeds.data:
-        if attempted_episodes >= effective_max_episodes:
+        if attempted_episodes >= effective_max_episodes or credit_stop:
             break
         print(f"\n📡 Processing Feed: {feed['name']}")
         
@@ -698,6 +705,10 @@ def _process_episode_with_ai_impl(
                 )
                 all_results.append(result)
                 attempted_episodes += 1
+                if isinstance(result, dict) and result.get("error") and openai_error_is_account_blocking(Exception(result["error"])):
+                    credit_stop = {"podcast": feed["name"], "episode": episode.title, "error": str(result["error"])[:1000]}
+                    print(f"🛑 OpenAI account blocked (credits or key); stopping the batch: {credit_stop['error'][:200]}")
+                    break
                 
         except Exception as e:
             print(f"❌ Error processing feed {feed['name']}: {str(e)}")
@@ -723,9 +734,10 @@ def _process_episode_with_ai_impl(
         "youtube_alignment_verified": youtube_alignments_verified,
         "youtube_alignment_failed": youtube_alignment_failures,
         "details": all_results,
+        "stopped_for_credits": credit_stop,
     }
     final_state = (
-        "failed" if failed_results and not successful_results
+        "failed" if credit_stop or (failed_results and not successful_results)
         else "succeeded_with_warnings" if failed_results or youtube_alignment_failures
         else "succeeded"
     )
@@ -740,7 +752,8 @@ def _process_episode_with_ai_impl(
             "youtube_alignment_failed": youtube_alignment_failures,
         },
         error_code=(
-            "episode_processing_failed" if final_state == "failed"
+            "openai_credits_exhausted" if credit_stop
+            else "episode_processing_failed" if final_state == "failed"
             else "youtube_alignment_incomplete"
             if final_state == "succeeded_with_warnings" and youtube_alignment_failures
             else "episode_processing_partial"
@@ -748,7 +761,8 @@ def _process_episode_with_ai_impl(
             else None
         ),
         error_message=(
-            "; ".join(str(item.get("error")) for item in failed_results)[:4000]
+            CREDIT_STOP_MESSAGE.format(done=len(successful_results)) if credit_stop
+            else "; ".join(str(item.get("error")) for item in failed_results)[:4000]
             if final_state == "failed"
             else f"{youtube_alignment_failures} takes require exact YouTube source verification"
             if youtube_alignment_failures
@@ -10968,7 +10982,7 @@ def scheduled_processor():
     log_id = log.data[0]['id'] if log.data else None
 
     try:
-        max_episodes = int(os.environ.get('SCHEDULED_MAX_EPISODES', '2'))
+        max_episodes = int(os.environ.get('SCHEDULED_MAX_EPISODES', '4'))
         idempotency_key = f"scheduled:{datetime.now(timezone.utc).date().isoformat()}"
         existing_job = (
             supabase.table("processing_jobs")
@@ -11015,9 +11029,11 @@ def scheduled_processor():
             for item in result.get('details', [])
             if isinstance(item, dict)
         )
+        credit_stop = result.get('stopped_for_credits')
         if log_id:
             supabase.table('automation_logs').update({
-                'status': 'success',
+                'status': 'failed' if credit_stop else 'success',
+                'error_message': CREDIT_STOP_MESSAGE.format(done=episodes_processed) if credit_stop else None,
                 'result': result,
                 'episodes_processed': episodes_processed,
                 'quotes_extracted': quotes_extracted,
