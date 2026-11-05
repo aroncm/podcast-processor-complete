@@ -8473,7 +8473,13 @@ def call_openai_structured(
             record_openai_response_usage(response, schema_name)
             if getattr(response, "status", None) == "incomplete":
                 details = getattr(response, "incomplete_details", None)
-                raise RuntimeError(f"OpenAI response incomplete: {details}")
+                # Nov 4: long episodes ran out of room at high reasoning (5 of 22 in the catch-up). Give the same
+                # request twice the room, up to 32k, before calling it a failure.
+                if getattr(details, "reason", None) == "max_output_tokens" and max_output_tokens < 32000 and attempt < max_retries - 1:
+                    max_output_tokens = min(32000, max_output_tokens * 2)
+                    print(f"⚠️ {schema_name} ran out of output room; retrying with max_output_tokens={max_output_tokens}")
+                    continue
+                raise RuntimeError(f"OpenAI response incomplete ({schema_name}): {details}")
             output_text = getattr(response, "output_text", "")
             if not output_text:
                 raise RuntimeError("OpenAI returned no structured output")
