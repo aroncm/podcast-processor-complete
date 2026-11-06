@@ -511,6 +511,7 @@ def _process_episode_with_ai_impl(
     end_date: str = None,
     max_episodes: int = None,
     job_id: str = None,
+    rerun_guids: list = None,
 ):
     """Process full episode with quality-focused quote extraction. Supports manual date/feed filtering."""
     
@@ -654,7 +655,8 @@ def _process_episode_with_ai_impl(
 
                 # 3. Analyzed but kept nothing (Oct 26): an episode whose analysis finished with zero perspectives has
                 # no test_quotes row, so the checks above would process it again on every run.
-                if not is_duplicate and getattr(entry, 'id', None):
+                # Nov 5: rerun_guids re-picks quotes for episodes that came back empty (transcript is reused).
+                if not is_duplicate and getattr(entry, 'id', None) and getattr(entry, 'id', None) not in set(rerun_guids or []):
                     res = (supabase.table('episode_processing_artifacts').select('id').eq('episode_guid', entry.id)
                            .not_.is_('analysis_cost_usd', 'null').limit(1).execute())
                     if res.data:
@@ -785,6 +787,7 @@ def process_episode_with_ai(
     end_date: str = None,
     max_episodes: int = None,
     job_id: str = None,
+    rerun_guids: list = None,
 ):
     """Audited Modal entrypoint. The job row remains the durable source of truth."""
     try:
@@ -794,6 +797,7 @@ def process_episode_with_ai(
             end_date=end_date,
             max_episodes=max_episodes,
             job_id=job_id,
+            rerun_guids=rerun_guids,
         )
     except Exception as exc:
         update_processing_job_from_env(
