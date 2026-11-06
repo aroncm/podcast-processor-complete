@@ -4647,10 +4647,8 @@ def publish_blockers(record):
     blockers = [f"verify the {label}" for label in missing_take_verification_fields(record)]
     if record.get("approval_status") != "approved":
         blockers.append("approve the take")
-    if record.get("context_review_status") != "approved":
-        blockers.append("approve the context")
-    elif not text("editorial_context"):
-        blockers.append("write the context")
+    # Context approval is not a publish step since Nov 6 (Craig): readers never see the context, so the take, theme
+    # and question approvals are enough (migration 20261106120000 drops the matching database checks).
     if not text("source_transcript_excerpt"):
         blockers.append("attach the transcript evidence")
     if record.get("mapping_review_status") != "approved":

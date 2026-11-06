@@ -1214,9 +1214,13 @@ class PublishPathTests(unittest.TestCase):
 
     def test_every_missing_item_is_listed_at_once(self):
         blockers = publish_blockers({})
-        for item in ("approve the take", "approve the context", "attach the transcript evidence",
+        for item in ("approve the take", "attach the transcript evidence",
                      "approve the theme, question and connections"):
             self.assertIn(item, blockers)
+        self.assertNotIn("approve the context", blockers)
+
+    def test_context_approval_is_not_required(self):
+        self.assertEqual(publish_blockers(dict(self.READY, context_review_status="unreviewed", editorial_context=None)), [])
 
 
 class ThreadMatchingTests(unittest.TestCase):
@@ -1675,7 +1679,7 @@ def test_a_mapped_take_says_what_stands_between_it_and_readers():
              "proposed_theme_name": "Data", "proposed_theme_summary": "s", "proposed_question_text": "q?", "connection_context": "c"}
     assert mapped_take_row(ready)["blockers"] == []
     draft = mapped_take_row({**ready, "context_review_status": "unreviewed", "source_transcript_excerpt": None})
-    assert draft["blockers"] == ["approve the context", "attach the transcript evidence"]
+    assert draft["blockers"] == ["attach the transcript evidence"]
     assert not draft["context_approved"] and not draft["has_evidence"]
 
 
