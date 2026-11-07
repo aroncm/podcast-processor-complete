@@ -11288,13 +11288,15 @@ def reader_updates():
 
 
 def send_thread_notifications(supabase):
-    state = supabase.table("automation_settings").select("value").eq("key", "push_last_published_at").limit(1).execute().data
-    since = (state[0]["value"] if state else None)
+    # Where the last run stopped, kept in a Modal Dict: automation_settings.value is boolean, so saving a time there
+    # failed on every run and no notification was ever sent (fixed Nov 7).
+    store = modal.Dict.from_name("podthreads-push-state", create_if_missing=True)
+    since = store.get("last_published_at")
     placements = _select_all(lambda: supabase.table("reader_placements_v1").select("quote_id,question_id,theme_id,published_at"))
     newest = max((p["published_at"] for p in placements if p.get("published_at")), default=None)
     if since is None or newest is None:
         if newest:
-            save_setting(supabase, "push_last_published_at", newest)
+            store["last_published_at"] = newest
         return {"status": "initialized", "since": newest}
     fresh = [p for p in placements if p.get("published_at") and p["published_at"] > since]
     if not fresh:
@@ -11323,7 +11325,7 @@ def send_thread_notifications(supabase):
         sent += sum(len(v) for v in targets.values())
     for t in gone:
         supabase.table("push_devices").delete().eq("token", t).execute()
-    save_setting(supabase, "push_last_published_at", newest)
+    store["last_published_at"] = newest
     return {"status": "sent", "notifications": sent, "removed_devices": len(gone)}
 
 
