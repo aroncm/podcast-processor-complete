@@ -11065,25 +11065,35 @@ def scheduled_processor():
 # around the stored RSS time, transcribed, and kept only when the perspective's words are found in it.
 MOMENT_AUDIO_BUCKET = "moment-audio"
 MOMENT_WINDOW_PAD = 40.0          # seconds of audio on each side of the stored time
+MOMENT_WIDE_PAD = 120.0           # second try, and first try for a legacy time of unknown source (Nov 7)
 MOMENT_TRANSCRIBE_USD_PER_MIN = 0.006
 push_image = image.pip_install("pyjwt[crypto]==2.10.1", "httpx[http2]==0.28.1")
 
 
-def build_one_moment_audio(supabase, client, quote):
+def moment_time(quote):
+    """The stored time to search around: the RSS time, else the original time. A legacy time of unknown source is
+    still worth a wide try, since the clip is kept only when the words are heard (Nov 7)."""
+    start, end = quote.get("rss_timestamp_start"), quote.get("rss_timestamp_end")
+    if start is not None and end is not None:
+        return start, end, True
+    if quote.get("timestamp_start") is not None and quote.get("timestamp_end") is not None:
+        return quote["timestamp_start"], quote["timestamp_end"], quote.get("timestamp_source") in (None, "rss", "whisper")
+    return None, None, False
+
+
+def build_one_moment_audio(supabase, client, quote, pad=MOMENT_WINDOW_PAD):
     """Cut, verify and upload one perspective's audio. Returns (row or None, minutes transcribed, reason)."""
     import subprocess
     import tempfile
-    start, end = quote.get("rss_timestamp_start"), quote.get("rss_timestamp_end")
-    if start is None or end is None:
-        if quote.get("timestamp_source") in (None, "rss", "whisper") and quote.get("timestamp_start") is not None:
-            start, end = quote.get("timestamp_start"), quote.get("timestamp_end")
-        else:
-            return None, 0.0, "no_rss_time"
+    start, end, _ = moment_time(quote)
+    if start is None:
+        return None, 0.0, "no_time"
     audio_url = quote.get("_audio_url")
     if not audio_url:
         return None, 0.0, "no_audio_url"
-    win_start = max(0.0, float(start) - MOMENT_WINDOW_PAD)
-    win_len = min(600.0, float(end) - float(start) + 2 * MOMENT_WINDOW_PAD)
+    win_start = max(0.0, float(start) - pad)
+    pad = float(start) - win_start   # near the episode's start the window has less audio before the time
+    win_len = min(600.0, float(end) - float(start) + 2 * pad)
     window = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
     clip = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
     try:
@@ -11101,7 +11111,7 @@ def build_one_moment_audio(supabase, client, quote):
             text = str(get("text", "") or "").strip()
             if text:
                 segments.append({"id": i, "start": float(get("start", 0)), "end": float(get("end", 0)), "raw_text": text, "text": text})
-        ranked = rank_source_alignment_candidates(quote["text"], segments, MOMENT_WINDOW_PAD, MOMENT_WINDOW_PAD + float(end) - float(start), max_candidates=1)
+        ranked = rank_source_alignment_candidates(quote["text"], segments, pad, pad + float(end) - float(start), max_candidates=1)
         if not ranked or ranked[0]["lexical_score"] < 0.55 or ranked[0]["distinctive_overlap"] < 3:
             return None, minutes, "words_not_found"
         best = ranked[0]
@@ -11184,7 +11194,13 @@ def build_moment_audio(quote_ids: list = None, max_cost_usd: float = 3.0, limit:
     import threading
     from concurrent.futures import ThreadPoolExecutor
     spent, outcomes, lock = [0.0], Counter(), threading.Lock()
-    per_clip = (2 * MOMENT_WINDOW_PAD + 60) / 60 * MOMENT_TRANSCRIBE_USD_PER_MIN
+    per_clip = (2 * MOMENT_WIDE_PAD + 60) / 60 * MOMENT_TRANSCRIBE_USD_PER_MIN
+    # Perspectives whose words were not found, with the widest window tried, so a miss is not re-transcribed every
+    # 30 minutes: a trusted time gets a narrow try then a wide one, a legacy time one wide try, then we stop (Nov 7).
+    # Kept in a Modal Dict: automation_settings.value is boolean.
+    miss_store = modal.Dict.from_name("podthreads-moment-audio-misses", create_if_missing=True)
+    misses = miss_store.get("misses", {})
+    targets = [q for q in moment_audio_targets(supabase, quote_ids) if misses.get(q["id"], 0) < MOMENT_WIDE_PAD]
 
     def one(quote):
         with lock:
@@ -11198,7 +11214,12 @@ def build_moment_audio(quote_ids: list = None, max_cost_usd: float = 3.0, limit:
             if supabase.table("moment_audio").select("quote_id").eq("quote_id", quote["id"]).limit(1).execute().data:
                 reason = "already_done"
             else:
-                _, minutes, reason = build_one_moment_audio(supabase, client, quote)
+                trusted = moment_time(quote)[2]
+                pad = MOMENT_WINDOW_PAD if trusted and quote["id"] not in misses else MOMENT_WIDE_PAD
+                _, minutes, reason = build_one_moment_audio(supabase, client, quote, pad)
+                if reason == "words_not_found":
+                    with lock:
+                        misses[quote["id"]] = pad
         except Exception as exc:
             reason = f"error:{type(exc).__name__}"
             print(f"moment audio {quote['id']}: {exc}")
@@ -11207,7 +11228,8 @@ def build_moment_audio(quote_ids: list = None, max_cost_usd: float = 3.0, limit:
             outcomes[reason] += 1
 
     with ThreadPoolExecutor(6) as pool:
-        list(pool.map(one, moment_audio_targets(supabase, quote_ids)[:limit]))
+        list(pool.map(one, targets[:limit]))
+    miss_store["misses"] = misses
     spent = spent[0]
     print(f"moment audio: {dict(outcomes)}, transcription ${spent:.2f}")
     return {"outcomes": dict(outcomes), "transcription_usd": round(spent, 4)}
