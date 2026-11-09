@@ -35,7 +35,7 @@ PIPELINE_VERSION = "podthreads-hybrid-v6-checkpointed-directory-aware"
 YOUTUBE_ALIGNMENT_VERSION = "youtube-caption-align-v4-semantic-candidate"
 SEMANTIC_ALIGNMENT_PROMPT_VERSION = "source-paraphrase-alignment-v1"
 TRANSCRIPT_CORRECTION_PROMPT_VERSION = "adtech-terminology-correction-v2-bounded"
-EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v5-speaker-aware"
+EXTRACTION_PROMPT_VERSION = "legacy-hybrid-takes-v6-guest-aware"
 RANKING_PROMPT_VERSION = "legacy-hybrid-ranking-v4"
 CONTEXT_PROMPT_VERSION = "adtech-connective-context-v3"
 MAPPING_PROMPT_VERSION = "adtech-controlled-theme-mapping-v4"
@@ -512,6 +512,7 @@ def _process_episode_with_ai_impl(
     max_episodes: int = None,
     job_id: str = None,
     rerun_guids: list = None,
+    guest_only_guids: list = None,
 ):
     """Process full episode with quality-focused quote extraction. Supports manual date/feed filtering."""
     
@@ -641,13 +642,16 @@ def _process_episode_with_ai_impl(
 
                 # 1. Check GUID (Best)
                 is_duplicate = False
-                if hasattr(entry, 'id'):
+                # Nov 9: guest_only_guids are staged episodes that kept no take from their guest; they go through again
+                # for the guest's take only (the transcript is reused).
+                guest_only = getattr(entry, 'id', None) in set(guest_only_guids or [])
+                if hasattr(entry, 'id') and not guest_only:
                     res = supabase.table('test_quotes').select('id').eq('episode_guid', entry.id).limit(1).execute()
                     if res.data:
                         is_duplicate = True
                 
                 # 2. Check Truncated Title (Fallback - DB stores max 100 chars)
-                if not is_duplicate:
+                if not is_duplicate and not guest_only:
                     truncated_title = entry.title[:100]
                     res = supabase.table('test_quotes').select('id').eq('episode_name', truncated_title).limit(1).execute()
                     if res.data:
@@ -656,7 +660,7 @@ def _process_episode_with_ai_impl(
                 # 3. Analyzed but kept nothing (Oct 26): an episode whose analysis finished with zero perspectives has
                 # no test_quotes row, so the checks above would process it again on every run.
                 # Nov 5: rerun_guids re-picks quotes for episodes that came back empty (transcript is reused).
-                if not is_duplicate and getattr(entry, 'id', None) and getattr(entry, 'id', None) not in set(rerun_guids or []):
+                if not is_duplicate and not guest_only and getattr(entry, 'id', None) and getattr(entry, 'id', None) not in set(rerun_guids or []):
                     res = (supabase.table('episode_processing_artifacts').select('id').eq('episode_guid', entry.id)
                            .not_.is_('analysis_cost_usd', 'null').limit(1).execute())
                     if res.data:
@@ -704,6 +708,7 @@ def _process_episode_with_ai_impl(
                     client,
                     supabase,
                     job_id=job_id,
+                    guest_only=episode_guid in set(guest_only_guids or []),
                 )
                 all_results.append(result)
                 attempted_episodes += 1
@@ -788,6 +793,7 @@ def process_episode_with_ai(
     max_episodes: int = None,
     job_id: str = None,
     rerun_guids: list = None,
+    guest_only_guids: list = None,
 ):
     """Audited Modal entrypoint. The job row remains the durable source of truth."""
     try:
@@ -798,6 +804,7 @@ def process_episode_with_ai(
             max_episodes=max_episodes,
             job_id=job_id,
             rerun_guids=rerun_guids,
+            guest_only_guids=guest_only_guids,
         )
     except Exception as exc:
         update_processing_job_from_env(
@@ -7658,7 +7665,7 @@ Prefer abstention to generic analysis or unsupported connections.
     )
 
 
-def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
+def process_single_episode_logic(episode, feed, client, supabase, job_id=None, guest_only=False):
     """Refactored logic for processing a single episode"""
     import subprocess
     import tempfile
@@ -7689,6 +7696,14 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         f"and {len(take_directory.get('people', []))} speaker records; "
         f"{len(known_episode_people)} people matched episode metadata"
     )
+    show_regular_names, episode_guests = [], []
+    try:
+        show_regular_names = show_regulars(supabase, feed.get("name", ""))
+        episode_guests = identify_episode_guests(client, feed.get("name", ""), getattr(episode, "title", ""),
+                                                 rss_episode_metadata, show_regular_names)
+    except Exception as exc:
+        print(f"AUDIT_WARNING guest identification abstained: {type(exc).__name__}: {str(exc)[:200]}")
+    print(f"  🎙️ Invited guests: {', '.join(g['name'] for g in episode_guests) or 'none named'}")
 
     
     try:
@@ -7975,6 +7990,84 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         except Exception as exc:
             print(f"AUDIT_WARNING transcript artifact persistence failed: {exc}")
 
+        def ground(candidate):
+            """Bind a candidate to the transcript segments it quotes; raises when the quote is not safely grounded."""
+            start_id = int(candidate.get("start_segment_id"))
+            end_id = int(candidate.get("end_segment_id"))
+            if start_id < 0 or end_id < start_id or end_id >= len(segments):
+                raise ValueError("segment range outside transcript")
+
+            source_excerpt = " ".join(
+                segment["text"] for segment in segments[start_id:end_id + 1]
+            ).strip()
+            raw_source_excerpt = " ".join(
+                segment["text"] for segment in raw_segments[start_id:end_id + 1]
+            ).strip()
+            candidate_text = candidate.get("text", "").strip()
+            if not candidate_has_publishable_length(candidate_text):
+                raise ValueError(
+                    f"quote length outside {MIN_QUOTE_WORDS}-{MAX_QUOTE_WORDS} words "
+                    f"({quote_word_count(candidate_text)} words)"
+                )
+            source_normalized = normalize_text(source_excerpt)
+            candidate_normalized = normalize_text(candidate_text)
+            if not candidate_normalized or candidate_normalized not in source_normalized:
+                from difflib import SequenceMatcher
+                similarity = SequenceMatcher(
+                    None,
+                    candidate_normalized,
+                    source_normalized,
+                ).ratio()
+                if similarity < 0.62:
+                    raise ValueError(f"quote not grounded in source (similarity={similarity:.2f})")
+
+            start_time = max(0, float(segments[start_id]["start"]) - 0.5)
+            end_time = float(segments[end_id]["end"]) + 0.5
+            if end_time - start_time < 15:
+                end_time = start_time + 15
+
+            source_speaker_label = quote_voice(segments[start_id:end_id + 1])
+            candidate_speaker_label = str(candidate.get("speaker_label") or "").strip()
+            if source_speaker_label and candidate_speaker_label != source_speaker_label:
+                raise ValueError("candidate speaker label does not match source segments")
+
+            identity = speaker_identity_map.get(source_speaker_label)
+            identity_fields = {}
+            if identity:
+                person = identity["person"]
+                identity_fields = {
+                    "speaker": person.get("name"),
+                    "speaker_title": person.get("title"),
+                    "speaker_company": person.get("company"),
+                    "speaker_linkedin": person.get("linkedin_url"),
+                    "guest_id": person.get("id"),
+                    "directory_resolution": {
+                        "speaker_status": "matched",
+                        "speaker_source": "diarized_explicit_identity_evidence",
+                        "speaker_confidence": identity.get("confidence"),
+                        "speaker_identity_basis": identity.get("identity_basis"),
+                        "speaker_evidence_segment_ids": identity.get("evidence_segment_ids"),
+                    },
+                }
+
+            candidate.update({
+                "clip_start": int(start_time),
+                "clip_end": int(end_time),
+                "clip_duration": int(end_time - start_time),
+                "start_seg": start_id,
+                "end_seg": end_id,
+                "source_transcript_excerpt": source_excerpt,
+                "raw_source_transcript_excerpt": raw_source_excerpt,
+                "transcript_corrections": corrections_for_segment_range(
+                    applied_corrections,
+                    start_id,
+                    end_id,
+                ),
+                "speaker_label": source_speaker_label or None,
+                **identity_fields,
+            })
+            return candidate
+
         # Generate candidates from every transcript chunk; each chunk may abstain.
         print("🧠 Extracting source-grounded candidates from the complete transcript...")
         formatted_chunks = build_extraction_chunks(segments)
@@ -7986,7 +8079,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
             progress={"extraction_chunks": len(formatted_chunks), "extraction_chunk": 0},
         )
 
-        for chunk_index, chunk_text in enumerate(formatted_chunks):
+        # A guest-only run (Nov 9) skips the full pass: the episode's takes are already staged.
+        for chunk_index, chunk_text in enumerate([] if guest_only else formatted_chunks):
             time.sleep(0.25)
             update_processing_job(
                 supabase,
@@ -8006,85 +8100,12 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
                 curation_examples=curation_examples,
                 category_directory=take_directory.get("categories", []),
                 episode_people=known_episode_people,
+                episode_guests=episode_guests,
             )
 
             for candidate in candidates:
                 try:
-                    start_id = int(candidate.get("start_segment_id"))
-                    end_id = int(candidate.get("end_segment_id"))
-                    if start_id < 0 or end_id < start_id or end_id >= len(segments):
-                        raise ValueError("segment range outside transcript")
-
-                    source_excerpt = " ".join(
-                        segment["text"] for segment in segments[start_id:end_id + 1]
-                    ).strip()
-                    raw_source_excerpt = " ".join(
-                        segment["text"] for segment in raw_segments[start_id:end_id + 1]
-                    ).strip()
-                    candidate_text = candidate.get("text", "").strip()
-                    if not candidate_has_publishable_length(candidate_text):
-                        raise ValueError(
-                            f"quote length outside {MIN_QUOTE_WORDS}-{MAX_QUOTE_WORDS} words "
-                            f"({quote_word_count(candidate_text)} words)"
-                        )
-                    source_normalized = normalize_text(source_excerpt)
-                    candidate_normalized = normalize_text(candidate_text)
-                    if not candidate_normalized or candidate_normalized not in source_normalized:
-                        from difflib import SequenceMatcher
-                        similarity = SequenceMatcher(
-                            None,
-                            candidate_normalized,
-                            source_normalized,
-                        ).ratio()
-                        if similarity < 0.62:
-                            raise ValueError(f"quote not grounded in source (similarity={similarity:.2f})")
-
-                    start_time = max(0, float(segments[start_id]["start"]) - 0.5)
-                    end_time = float(segments[end_id]["end"]) + 0.5
-                    if end_time - start_time < 15:
-                        end_time = start_time + 15
-
-                    source_speaker_label = quote_voice(segments[start_id:end_id + 1])
-                    candidate_speaker_label = str(candidate.get("speaker_label") or "").strip()
-                    if source_speaker_label and candidate_speaker_label != source_speaker_label:
-                        raise ValueError("candidate speaker label does not match source segments")
-
-                    identity = speaker_identity_map.get(source_speaker_label)
-                    identity_fields = {}
-                    if identity:
-                        person = identity["person"]
-                        identity_fields = {
-                            "speaker": person.get("name"),
-                            "speaker_title": person.get("title"),
-                            "speaker_company": person.get("company"),
-                            "speaker_linkedin": person.get("linkedin_url"),
-                            "guest_id": person.get("id"),
-                            "directory_resolution": {
-                                "speaker_status": "matched",
-                                "speaker_source": "diarized_explicit_identity_evidence",
-                                "speaker_confidence": identity.get("confidence"),
-                                "speaker_identity_basis": identity.get("identity_basis"),
-                                "speaker_evidence_segment_ids": identity.get("evidence_segment_ids"),
-                            },
-                        }
-
-                    candidate.update({
-                        "clip_start": int(start_time),
-                        "clip_end": int(end_time),
-                        "clip_duration": int(end_time - start_time),
-                        "start_seg": start_id,
-                        "end_seg": end_id,
-                        "source_transcript_excerpt": source_excerpt,
-                        "raw_source_transcript_excerpt": raw_source_excerpt,
-                        "transcript_corrections": corrections_for_segment_range(
-                            applied_corrections,
-                            start_id,
-                            end_id,
-                        ),
-                        "speaker_label": source_speaker_label or None,
-                        **identity_fields,
-                    })
-                    all_candidates.append(candidate)
+                    all_candidates.append(ground(candidate))
                 except Exception as exc:
                     print(f"⚠️ Rejected ungrounded candidate: {exc}")
 
@@ -8107,6 +8128,37 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         # The quality bar (Oct 29): the editor approved 3 in 4 takes scoring 0.9 and fewer than half under 0.5, so a take
         # under the floor is not staged at all; at most five per episode.
         ranked_quotes = [q for q in ranked_quotes if float(q.get("quality_score") or 0) >= QUALITY_FLOOR][:5]
+
+        def guest_pass():
+            found = []
+            for chunk_num, chunk_text in enumerate(formatted_chunks, 1):
+                for candidate in extract_quotes(
+                    chunk_text, feed['name'], episode.title, client, chunk_num=chunk_num,
+                    curation_examples=curation_examples, category_directory=take_directory.get("categories", []),
+                    episode_people=known_episode_people, episode_guests=episode_guests,
+                    only_speakers=[g["name"] for g in episode_guests],
+                ):
+                    try:
+                        found.append(ground(candidate))
+                    except Exception as exc:
+                        print(f"⚠️ Rejected ungrounded guest candidate: {exc}")
+            return deduplicate_candidates(found)
+
+        already_has_guest = False
+        if guest_only and episode_guests:
+            staged = _retry(lambda: supabase.table("test_quotes").select("speaker_name").eq("podcast_name", feed["name"])
+                            .eq("episode_name", episode.title[:100]).execute().data) or []
+            already_has_guest = any(guest_for_take({"speaker": r.get("speaker_name")}, episode_guests, show_regular_names) for r in staged)
+        try:
+            ranked_quotes, guest_outcome = ensure_guest_take(
+                ranked_quotes, all_candidates, episode_guests, show_regular_names, podcast=feed['name'],
+                episode=episode.title, client=client, curation_examples=curation_examples, guest_pass=guest_pass,
+                already_has_guest=already_has_guest,
+            )
+        except Exception as exc:   # the hosts' takes still go through
+            guest_outcome = f"error:{type(exc).__name__}"
+            print(f"AUDIT_WARNING guest take step failed: {exc}")
+        print(f"🎙️ Guest take: {guest_outcome}")
         ranked_quotes = [
             bind_candidate_to_directories(
                 quote,
@@ -8385,6 +8437,8 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None):
         return {
             "episode": episode.title,
             "quotes": len(saved),
+            "guests": [g["name"] for g in episode_guests],
+            "guest_take": guest_outcome,
             "youtube_id": youtube_id,
             "status": "success" if failed_alignments == 0 else "source_alignment_warning",
             "api_cost": {
@@ -8496,6 +8550,112 @@ def call_openai_structured(
             raise
 
 
+# ---------------------------------------------------------------- the invited guest (Nov 9)
+# Craig, Nov 9: some episodes kept only the hosts' takes (Marketecture 197 and 198, AdTechGod 154, Open Market 120).
+# An episode with an invited guest now keeps at least one take from the guest when one clears the staging floor; the
+# hosts can still have takes too. The guest is whoever the episode's title and description present as the guest:
+# quote history only says who usually speaks on a show, and someone who hosts one show can be the guest on another.
+def show_regulars(supabase, podcast_name, minimum_episodes=3):
+    """Names quoted in at least three of this show's episodes: usually its hosts."""
+    rows = _select_all(lambda: supabase.table("test_quotes").select("speaker_name,episode_guid,episode_name").eq("podcast_name", podcast_name))
+    episodes = {}
+    for r in rows:
+        name = str(r.get("speaker_name") or "").strip()
+        if len(name.split()) >= 2 and name.casefold() not in PLACEHOLDER_SPEAKERS:
+            episodes.setdefault(name, set()).add(r.get("episode_guid") or r.get("episode_name"))
+    return sorted((n for n, e in episodes.items() if len(e) >= minimum_episodes), key=lambda n: -len(episodes[n]))
+
+
+def identify_episode_guests(client, podcast, episode_title, metadata, regulars):
+    """The invited guests named in the episode listing, or none for a hosts-only episode."""
+    schema = {"type": "object", "properties": {"guests": {"type": "array", "items": {"type": "object", "properties": {
+        "name": {"type": "string"}, "title": {"type": "string"}, "company": {"type": "string"}, "evidence": {"type": "string"}},
+        "required": ["name", "title", "company", "evidence"], "additionalProperties": False}}},
+        "required": ["guests"], "additionalProperties": False}
+    data = call_openai_structured(
+        client,
+        model=os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra"),
+        system_prompt="You read a podcast episode's listing and name its invited guests. Never invent a person.",
+        user_prompt=f"""
+Podcast: {podcast}
+Episode title: {episode_title}
+Episode listing (title, description, notes):
+{str(metadata or "")[:6000]}
+
+People quoted on many of this show's episodes (usually its hosts): {json.dumps(regulars, ensure_ascii=False)}
+
+List the invited guests of this episode: the people the title or description presents as the guest or interviewee.
+A regular of the show is not a guest, unless the listing presents them as this episode's guest (someone who hosts one
+show can be the guest on another). Return no guests for an episode with only the hosts. Use full names exactly as
+written in the listing; title and company only when the listing gives them, otherwise empty. Evidence quotes the words.
+""",
+        schema_name="podthreads_episode_guests",
+        schema=schema,
+        reasoning_effort="low",
+        max_output_tokens=1500,
+    )
+    guests = []
+    for g in data.get("guests") or []:
+        name = str(g.get("name") or "").strip()
+        if len(name.split()) >= 2 and name.casefold() not in PLACEHOLDER_SPEAKERS:
+            guests.append({"name": name, "title": str(g.get("title") or "").strip(), "company": str(g.get("company") or "").strip()})
+    return guests[:4]
+
+
+def _name_tokens(name):
+    import unicodedata
+    plain = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().casefold()
+    return set(re.sub(r"[^a-z0-9]+", " ", plain).split())
+
+
+def guest_for_take(candidate, guests, regulars=()):
+    """The guest who said this take, or None. A transcribed first or last name counts ("Chris" for Chris Harihar),
+    unless it also belongs to a regular of the show who is not this episode's guest."""
+    speaker = _name_tokens(candidate.get("speaker"))
+    if not speaker or str(candidate.get("speaker") or "").strip().casefold() in PLACEHOLDER_SPEAKERS:
+        return None
+    guest_tokens = set().union(*(_name_tokens(g["name"]) for g in guests)) if guests else set()
+    others = set().union(*(_name_tokens(r) for r in regulars)) - guest_tokens if regulars else set()
+    if speaker & others:
+        return None
+    matches = [g for g in guests if speaker & _name_tokens(g["name"])]
+    return matches[0] if len(matches) == 1 else None
+
+
+def ensure_guest_take(ranked, candidates, guests, regulars, *, podcast, episode, client, curation_examples="",
+                      guest_pass=None, already_has_guest=False):
+    """At least one take from the invited guest (Craig, Nov 9). Returns (takes, outcome). When the picks hold no guest
+    take, the guest's candidates (all of them, not only the first thirty ranked) are ranked on the same standard against
+    the staging floor rather than the 0.74 ranking cut; when the guest had no candidate, guest_pass() looks again for
+    the guest's words only. The best is added; at five takes, the weakest host take makes room."""
+    if not guests:
+        return ranked, "no_guest_named"
+    if already_has_guest or any(guest_for_take(q, guests, regulars) for q in ranked):
+        return ranked, "guest_already_kept"
+    pool = [c for c in candidates if guest_for_take(c, guests, regulars)]
+    outcome = "from_candidates"
+    if not pool and guest_pass:
+        pool = [c for c in guest_pass() if guest_for_take(c, guests, regulars)]
+        outcome = "from_guest_pass"
+    if not pool:
+        return ranked, "guest_has_no_candidate"
+    names = ", ".join(g["name"] for g in guests)
+    picked = rank_quote_candidates(
+        pool[:30], podcast, episode, client, curation_examples=curation_examples, min_quality=QUALITY_FLOOR,
+        note=(f"Every candidate below is from this episode's invited guest ({names}). Rank them on the same standard; "
+              "the strongest is kept so the guest is represented. Select none when none clears the bar."),
+    )
+    if not picked:
+        return ranked, "guest_take_below_bar"
+    best = dict(picked[0])
+    guest = guest_for_take(best, guests, regulars)
+    if guest and not best.get("guest_id") and len(_name_tokens(best.get("speaker"))) < 2:
+        best["speaker"] = guest["name"]   # "Chris" as transcribed, the listing's full name for the editor
+    best["ranking_reason"] = f"Kept as the guest's take (at least one per episode). {best.get('ranking_reason') or ''}".strip()
+    takes = sorted(ranked, key=lambda q: float(q.get("quality_score") or 0), reverse=True)[:4]
+    return takes + [best], outcome
+
+
 def extract_quotes(
     text,
     podcast,
@@ -8505,6 +8665,8 @@ def extract_quotes(
     curation_examples="",
     category_directory=None,
     episode_people=None,
+    episode_guests=None,
+    only_speakers=None,
 ):
     """Retrieve readable, literal candidates using the proven legacy taste bar."""
     model = os.environ.get("OPENAI_CANDIDATE_MODEL", "gpt-5.6-terra")
@@ -8569,6 +8731,11 @@ def extract_quotes(
         if category_names else
         "Return a concise category label; no canonical category directory was supplied for this evaluation."
     )
+    focus_instruction = (
+        "\n- This pass is only for takes spoken by: " + ", ".join(only_speakers)
+        + ". Leave out everyone else. Zero is still correct when none of their words clear the bar."
+        if only_speakers else ""
+    )
     user_prompt = f"""
 Podcast: {podcast}
 Episode: {episode}
@@ -8605,6 +8772,10 @@ Hard requirements:
 - When transcript lines include `[speaker=...]`, copy that exact label into
   `speaker_label` and keep the quote within one labeled voice. When labels are
   unavailable, return a blank string.
+- When the invited guest below is speaking, `speaker` is the guest's full name.{focus_instruction}
+
+INVITED GUESTS THIS EPISODE (the other voices are the hosts):
+{json.dumps(episode_guests or [], ensure_ascii=False)}
 
 {curation_examples}
 
@@ -8657,6 +8828,8 @@ def rank_quote_candidates(
     episode,
     client,
     curation_examples="",
+    min_quality=None,
+    note="",
 ):
     """Choose takes without allowing downstream analysis to influence selection."""
     if not candidates:
@@ -8724,6 +8897,7 @@ Podcast: {podcast}
 Episode: {episode}
 
 Rank up to five takes. Select none when the candidates do not clear the bar.
+{note}
 
 Editorial standard:
 1. Preserve the original PodTakes standard: the quote should challenge,
@@ -8765,7 +8939,7 @@ Reject polished generic business commentary and incomplete transcript fragments.
         max_output_tokens=5000,
     )
 
-    minimum_quality = float(os.environ.get("MIN_QUOTE_QUALITY", "0.74"))
+    minimum_quality = float(min_quality if min_quality is not None else os.environ.get("MIN_QUOTE_QUALITY", "0.74"))
     selected = []
     used_indices = set()
     for selection in data.get("selections", []):
