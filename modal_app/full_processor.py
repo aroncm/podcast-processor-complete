@@ -13655,6 +13655,8 @@ def fastapi_app():
             whole = next((x for x in screens if x and x.get("episode_reject")), None)
             needing = [r for r in items if speaker_needs_attention(r)]
             out.append({"podcast_name": podcast, "episode_name": episode, "date_published": items[0].get("date_published"),
+                        # Nov 10: when the episode was processed (its first pending quote), so the screen can sort by it
+                        "processed_at": min((str(r.get("created_at") or "") for r in items if r.get("created_at")), default=None),
                         "pending": len(items), "needs_speaker": len(needing),
                         "speaker_suggested": sum(1 for r in needing if (proposal_of(r) or {}).get("confidence") == "high" and (proposal_of(r) or {}).get("name")),
                         "timing_unverified": sum(1 for r in items if not timing_verified(r)),
