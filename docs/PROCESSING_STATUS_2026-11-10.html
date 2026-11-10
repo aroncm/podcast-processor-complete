@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PodThreads Episode Processing Status, November 10, 2026</title>
+<style>
+  @page { size: Letter; margin: 0.7in 0.8in; }
+  body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; color: #1c1f26; font-size: 10pt; line-height: 1.45; margin: 0; }
+  h1 { font-size: 20pt; line-height: 1.15; margin: 0 0 4pt; letter-spacing: -0.01em; }
+  .meta { color: #5d6472; font-size: 9.5pt; margin-bottom: 18pt; border-bottom: 1px solid #d9dce2; padding-bottom: 10pt; }
+  h2 { font-size: 12pt; margin: 16pt 0 5pt; color: #12304a; break-after: avoid; }
+  p { margin: 0 0 8pt; }
+  ul, ol { margin: 0 0 8pt; padding-left: 18pt; }
+  li { margin-bottom: 3pt; }
+  .summary { background: #f3f6f9; border: 1px solid #dbe3ea; border-radius: 6px; padding: 10pt 12pt; margin-bottom: 6pt; }
+  .summary p:last-child { margin-bottom: 0; }
+  table { break-inside: avoid; border-collapse: collapse; width: 100%; margin: 4pt 0 8pt; font-size: 10pt; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 3.5pt 6pt; border-bottom: 1px solid #e3e6eb; }
+  th { font-size: 8.5pt; text-transform: uppercase; letter-spacing: 0.04em; color: #5d6472; border-bottom: 1.5px solid #c9ced6; }
+  td.n, th.n { text-align: right; }
+  td.d, th.d { white-space: nowrap; }
+  tr.total td { font-weight: 700; border-top: 1.5px solid #c9ced6; border-bottom: 0; }
+  .note { color: #5d6472; font-size: 9pt; }
+  .src { break-inside: avoid; color: #5d6472; font-size: 8.5pt; margin-top: 18pt; border-top: 1px solid #d9dce2; padding-top: 8pt; }
+</style>
+</head>
+<body>
+
+<h1>PodThreads episode processing: status as of November 10, 2026</h1>
+<div class="meta">For Craig Aron · Prepared November 10, 2026 · Covers the nightly processing run and the unprocessed back catalog</div>
+
+<div class="summary">
+  <p><strong>Where things stand.</strong> PodThreads is caught up on every episode released in the last 60 days except one, the John Hoctor episode of AdTechGod Pod released today, which tonight's run will process.</p>
+  <p><strong>What changed today.</strong> The nightly run now takes the newest episodes first across all podcasts, and only from the last 60 days.</p>
+  <p><strong>Decision.</strong> The back catalog of 715 older episodes stays unprocessed for now. Processing all of it would cost about $410.</p>
+</div>
+
+<h2>How the nightly run works now</h2>
+<p>Every night at 7:00 pm Eastern (8:00 pm in summer), the processor does the following:</p>
+<ol>
+  <li>It looks at all seven active podcast feeds and finds every episode that has not been processed yet.</li>
+  <li>It keeps only episodes released in the last 60 days.</li>
+  <li>It sorts them by release date, newest first, no matter which podcast they come from.</li>
+  <li>It processes the top 4.</li>
+</ol>
+<p>So a new release always goes first, whichever podcast it belongs to. Older episodes from the last 60 days get any slots left over. Anything older than 60 days runs only when someone picks its dates on the Episode Processing screen in Admin.</p>
+<p>If OpenAI runs out of credits, the run stops, says so at the top of every Admin tab, and picks up again on the next night once the balance is topped up.</p>
+
+<h2>Why it changed</h2>
+<p>Before today, the run went through the podcasts in a fixed order: Marketecture, Open Market, AdTechGod Pod, The Aperiam Podcast, The FPC Podcast, The AI Edge Podcast, then Adtech Adtalk. In each podcast it took any of the 10 newest episodes that had not been processed, up to 2 per podcast, until it had 4.</p>
+<p>Nothing limited how old those episodes could be. On the night of November 9, for example, the run processed one new episode and three older ones:</p>
+<table>
+  <tr><th>Episode processed on November 9 (titles shortened)</th><th>Podcast</th><th class="d">Released</th></tr>
+  <tr><td>How Intentwise Is Using AI to Transform Amazon Advertising and Retail Analytics</td><td>AdTechGod Pod</td><td class="d">November 9</td></tr>
+  <tr><td>Episode 33: Rob McLaughlin, CEO of AUDIENCES</td><td>The FPC Podcast</td><td class="d">May</td></tr>
+  <tr><td>Episode 32: Bedrock, Index Cloud, and the Rise of Containerisation</td><td>The FPC Podcast</td><td class="d">May</td></tr>
+  <tr><td>Ep 31. Autonomous Marketing Is Coming, with Jamie Domenici, Klaviyo</td><td>The AI Edge Podcast</td><td class="d">July</td></tr>
+</table>
+<p>A new release from a podcast near the end of the list could wait behind older episodes from podcasts near the start.</p>
+
+<h2>Catch-up status: the last 60 days</h2>
+<p>One episode from the last 60 days has not been processed. Tonight's run will take it.</p>
+<table>
+  <tr><th>Podcast</th><th>Episode</th><th class="d">Released</th></tr>
+  <tr><td class="d">AdTechGod Pod</td><td>Smarter Advertising Decisions, Not Just Automation: With John Hoctor of Newton Research</td><td class="d">November 10</td></tr>
+</table>
+<p>A test of tonight's selection, run today without processing anything, picked exactly this episode and nothing else.</p>
+
+<h2>The back catalog: older than 60 days</h2>
+<p>These episodes are in the podcasts' feeds but have never been processed. The nightly run will not touch them.</p>
+<table>
+  <tr><th>Podcast</th><th class="n">Not processed</th><th class="n">Processed</th><th class="n">In the feed</th><th>Feed goes back to</th></tr>
+  <tr><td>Marketecture</td><td class="n">345</td><td class="n">78</td><td class="n">423</td><td>April 2022</td></tr>
+  <tr><td>AdTechGod Pod</td><td class="n">172</td><td class="n">45</td><td class="n">218</td><td>August 2023</td></tr>
+  <tr><td>Open Market</td><td class="n">90</td><td class="n">30</td><td class="n">120</td><td>May 2024</td></tr>
+  <tr><td>The Aperiam Podcast</td><td class="n">39</td><td class="n">28</td><td class="n">67</td><td>March 2025</td></tr>
+  <tr><td>Adtech Adtalk</td><td class="n">39</td><td class="n">31</td><td class="n">70</td><td>April 2025</td></tr>
+  <tr><td>The FPC Podcast</td><td class="n">19</td><td class="n">18</td><td class="n">37</td><td>November 2024</td></tr>
+  <tr><td>The AI Edge Podcast</td><td class="n">11</td><td class="n">27</td><td class="n">38</td><td>November 2025</td></tr>
+  <tr class="total"><td>Total</td><td class="n">715</td><td class="n">257</td><td class="n">973</td><td></td></tr>
+</table>
+<p class="note">"Processed" counts the episodes in each feed that have takes or a finished analysis on record. "In the feed" counts every episode the feed lists today. AdTechGod Pod's feed also holds the 1 recent episode above, which is why its row adds to 218.</p>
+
+<h2>What a backfill would cost</h2>
+<p>The 72 episodes processed since October 15 cost an average of $0.57 each (median $0.56, lowest $0.25, highest $1.01). About $0.24 of that is transcription and $0.34 is the AI work of picking, checking and placing takes. The average episode ran 39 minutes.</p>
+<table>
+  <tr><th>Scope</th><th class="n">Episodes</th><th class="n">Estimated cost</th></tr>
+  <tr><td>The whole back catalog</td><td class="n">715</td><td class="n">about $410</td></tr>
+  <tr><td>Marketecture only</td><td class="n">345</td><td class="n">about $195</td></tr>
+  <tr><td>AdTechGod Pod only</td><td class="n">172</td><td class="n">about $100</td></tr>
+  <tr><td>Everything except Marketecture and AdTechGod Pod</td><td class="n">198</td><td class="n">about $115</td></tr>
+</table>
+<p>Older episodes may run longer or shorter than recent ones, so treat these as estimates. Every processed episode also adds pending takes to review in Admin, up to 5 per episode.</p>
+
+<h2>Decision and next steps</h2>
+<ul>
+  <li>Hold the full backfill for now (Craig, November 10).</li>
+  <li>The nightly run keeps PodThreads current on new releases with no action needed.</li>
+  <li>To process older episodes later, open Admin, then Episode Processing, choose Custom Range with the dates wanted, and run it. Doing one podcast or one year at a time keeps the review queue manageable.</li>
+</ul>
+
+<div class="src">
+  Sources: the live podcast feeds and the PodThreads database, checked November 10, 2026. Recorded costs come from the processing records for each episode. The nightly change was deployed November 10 (processor commit fbab79c). The Admin screen's note about the nightly run was updated in web commit 64e49c2 and appears after the next Bolt publish.
+</div>
+</body>
+</html>
