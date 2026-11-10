@@ -513,8 +513,10 @@ def _process_episode_with_ai_impl(
     job_id: str = None,
     rerun_guids: list = None,
     guest_only_guids: list = None,
+    dry_run: bool = False,
 ):
-    """Process full episode with quality-focused quote extraction. Supports manual date/feed filtering."""
+    """Process full episode with quality-focused quote extraction. Supports manual date/feed filtering.
+    dry_run (Nov 10): report which episodes this run would pick, and process nothing."""
     
     import feedparser
     import subprocess
@@ -610,35 +612,33 @@ def _process_episode_with_ai_impl(
     # Nov 4: an empty OpenAI balance (or a bad key) fails every episode the same way, so the batch stops at the first
     # one and says so, instead of trying the rest and reporting a quiet night.
     credit_stop = None
-    for feed in feeds.data:
-        if attempted_episodes >= effective_max_episodes or credit_stop:
-            break
-        print(f"\n📡 Processing Feed: {feed['name']}")
-        
+    # Nov 10 (Craig): the nightly run takes the newest episodes across ALL feeds, by release date, and only from the
+    # last 60 days. It used to walk the feeds in a fixed order and take any of each feed's ten newest that had not run,
+    # so May and July episodes from early feeds took slots ahead of new releases from later ones. A manual run (dates
+    # or feeds chosen on the processing screen) still goes feed by feed through exactly what was asked for.
+    is_manual = bool(start_date or end_date or feed_ids)
+    AUTO_LOOKBACK_DAYS = int(os.environ.get("AUTO_LOOKBACK_DAYS", "60"))
+    auto_cutoff = datetime.utcnow() - timedelta(days=AUTO_LOOKBACK_DAYS)
+    candidates = []   # (release date or None, feed order, feed, entry)
+    for feed_order, feed in enumerate(feeds.data):
+        print(f"\n📡 Checking Feed: {feed['name']}")
         try:
             parsed = feedparser.parse(feed['rss_url'])
-            
-            # Find ALL unprocessed episodes in this feed
-            new_episodes = []
-            
-            # Limit processing to avoid timeouts (Cron catches up)
-            MAX_EPISODES_PER_FEED = 2
-            
-            # If manual mode, check deeper
-            check_depth = 50 if (start_date or end_date) else 10
-            
+            check_depth = 50 if is_manual else 30
             for entry in parsed.entries[:check_depth]:
-                # Date Filter Check (New Feature)
+                try:
+                    pub_date = datetime(*entry.published_parsed[:6])
+                except Exception:
+                    pub_date = None
                 if start_dt or end_dt:
-                    try:
-                        pub_date = datetime(*entry.published_parsed[:6])
-                        if start_dt and pub_date < start_dt:
-                            continue
-                        if end_dt and pub_date > end_dt:
-                            continue
+                    if pub_date and start_dt and pub_date < start_dt:
+                        continue
+                    if pub_date and end_dt and pub_date > end_dt:
+                        continue
+                    if pub_date:
                         print(f"  📅 Match Date: {pub_date.date()} ({entry.title[:30]}...)")
-                    except:
-                        pass # Skip date check if parsing fails
+                elif not is_manual and (pub_date is None or pub_date < auto_cutoff):
+                    continue   # older than the lookback: left for a manual run
 
                 # 1. Check GUID (Best)
                 is_duplicate = False
@@ -649,7 +649,7 @@ def _process_episode_with_ai_impl(
                     res = supabase.table('test_quotes').select('id').eq('episode_guid', entry.id).limit(1).execute()
                     if res.data:
                         is_duplicate = True
-                
+            
                 # 2. Check Truncated Title (Fallback - DB stores max 100 chars)
                 if not is_duplicate and not guest_only:
                     truncated_title = entry.title[:100]
@@ -668,59 +668,54 @@ def _process_episode_with_ai_impl(
 
                 if not is_duplicate:
                     print(f"  📎 Found new episode: {entry.title}")
-                    new_episodes.append(entry)
+                    candidates.append((pub_date, feed_order, feed, entry))
                 else:
                     print(f"  ⏭️  Skipping existing: {entry.title[:30]}...")
-                    pass # Don't break loop in manual mode, might find older unchecked ones
-            
-            if not new_episodes:
-                print(f"  ✅ No new episodes for {feed['name']}")
-                continue
-            
-            # Reduce batch size to prevent Timeout (Unless manual mode)
-            is_manual = bool(start_date or end_date or feed_ids)
-            if not is_manual and len(new_episodes) > MAX_EPISODES_PER_FEED:
-                print(f"  ⚠️ Limiting to {MAX_EPISODES_PER_FEED} episodes (from {len(new_episodes)}) to prevent timeout.")
-                new_episodes = new_episodes[:MAX_EPISODES_PER_FEED]
-
-            remaining = effective_max_episodes - attempted_episodes
-            new_episodes = new_episodes[:max(0, remaining)]
-                
-            print(f"  ✨ Processing {len(new_episodes)} new episodes for {feed['name']}...")
-            
-            # Process each new episode
-            for episode in new_episodes:
-                episode_guid = getattr(episode, "id", None)
-                update_processing_job(
-                    supabase,
-                    job_id,
-                    "downloading",
-                    current_episode_guid=episode_guid,
-                    progress={
-                        "attempted_episodes": attempted_episodes,
-                        "current_podcast": feed["name"],
-                        "current_episode": episode.title,
-                    },
-                )
-                result = process_single_episode_logic(
-                    episode,
-                    feed,
-                    client,
-                    supabase,
-                    job_id=job_id,
-                    guest_only=episode_guid in set(guest_only_guids or []),
-                )
-                all_results.append(result)
-                attempted_episodes += 1
-                if isinstance(result, dict) and result.get("error") and openai_error_is_account_blocking(Exception(result["error"])):
-                    credit_stop = {"podcast": feed["name"], "episode": episode.title, "error": str(result["error"])[:1000]}
-                    print(f"🛑 OpenAI account blocked (credits or key); stopping the batch: {credit_stop['error'][:200]}")
-                    break
-                
         except Exception as e:
-            print(f"❌ Error processing feed {feed['name']}: {str(e)}")
+            print(f"❌ Error reading feed {feed['name']}: {str(e)}")
             continue
-        
+
+    if not is_manual:
+        candidates.sort(key=lambda c: (c[0] or datetime.min), reverse=True)
+    chosen = candidates[:max(0, effective_max_episodes)]
+    print(f"\n✨ {len(candidates)} new episode(s) found; processing {len(chosen)}: "
+          + "; ".join(f"{c[2]['name']} {c[0].date() if c[0] else '?'}" for c in chosen))
+    if dry_run:
+        return {"dry_run": True, "found": len(candidates), "chosen": [
+            {"podcast": c[2]["name"], "episode": c[3].title, "released": c[0].date().isoformat() if c[0] else None} for c in chosen]}
+
+    for pub_date, _, feed, episode in chosen:
+        try:
+            episode_guid = getattr(episode, "id", None)
+            update_processing_job(
+                supabase,
+                job_id,
+                "downloading",
+                current_episode_guid=episode_guid,
+                progress={
+                    "attempted_episodes": attempted_episodes,
+                    "current_podcast": feed["name"],
+                    "current_episode": episode.title,
+                },
+            )
+            result = process_single_episode_logic(
+                episode,
+                feed,
+                client,
+                supabase,
+                job_id=job_id,
+                guest_only=episode_guid in set(guest_only_guids or []),
+            )
+            all_results.append(result)
+            attempted_episodes += 1
+            if isinstance(result, dict) and result.get("error") and openai_error_is_account_blocking(Exception(result["error"])):
+                credit_stop = {"podcast": feed["name"], "episode": episode.title, "error": str(result["error"])[:1000]}
+                print(f"🛑 OpenAI account blocked (credits or key); stopping the batch: {credit_stop['error'][:200]}")
+                break
+        except Exception as e:
+            print(f"❌ Error processing {feed['name']}: {str(e)}")
+            continue
+
     failed_results = [item for item in all_results if isinstance(item, dict) and item.get("error")]
     successful_results = [item for item in all_results if isinstance(item, dict) and not item.get("error")]
     youtube_alignment_failures = sum(
@@ -794,6 +789,7 @@ def process_episode_with_ai(
     job_id: str = None,
     rerun_guids: list = None,
     guest_only_guids: list = None,
+    dry_run: bool = False,
 ):
     """Audited Modal entrypoint. The job row remains the durable source of truth."""
     try:
@@ -805,6 +801,7 @@ def process_episode_with_ai(
             job_id=job_id,
             rerun_guids=rerun_guids,
             guest_only_guids=guest_only_guids,
+            dry_run=dry_run,
         )
     except Exception as exc:
         update_processing_job_from_env(
