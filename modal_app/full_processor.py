@@ -7735,7 +7735,10 @@ def process_single_episode_logic(episode, feed, client, supabase, job_id=None, g
         if youtube_id:
             print(f"📺 FOUND YouTube ID (from RSS text): {youtube_id}")
         else:
-            print("❌ No YouTube ID found in RSS. Initiating fallback search...")
+            print("❌ No YouTube ID found in RSS. Looking in the podcast's YouTube list...")
+            youtube_id = find_youtube_in_podcast_playlist(feed['name'], episode.title)
+        if not youtube_id:
+            print("❌ Not in the podcast's YouTube list. Initiating fallback search...")
             # Try searching with just the episode title first (often more successful for long titles)
             # Oct 29: a title-only search attached other shows' videos (gold mining, a gun review) to 14 episodes; a result now
             # has to come from the podcast's channel and match the episode's title, or the episode keeps its RSS audio.
@@ -10880,6 +10883,65 @@ PODCAST_YOUTUBE_CHANNELS = {
     "open market": {"marketecturetv", "open market"},
     "the ai edge podcast": {"u of digital"},
 }
+
+# Each podcast's own YouTube list (Craig, Nov 12). Looked up before any search: a search on the RSS title misses
+# episodes YouTube titles differently (U of Digital posts AI Edge as "AI Edge Podcast | Guest: ... | Ep.38").
+PODCAST_YOUTUBE_PLAYLISTS = {
+    "adtechgod pod": "https://www.youtube.com/playlist?list=PLpOWdbqdAllHOZ9jQ6lsIObFrj3zx9rn6",
+    "open market": "https://www.youtube.com/@OpenMarketPod/videos",
+    "the ai edge podcast": "https://www.youtube.com/playlist?list=PLwXW9E8esdgGmF0GmWb0Y5DcAtLtG9xEN",
+}
+_PLAYLIST_CACHE = {}
+
+
+def episode_number(title):
+    m = re.search(r"\b(?:ep|episode)\.?\s*(\d{1,4})\b", str(title or ""), re.I)
+    return int(m.group(1)) if m else None
+
+
+def podcast_playlist_videos(podcast_name):
+    """The podcast's YouTube list, read once per container: [{id, title, duration}]. Empty when it has none or the read fails."""
+    key = normalize_text(podcast_name or "").strip()
+    url = PODCAST_YOUTUBE_PLAYLISTS.get(key)
+    if not url:
+        return []
+    if key not in _PLAYLIST_CACHE:
+        import yt_dlp
+        try:
+            with yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False) or {}
+            _PLAYLIST_CACHE[key] = [{"id": e.get("id"), "title": e.get("title") or "", "duration": e.get("duration") or 0}
+                                    for e in (info.get("entries") or []) if e and e.get("id") and e.get("title")]
+            print(f"  📃 {podcast_name} YouTube list: {len(_PLAYLIST_CACHE[key])} videos")
+        except Exception as exc:
+            print(f"  ❌ Could not read {podcast_name}'s YouTube list: {exc}")
+            return []
+    return _PLAYLIST_CACHE[key]
+
+
+def match_playlist_video(videos, episode_title, audio_seconds=None):
+    """The video in the podcast's own list that is this episode: the same episode number when both titles carry one,
+    otherwise a strong title match. Full-length only; of two uploads, the one nearest the audio's length (else the longer)."""
+    num = episode_number(episode_title)
+    full = [v for v in videos if (v.get("duration") or 0) > 300]
+    if num is not None:
+        hits = [v for v in full if episode_number(v["title"]) == num]
+    else:
+        hits = []
+    if not hits:
+        hits = [v for v in full if youtube_title_matches_episode(v["title"], episode_title)["matches"]]
+    if not hits:
+        return None
+    if audio_seconds:
+        return min(hits, key=lambda v: abs((v.get("duration") or 0) - audio_seconds))["id"]
+    return max(hits, key=lambda v: v.get("duration") or 0)["id"]
+
+
+def find_youtube_in_podcast_playlist(podcast_name, episode_title, audio_seconds=None):
+    vid = match_playlist_video(podcast_playlist_videos(podcast_name), episode_title, audio_seconds)
+    if vid:
+        print(f"  ✅ Found in {podcast_name}'s YouTube list: {vid}")
+    return vid
 
 
 def squash_name(value):
