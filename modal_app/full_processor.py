@@ -7127,7 +7127,58 @@ def daily_autopilot():
         print("speaker autopilot", json.dumps(run_speaker_autopilot(supabase, autopilot_editor_id(supabase))))
     with ai_job("Editor screen"):
         print("editor screen", json.dumps(run_editor_screen(supabase)))
+    try:   # a video that went up after its episode was processed; the caption relay then checks the timing
+        print("playlist videos", json.dumps({k: v for k, v in attach_playlist_videos(supabase, dry_run=False).items() if k != "items"}))
+    except Exception as exc:
+        print("playlist videos failed:", exc)
     print("timing predictions", predict_all_episode_timing(supabase))
+
+
+def attach_playlist_videos(supabase, days=60, include_live=False, dry_run=True):
+    """Give takes that have no video the one from their podcast's own YouTube list (Nov 12). Catches an episode whose video
+    went up after it was processed, and one the search missed. A take only gets youtube_id and a pending timing check:
+    the player opens on video once the caption timing check verifies the moment, so a wrong match never plays.
+    days limits the staged takes to those created recently (None = all); include_live also fills published quotes."""
+    plays = {normalize_text(k).strip() for k in PODCAST_YOUTUBE_PLAYLISTS}
+    names = [r["name"] for r in supabase.table("podcasts").select("id,name").execute().data or []
+             if normalize_text(r["name"]).strip() in plays]
+    episodes = _select_all(lambda: supabase.table("episodes").select("id,title,podcast_id,duration_seconds,source_guid"))
+    seconds = {e["source_guid"]: e.get("duration_seconds") for e in episodes if e.get("source_guid")}
+    q = lambda: supabase.table("test_quotes").select("id,podcast_name,episode_name,episode_guid,created_at") \
+        .in_("podcast_name", names).is_("youtube_id", "null").in_("approval_status", ["pending", "approved", "promoted"])
+    staged = _select_all(q)
+    if days:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        staged = [r for r in staged if (r.get("created_at") or "") >= cutoff]
+    plan = []   # (table, id, podcast, episode title, youtube_id)
+    for r in staged:
+        vid = match_playlist_video(podcast_playlist_videos(r["podcast_name"]), r["episode_name"], seconds.get(r.get("episode_guid")))
+        if vid:
+            plan.append(("test_quotes", r["id"], r["podcast_name"], r["episode_name"], vid))
+    if include_live:
+        pod = {r["id"]: r["name"] for r in supabase.table("podcasts").select("id,name").execute().data or []}
+        ep = {e["id"]: e for e in episodes}
+        live = _select_all(lambda: supabase.table("quotes").select("id,episode_id").is_("youtube_id", "null").is_("withheld_at", "null"))
+        for r in live:
+            e = ep.get(r.get("episode_id")) or {}
+            name = pod.get(e.get("podcast_id"))
+            if name not in names:
+                continue
+            vid = match_playlist_video(podcast_playlist_videos(name), e.get("title"), e.get("duration_seconds"))
+            if vid:
+                plan.append(("quotes", r["id"], name, e.get("title"), vid))
+    if not dry_run:
+        for table, quote_id, *_, vid in plan:
+            supabase.table(table).update({"youtube_id": vid, "youtube_alignment_status": "pending"}) \
+                .eq("id", quote_id).is_("youtube_id", "null").execute()
+    return {"dry_run": dry_run, "attached": len(plan),
+            "items": [{"table": t, "id": i, "podcast": p, "episode": e, "youtube_id": v} for t, i, p, e, v in plan]}
+
+
+@app.function(image=image, secrets=[my_secret], timeout=900)
+def attach_playlist_videos_job(days: int = 60, include_live: bool = False, dry_run: bool = True):
+    from supabase import create_client
+    return attach_playlist_videos(create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"]), days, include_live, dry_run)
 
 
 def predict_all_episode_timing(supabase):
